@@ -3,8 +3,8 @@
 > The precise technical reference for **asmdb**: a minimalist, transactional
 > database written in **x86-64 assembly** (NASM, `-f bin`), with **no linker**,
 > **no C runtime**, raw **Win32** calls, WAL-durable transactions, an ASCII-art
-> REPL, and a **Model Context Protocol** server that turns it into durable
-> **memory for AI agents**.
+> REPL, and a **Model Context Protocol** server that exposes it as a generic
+> CRUD store (durable **memory for AI agents** being one example use case).
 >
 > This document describes what the engine *actually does today*, byte for byte.
 > For the high-level tour and benchmarks, see the [README](../README.md); for
@@ -17,14 +17,14 @@
 1. [Design goals & constraints](#1-design-goals--constraints)
 2. [Build toolchain & PE64 layout](#2-build-toolchain--pe64-layout)
 3. [Calling convention & register discipline](#3-calling-convention--register-discipline)
-4. [Record layout (256-byte memory record)](#4-record-layout-256-byte-memory-record)
+4. [Record layout (256-byte record)](#4-record-layout-256-byte-record)
 5. [Hash table — the store *is* the index](#5-hash-table--the-store-is-the-index)
 6. [On-disk formats](#6-on-disk-formats)
 7. [Transactions, durability & crash recovery](#7-transactions-durability--crash-recovery)
 8. [Timestamps](#8-timestamps)
 9. [REPL command grammar](#9-repl-command-grammar)
 10. [Supported column types](#10-supported-column-types)
-11. [MCP server — agent memory](#11-mcp-server--agent-memory)
+11. [MCP server — CRUD interface](#11-mcp-server--crud-interface)
 12. [Roadmap](#12-roadmap)
 13. [Source map](#13-source-map)
 
@@ -42,14 +42,14 @@
 | Index | **Open-addressing** hash table (the store IS the index) |
 | Transactions | **WAL** (write-ahead log) → atomicity, durability, recovery |
 | Interface | **REPL** over stdin/stdout, ASCII-art presentation |
-| Integration | **MCP** server (Node) exposing the engine as agent memory |
+| Integration | **MCP** server (Node) exposing the engine as a generic CRUD store |
 
-**Design center.** The record schema is tuned for **agent memory**: a numeric
-score, automatic creation/update timestamps, a short category `tag`, and a
+**Design center.** The record schema is a general-purpose fixed shape: a numeric
+`value`, automatic creation/update timestamps, a short category `tag`, and a
 free-text `content` field — all fixed-width so every operation is pointer
 arithmetic. The whole store is a single flat hash region that is memory-mapped
 into RAM at startup, so CRUD is in-memory and durability is layered on top by
-the WAL.
+the WAL. (Agent memory is one workload this shape suits — not the only one.)
 
 ### Deliberate non-goals (today)
 
@@ -122,7 +122,7 @@ enable ANSI colour when stdout is a real console.
 
 ---
 
-## 4. Record layout (256-byte memory record)
+## 4. Record layout (256-byte record)
 
 Each record is exactly **256 bytes = four 64-byte cache lines**, so slot *i*
 lives at byte offset `i << REC_SHIFT` (`REC_SHIFT = 8`).
@@ -131,11 +131,11 @@ lives at byte offset `i << REC_SHIFT` (`REC_SHIFT = 8`).
 |-------:|-----:|-----------|------------|-------------|
 | 0      | 8    | `id`      | `u64`      | primary key |
 | 8      | 1    | `status`  | `u8`       | `0` empty / `1` live / `2` deleted (tombstone) |
-| 9      | 1    | `kind`    | `u8`       | memory-kind enum (reserved, default `0`) |
+| 9      | 1    | `kind`    | `u8`       | row-kind tag (reserved, default `0`) |
 | 12     | 4    | `clen`    | `u32`      | content byte length |
 | 16     | 8    | `created` | `i64`      | creation time, unix epoch ms (auto) |
 | 24     | 8    | `updated` | `i64`      | last-update time, unix epoch ms (auto) |
-| 32     | 8    | `value`   | `i64`      | numeric score / payload |
+| 32     | 8    | `value`   | `i64`      | numeric payload / score |
 | 40     | 40   | `tag`     | `char[40]` | category / namespace, NUL-padded |
 | 80     | 176  | `content` | `char[176]`| free text, NUL-padded |
 
@@ -346,39 +346,50 @@ short `tag`, and a free-text `content` field.
 
 ---
 
-## 11. MCP server — agent memory
+## 11. MCP server — CRUD interface
 
 The `mcp/` package is a Node [Model Context Protocol](https://modelcontextprotocol.io)
-server that exposes asmdb as durable long-term memory for an AI agent. See
+server that exposes asmdb to any MCP client as a **generic CRUD store**. See
 [`mcp/README.md`](../mcp/README.md) for setup and client registration.
 
 ```
-agent / MCP client ──MCP stdio──▶ asmdb-mcp (Node) ──stdin/stdout──▶ asmdb.exe
+MCP client (agent / IDE) ──MCP stdio──▶ asmdb-mcp (Node) ──stdin/stdout──▶ asmdb.exe
 ```
 
 - The server keeps **one long-lived `asmdb.exe` process**, so the 64 MiB region
   is read once at startup and every tool call is an in-memory hash lookup plus a
-  durable write.
-- An agent addresses memories by a free-text **`key`**, which the server hashes
-  to asmdb's `u64` `id` with **64-bit FNV-1a**. The engine stays a pure
-  id-keyed store — no secondary string index needed.
-- Field mapping: `key → id`, `tag → tag` (namespace/category), `value → value`
-  (optional score), `content → content` (the remembered text); `created` /
-  `updated` are automatic.
+  durable write. On client disconnect it shuts the engine down cleanly (no
+  orphaned process).
+- A row is addressed by a numeric **`id`** (used as-is) or a string **`key`**
+  that the server hashes to asmdb's `u64` `id` with **64-bit FNV-1a**. The
+  engine stays a pure id-keyed store — no secondary string index needed.
+- Field mapping: `id`/`key → id`, `tag → tag` (namespace/category),
+  `value → value` (numeric payload/score), `content → content` (free text);
+  `created` / `updated` are automatic.
 
 ### Tools
 
 | Tool | Arguments | Description |
 |------|-----------|-------------|
-| `memory_store`  | `key`, `content`, `tag?`, `value?` | insert or overwrite (upsert on the same key) |
-| `memory_recall` | `key` | fetch one memory with content, tag, value, timestamps |
-| `memory_search` | `query` | case-insensitive substring search over tag + content |
-| `memory_list`   | — | return every stored memory |
-| `memory_delete` | `key` | remove a memory by key |
+| `db_insert` | `id`\|`key`, `content?`, `tag?`, `value?`, `upsert?` | insert a row; `upsert:true` overwrites instead of erroring |
+| `db_update` | `id`\|`key`, `content?`, `tag?`, `value?` | overwrite an existing row (errors if absent) |
+| `db_get`    | `id`\|`key` | fetch one row with value, tag, content, timestamps |
+| `db_delete` | `id`\|`key` | remove a row |
+| `db_find`   | `query` | case-insensitive substring search over tag + content |
+| `db_list`   | — | return every live row |
+| `db_count`  | — | number of live rows |
 
-`memory_store` upserts: it tries `INSERT`, and on an "already exists" reply from
-the engine it retries as `UPDATE`, so re-storing the same key overwrites in
-place and bumps `updated`.
+`db_insert` with `upsert:true` tries `INSERT`, and on an "already exists" reply
+from the engine retries as `UPDATE`, so the same id/key overwrites in place and
+bumps `updated`.
+
+### Example use case — agent memory
+
+The generic tools cover long-term **memory for an AI agent** directly: address
+each memory by a string `key` (e.g. `user.timezone`), use `tag` as a namespace,
+`value` as an optional score, and `content` as the remembered text; call
+`db_insert` with `upsert:true` to store-or-overwrite and `db_get`/`db_find` to
+recall. This is one workload the record shape suits — not the only one.
 
 ---
 
@@ -403,9 +414,9 @@ place and bumps `updated`.
 | 7 | WAL + multi-statement `BEGIN`/`COMMIT`/`ROLLBACK` | ✅ done |
 | 8 | Crash recovery (idempotent WAL redo at startup) | ✅ done |
 | 9 | Tests + 100k-row benchmark vs SQLite + docs | ✅ done |
-| 10 | Agent-memory 256-byte schema (score, timestamps, tag, content) | ✅ done |
+| 10 | 256-byte record schema (numeric value, timestamps, tag, content) | ✅ done |
 | 11 | `FIND` substring search; `SCHEMA`/`TYPES`/`TABLES`/`DATABASES` | ✅ done |
-| 12 | MCP server (5 memory tools) + language clients (Py/C#/C) | ✅ done |
+| 12 | MCP server (7 generic CRUD tools) + language clients (Py/C#/C) | ✅ done |
 | 13 | Fatal-I/O and out-of-memory guards (open failure aborts cleanly) | ✅ done |
 
 Everything below is **future work** — listed to set direction honestly, not to
@@ -466,6 +477,30 @@ The theme is "more cores, more machines, more OSes — still assembly."
 > rows across the 64 MiB area. This is why the bulk-durable number trails SQLite
 > slightly in the README table — the **incremental checkpoint** (v1.0) and
 > **partitioning** (v3.0) items above are the fix, and are not yet implemented.
+
+### Transactional-database principles — coverage
+
+The classic **ACID** guarantees plus the operational pillars every real database
+needs, scored against asmdb — ✅ delivered, ◐ partial, 🗺️ planned. This maps the
+roadmap above onto the principles it satisfies, and marks which pillars belong to
+the hosted [SaaS layer](SAAS.md) rather than the single-node engine.
+
+| # | Principle | Status | Where / how |
+|--:|-----------|:------:|-------------|
+| 1 | **Atomicity** | ✅ | `BEGIN`/`COMMIT`/`ROLLBACK` + undo log (§7) |
+| 2 | **Consistency** | ◐ | unique primary key, fixed-width types (§4, §10); `CHECK`-style constraints → roadmap |
+| 3 | **Isolation** | ◐ | single-writer today; MVCC + snapshot isolation → v3.0 |
+| 4 | **Durability** | ✅ | WAL + `FlushFileBuffers` (§6, §7) |
+| 5 | **Crash recovery** | ✅ | idempotent WAL redo with commit marker (§7); CRC32 frames → v1.0 |
+| 6 | **Concurrency control** | ◐ | single-writer per instance; group commit → v1.0, MVCC → v3.0 (SaaS runs one instance per DB) |
+| 7 | **Indexing & access paths** | ◐ | O(1) primary hash (§5); secondary / bitmap / range indexes → v1.5 |
+| 8 | **Query & access interface** | ✅ | REPL grammar (§9), MCP CRUD tools (§11), Python/C#/C clients |
+| 9 | **Backup & restore / PITR** | ◐ | copy `.dat`/`.wal`; snapshots + WAL shipping + PITR → SaaS / roadmap |
+| 10 | **Security & observability** | 🗺️ | authz, encryption, audit, metrics → [SaaS layer](SAAS.md) (engine stays single-node) |
+
+The engine owns the **transactional core** (1, 4, 5, 8 delivered; 2, 3, 7
+advancing across v1.0–v3.0 above). The **service pillars** (6 at scale, 9, 10)
+are the job of `SAAS.md` — and the engine stays 100% assembly throughout.
 
 ---
 

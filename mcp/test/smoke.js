@@ -38,14 +38,15 @@ try {
 
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
   check(
-    "exposes five memory tools",
-    ["memory_delete", "memory_list", "memory_recall", "memory_search", "memory_store"]
+    "exposes the CRUD tool set",
+    ["db_count", "db_delete", "db_find", "db_get", "db_insert", "db_list", "db_update"]
       .every((t) => tools.includes(t))
   );
 
+  // Address rows by string key (hashed to the id) - the agent-memory pattern.
   const s1 = parse(
     await client.callTool({
-      name: "memory_store",
+      name: "db_insert",
       arguments: {
         key: "user.name",
         content: "The user prefers to be called Fred",
@@ -54,42 +55,58 @@ try {
       },
     })
   );
-  check("store inserts", s1.ok && s1.action === "inserted");
+  check("insert by key creates a row", s1.ok && s1.action === "inserted");
+
+  const dup = parse(
+    await client.callTool({
+      name: "db_insert",
+      arguments: { key: "user.name", content: "dup", tag: "profile" },
+    })
+  );
+  check("insert without upsert rejects a duplicate", dup.ok === false && /exists/i.test(dup.error));
 
   const s2 = parse(
     await client.callTool({
-      name: "memory_store",
-      arguments: { key: "user.name", content: "The user goes by Fred G", tag: "profile" },
+      name: "db_insert",
+      arguments: { key: "user.name", content: "The user goes by Fred G", tag: "profile", upsert: true },
     })
   );
-  check("re-store updates same key", s2.ok && s2.action === "updated" && s2.id === s1.id);
+  check("insert with upsert overwrites the row", s2.ok && s2.action === "updated" && s2.id === s1.id);
 
-  await client.callTool({
-    name: "memory_store",
-    arguments: {
-      key: "project.stack",
-      content: "asmdb is written in x86-64 assembly with NASM",
-      tag: "project",
-    },
-  });
+  // Address a row by explicit numeric id - the generic-DB pattern.
+  const s3 = parse(
+    await client.callTool({
+      name: "db_insert",
+      arguments: { id: 42, content: "asmdb is written in x86-64 assembly with NASM", tag: "project" },
+    })
+  );
+  check("insert by numeric id creates a row", s3.ok && s3.id === "42");
 
-  const r = parse(await client.callTool({ name: "memory_recall", arguments: { key: "user.name" } }));
-  check("recall returns updated content", r.found && /Fred G/.test(r.content));
-  check("recall has timestamps", Number.isFinite(r.created) && Number.isFinite(r.updated));
+  const upd = parse(
+    await client.callTool({ name: "db_update", arguments: { id: 42, content: "asmdb: a DB in assembly", tag: "project", value: 7 } })
+  );
+  check("update by id succeeds", upd.ok && upd.action === "updated");
+
+  const r = parse(await client.callTool({ name: "db_get", arguments: { key: "user.name" } }));
+  check("get returns updated content", r.found && /Fred G/.test(r.content));
+  check("get has timestamps", Number.isFinite(r.created) && Number.isFinite(r.updated));
 
   const search = parse(
-    await client.callTool({ name: "memory_search", arguments: { query: "assembly" } })
+    await client.callTool({ name: "db_find", arguments: { query: "assembly" } })
   );
-  check("search finds project memory", search.count === 1 && /assembly/i.test(search.matches[0].content));
+  check("find matches the project row", search.count === 1 && /assembly/i.test(search.matches[0].content));
 
-  const list = parse(await client.callTool({ name: "memory_list", arguments: {} }));
-  check("list returns two memories", list.count === 2);
+  const list = parse(await client.callTool({ name: "db_list", arguments: {} }));
+  check("list returns both rows", list.count === 2);
 
-  const del = parse(await client.callTool({ name: "memory_delete", arguments: { key: "user.name" } }));
-  check("delete removes the key", del.deleted === true);
+  const cnt = parse(await client.callTool({ name: "db_count", arguments: {} }));
+  check("count returns two", cnt.ok && cnt.count === 2);
 
-  const gone = parse(await client.callTool({ name: "memory_recall", arguments: { key: "user.name" } }));
-  check("recall after delete is not found", gone.found === false);
+  const del = parse(await client.callTool({ name: "db_delete", arguments: { key: "user.name" } }));
+  check("delete removes the row", del.deleted === true);
+
+  const gone = parse(await client.callTool({ name: "db_get", arguments: { key: "user.name" } }));
+  check("get after delete is not found", gone.found === false);
 } catch (err) {
   console.error("test error:", err);
   fails++;

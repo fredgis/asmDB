@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 // server.js - Model Context Protocol server backed by asmdb.
 //
-// Exposes asmdb as durable long-term memory for an AI agent. Each memory is
-// addressed by a free-text `key`; the server hashes the key to asmdb's u64
-// primary id (FNV-1a), so the engine stays a pure id-keyed store and needs no
-// secondary string index. tag = category/namespace, value = numeric score,
-// content = the remembered text. created/updated timestamps are automatic.
+// Exposes the asmdb transactional engine over MCP as a generic CRUD store:
+// db_insert / db_update / db_get / db_delete / db_find / db_list / db_count.
+// Rows are addressed by a numeric `id` (u64) or a string `key` that the server
+// hashes to the id with FNV-1a, so the engine stays a pure id-keyed store with
+// no secondary string index. tag = category/namespace, value = numeric
+// payload/score, content = free text; created/updated timestamps are automatic.
+//
+// Agent memory is one example use case (key = memory name, tag = namespace,
+// content = the remembered text) - not the only one.
 //
 // Configuration (environment variables):
 //   ASMDB_EXE  path to asmdb.exe      (default: ../../build/asmdb.exe)
 //   ASMDB_DIR  directory for data     (default: ~/.asmdb)
-//   ASMDB_DB   database base name     (default: agentmem)
+//   ASMDB_DB   database base name     (default: asmdb)
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -34,7 +38,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const EXE =
   process.env.ASMDB_EXE || resolve(__dirname, "..", "..", "build", "asmdb.exe");
 const DIR = process.env.ASMDB_DIR || join(homedir(), ".asmdb");
-const DB = process.env.ASMDB_DB || "agentmem";
+const DB = process.env.ASMDB_DB || "asmdb";
 
 if (!existsSync(EXE)) {
   console.error(`[asmdb-mcp] engine not found at ${EXE}`);
@@ -49,77 +53,146 @@ await session.ready; // consume the banner
 const ok = (text) => ({ content: [{ type: "text", text }] });
 const json = (obj) => ok(JSON.stringify(obj, null, 2));
 
-const server = new McpServer({ name: "asmdb-memory", version: "1.0.0" });
+const server = new McpServer({ name: "asmdb", version: "1.0.0" });
+
+// Resolve a record id from either an explicit numeric `id` (u64) or a string
+// `key` hashed with FNV-1a. Returns { id } (decimal string) or { error }.
+function resolveId({ id, key }) {
+  if (id !== undefined && id !== null && `${id}`.trim() !== "") {
+    const s = `${id}`.trim();
+    if (!/^\d+$/.test(s)) {
+      return { error: `invalid id "${s}" - expected a non-negative integer (use \`key\` for huge/string ids)` };
+    }
+    const n = BigInt(s);
+    if (n === 0n) return { error: "id 0 is reserved - use id >= 1 or a string key" };
+    if (n >= 1n << 64n) return { error: `id "${s}" exceeds the u64 range` };
+    return { id: s };
+  }
+  if (key !== undefined && key !== null && `${key}` !== "") {
+    return { id: keyToId(key) };
+  }
+  return { error: "provide either `id` (integer) or `key` (string)" };
+}
+
+// Shared id/key selector for every record-addressed tool.
+const idKey = {
+  id: z
+    .union([z.number().int(), z.string()])
+    .optional()
+    .describe("numeric primary key (u64) - provide this or `key`"),
+  key: z
+    .string()
+    .optional()
+    .describe("string key hashed to the id with FNV-1a - provide this or `id`"),
+};
 
 server.registerTool(
-  "memory_store",
+  "db_insert",
   {
-    title: "Store a memory",
+    title: "Insert a row",
     description:
-      "Store or overwrite a memory in asmdb. `key` is a stable free-text " +
-      "handle (hashed to the record id), `content` is the text to remember " +
-      "(<=175 chars), `tag` is a short single-word category, and `value` is " +
-      "an optional numeric score. Re-storing the same key updates it.",
+      "Insert a new row into asmdb. Address it by `id` (u64) or `key` " +
+      "(string, hashed to the id). `content` is free text (<=175 chars), " +
+      "`tag` a short single-word category/namespace, `value` an optional " +
+      "numeric payload/score. Set `upsert:true` to overwrite instead of " +
+      "erroring when the row already exists. Example use - agent memory: " +
+      "key = the memory name, tag = namespace, content = the remembered text.",
     inputSchema: {
-      key: z.string().min(1).describe("stable identifier for this memory"),
-      content: z.string().describe("the text to remember"),
-      tag: z
-        .string()
-        .optional()
-        .describe("short category / namespace (single word)"),
-      value: z
-        .number()
-        .optional()
-        .describe("optional numeric score or weight (default 0)"),
+      ...idKey,
+      content: z.string().optional().describe("free text payload (<=175 chars)"),
+      tag: z.string().optional().describe("short category / namespace (single word)"),
+      value: z.number().optional().describe("optional numeric payload / score (default 0)"),
+      upsert: z.boolean().optional().describe("overwrite an existing row instead of erroring"),
     },
   },
-  async ({ key, content, tag, value }) => {
-    const id = keyToId(key);
+  async ({ id, key, content, tag, value, upsert }) => {
+    const r = resolveId({ id, key });
+    if (r.error) return json({ ok: false, error: r.error });
     const t = sanitizeTag(tag);
     const c = sanitizeContent(content);
     const v = Number.isFinite(value) ? Math.trunc(value) : 0;
-    let out = await session.command(`INSERT ${id} ${v} ${t} ${c}`);
+    let out = await session.command(`INSERT ${r.id} ${v} ${t} ${c}`);
     let action = "inserted";
     if (/already exists/i.test(out)) {
-      out = await session.command(`UPDATE ${id} ${v} ${t} ${c}`);
+      if (!upsert) return json({ ok: false, error: "row already exists", id: r.id });
+      out = await session.command(`UPDATE ${r.id} ${v} ${t} ${c}`);
       action = "updated";
     }
-    if (/\[ERR\]/.test(out)) {
-      return ok(`error storing "${key}": ${out.trim()}`);
-    }
-    return json({ ok: true, action, key, id, tag: t, value: v });
+    if (/\[ERR\]/.test(out)) return json({ ok: false, error: out.trim(), id: r.id });
+    return json({ ok: true, action, id: r.id, tag: t, value: v });
   }
 );
 
 server.registerTool(
-  "memory_recall",
+  "db_update",
   {
-    title: "Recall a memory by key",
+    title: "Update a row",
     description:
-      "Retrieve a single memory by its exact `key`, including its content, " +
-      "tag, numeric value and created/updated timestamps.",
+      "Overwrite an existing row's value, tag and content. Address it by " +
+      "`id` or `key`. Fails if the row does not exist (use db_insert with " +
+      "upsert to create-or-update).",
     inputSchema: {
-      key: z.string().min(1).describe("the key used when the memory was stored"),
+      ...idKey,
+      content: z.string().optional().describe("new free text payload (<=175 chars)"),
+      tag: z.string().optional().describe("new category / namespace (single word)"),
+      value: z.number().optional().describe("new numeric payload / score (default 0)"),
     },
   },
-  async ({ key }) => {
-    const id = keyToId(key);
-    const out = await session.command(`SELECT ${id}`);
-    if (/key not found/i.test(out)) {
-      return json({ ok: false, found: false, key });
-    }
-    const rec = parseDetail(out);
-    if (!rec) return ok(out.trim());
-    return json({ ok: true, found: true, key, ...rec });
+  async ({ id, key, content, tag, value }) => {
+    const r = resolveId({ id, key });
+    if (r.error) return json({ ok: false, error: r.error });
+    const t = sanitizeTag(tag);
+    const c = sanitizeContent(content);
+    const v = Number.isFinite(value) ? Math.trunc(value) : 0;
+    const out = await session.command(`UPDATE ${r.id} ${v} ${t} ${c}`);
+    if (/not found/i.test(out)) return json({ ok: false, found: false, id: r.id });
+    if (/\[ERR\]/.test(out)) return json({ ok: false, error: out.trim(), id: r.id });
+    return json({ ok: true, action: "updated", id: r.id, tag: t, value: v });
   }
 );
 
 server.registerTool(
-  "memory_search",
+  "db_get",
   {
-    title: "Search memories",
+    title: "Get one row",
     description:
-      "Case-insensitive substring search across every memory's tag and " +
+      "Fetch a single row by `id` or `key`, with its value, tag, content " +
+      "and created/updated timestamps.",
+    inputSchema: { ...idKey },
+  },
+  async ({ id, key }) => {
+    const r = resolveId({ id, key });
+    if (r.error) return json({ ok: false, error: r.error });
+    const out = await session.command(`SELECT ${r.id}`);
+    if (/not found/i.test(out)) return json({ ok: true, found: false, id: r.id });
+    const rec = parseDetail(out);
+    if (!rec) return ok(out.trim());
+    return json({ ok: true, found: true, ...rec });
+  }
+);
+
+server.registerTool(
+  "db_delete",
+  {
+    title: "Delete a row",
+    description: "Remove the row addressed by `id` or `key`, if it exists.",
+    inputSchema: { ...idKey },
+  },
+  async ({ id, key }) => {
+    const r = resolveId({ id, key });
+    if (r.error) return json({ ok: false, error: r.error });
+    const out = await session.command(`DELETE ${r.id}`);
+    const deleted = /1 row deleted/i.test(out);
+    return json({ ok: true, deleted, id: r.id });
+  }
+);
+
+server.registerTool(
+  "db_find",
+  {
+    title: "Search rows",
+    description:
+      "Case-insensitive substring search across every row's tag and " +
       "content. Returns all matching rows.",
     inputSchema: {
       query: z.string().min(1).describe("substring to look for"),
@@ -134,33 +207,30 @@ server.registerTool(
 );
 
 server.registerTool(
-  "memory_list",
+  "db_list",
   {
-    title: "List all memories",
-    description: "Return every stored memory (id, tag, value, content).",
+    title: "List all rows",
+    description: "Return every live row (id, tag, value, content).",
     inputSchema: {},
   },
   async () => {
     const out = await session.command("SELECT *");
     const rows = parseTable(out);
-    return json({ ok: true, count: rows.length, memories: rows });
+    return json({ ok: true, count: rows.length, rows });
   }
 );
 
 server.registerTool(
-  "memory_delete",
+  "db_count",
   {
-    title: "Delete a memory by key",
-    description: "Remove the memory addressed by `key`, if it exists.",
-    inputSchema: {
-      key: z.string().min(1).describe("the key of the memory to delete"),
-    },
+    title: "Count rows",
+    description: "Return the number of live rows in the database.",
+    inputSchema: {},
   },
-  async ({ key }) => {
-    const id = keyToId(key);
-    const out = await session.command(`DELETE ${id}`);
-    const deleted = /1 row deleted/i.test(out);
-    return json({ ok: true, deleted, key, id });
+  async () => {
+    const out = await session.command("COUNT");
+    const m = out.match(/\[\s*OK\s*\]\s*(\d+)/);
+    return json({ ok: true, count: m ? Number(m[1]) : null });
   }
 );
 

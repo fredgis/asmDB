@@ -6,13 +6,14 @@
 %define RVA(x)    ((x) - IMAGEBASE)
 
 ; ---- Record layout (256 bytes, four cache lines) ----
-; Tuned for agent memory: a numeric score, creation/update timestamps, a short
-; category tag, and a free-text content field, all fixed-width.
+; A general-purpose fixed record: a numeric value/score, creation/update
+; timestamps, a short category tag, and a free-text content field, all
+; fixed-width. (Agent memory is one example use case, not the only one.)
 %define REC_SIZE    256
 %define REC_SHIFT   8        ; log2(REC_SIZE) - slot index <-> byte offset
 %define REC_ID      0        ; u64  primary key
 %define REC_STATUS  8        ; u8   0 empty / 1 live / 2 deleted
-%define REC_KIND    9        ; u8   memory kind enum (reserved, default 0)
+%define REC_KIND    9        ; u8   row-kind tag (reserved, default 0)
 %define REC_CLEN    12       ; u32  content byte length
 %define REC_CREATED 16       ; i64  created  (unix epoch ms)
 %define REC_UPDATED 24       ; i64  updated  (unix epoch ms)
@@ -26,7 +27,7 @@
 %define ST_OCCUPIED 1
 %define ST_DELETED  2
 
-; ---- Memory kind enum (stored in REC_KIND; reserved for future use) ----
+; ---- Row-kind tag (stored in REC_KIND; reserved for future use) ----
 %define KIND_GENERIC 0
 
 ; ---- Hash table (v1: fixed power-of-two capacity) ----

@@ -134,7 +134,7 @@ h_g_cat:    db '  Catalog', 0
 h_g_sess:   db '  Session', 0
 
 hc_insert:  db 'INSERT <id> <val> <tag> <text>', 0
-hd_insert:  db 'store a memory row', 0
+hd_insert:  db 'insert a row', 0
 hc_sel1:    db 'SELECT <id>', 0
 hd_sel1:    db 'show one row (full detail)', 0
 hc_selall:  db 'SELECT *', 0
@@ -172,14 +172,14 @@ hc_exit:    db 'EXIT / QUIT', 0
 hd_exit:    db 'leave asmdb', 0
 
 ; ---- SCHEMA / TYPES (static) ----
-s_schema_title: db '  record layout - fixed 256 bytes per row (agent-memory schema)', 0
+s_schema_title: db '  record layout - fixed 256 bytes per row', 0
 s_schema_body:
     db 13, 10
     db '    offset  size  field    type', 13, 10
     db '    ------  ----  -------  -------------------------------------', 13, 10
     db '    0       8     id       u64   primary key', 13, 10
     db '    8       1     status   u8    0 empty / 1 live / 2 deleted', 13, 10
-    db '    9       1     kind     u8    memory kind (reserved)', 13, 10
+    db '    9       1     kind     u8    row-kind tag (reserved)', 13, 10
     db '    12      4     clen     u32   content byte length', 13, 10
     db '    16      8     created  i64   unix epoch ms (auto)', 13, 10
     db '    24      8     updated  i64   unix epoch ms (auto)', 13, 10

@@ -1,7 +1,7 @@
 {
   "name": "asmdb-mcp",
   "version": "1.0.0",
-  "description": "Model Context Protocol server exposing asmdb as durable long-term memory for AI agents.",
+  "description": "Model Context Protocol server exposing the asmdb transactional engine as a generic CRUD store (agent memory is one example use case).",
   "type": "module",
   "bin": {
     "asmdb-mcp": "src/server.js"

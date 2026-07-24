@@ -4,8 +4,8 @@
   <h1>asmdb</h1>
 
   <p>
-    <strong>A transactional CRUD database engine, hand-written in x86-64 assembly —<br>
-    tuned for agent memory, with a Model Context Protocol server.</strong><br>
+    <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
+    x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. ~18 KB. And it is genuinely fast.
   </p>
 
@@ -17,7 +17,7 @@
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/runtime-Win32%20%2F%20no%20CRT-bf8700" alt="runtime"></a>
     <a href="#"><img src="https://img.shields.io/badge/binary-~18%20KB-1a7f37" alt="size"></a>
-    <a href="#"><img src="https://img.shields.io/badge/MCP-agent%20memory-6e4aa0" alt="mcp"></a>
+    <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
 </div>
@@ -31,10 +31,13 @@ there is **no linker, no C runtime, no libraries** — and the program talks to
 every statement is flushed to disk, `BEGIN`/`COMMIT`/`ROLLBACK` are real
 transactions, and a write-ahead log makes crash recovery atomic.
 
-Its 256-byte record is tuned for **AI-agent memory** — a numeric score,
-automatic created/updated timestamps, a short `tag`, and a free-text `content`
-field — and a bundled **[MCP server](mcp/)** exposes it to any agent as durable
-long-term memory.
+You drive it two ways: an **ASCII-art CLI** over stdin/stdout, and a bundled
+**[MCP server](mcp/)** that exposes the engine to any Model Context Protocol
+client as a generic CRUD store (`db_insert` / `db_get` / `db_find` / …). Its
+256-byte record — a numeric `value`, automatic `created`/`updated` timestamps,
+a short `tag`, and a free-text `content` field — suits many workloads;
+**durable long-term memory for an AI agent is one example use case**, not the
+only one.
 
 ```text
 asmdb> INSERT 1001 5 project asmdb is a database engine written in x86-64 assembly
@@ -60,11 +63,12 @@ That is the whole point of writing a database in assembly.
 - [Quickstart](#quickstart)
 - [Commands](#commands)
 - [Data model & supported types](#data-model--supported-types)
-- [Agent memory & the MCP server](#agent-memory--the-mcp-server)
+- [MCP server & the CRUD interface](#mcp-server--the-crud-interface)
 - [How asmdb works](#how-asmdb-works) — the 60-second version, then a deep dive
 - [On-disk format: `.dat` and `.wal`](#on-disk-format-dat-and-wal)
 - [Performance](#performance) — benchmarks vs SQLite
 - [How a modern database goes faster](#how-a-modern-database-goes-faster)
+- [Transactional-database principles](#transactional-database-principles) — the pillars & coverage
 - [Connect from your app](#connect-from-your-app-python--c--c)
 - [Engine specification](#engine-specification)
 - [Roadmap & SaaS plan](#roadmap--saas-plan)
@@ -75,13 +79,14 @@ That is the whole point of writing a database in assembly.
 - **Zero dependencies** — assembled by NASM alone. No linker, no CRT, no DLL but `kernel32`.
 - **Four cache lines per row** — fixed 256-byte records in an open-addressing hash
   table; the record array *is* the index. Lookups are Fibonacci hash + linear probe.
-- **Built for agent memory** — a score, auto `created`/`updated` timestamps, a
-  `tag` namespace and free-text `content`, plus a `FIND` substring search.
-- **MCP server included** — [`mcp/`](mcp/) turns asmdb into durable memory for an
-  AI agent (store / recall / search / list / delete).
-- **Durable by default** — autocommit flushes every mutation (`FlushFileBuffers`).
 - **Real transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` backed by an undo log.
+- **Durable by default** — autocommit flushes every mutation (`FlushFileBuffers`).
 - **Crash-safe** — a WAL with a commit marker is replayed or discarded atomically on startup.
+- **Two interfaces** — an ASCII-art **CLI** and a bundled **[MCP server](mcp/)** that
+  exposes generic CRUD tools (`db_insert` / `db_get` / `db_find` / `db_list` / …).
+- **General-purpose record** — a numeric `value`, auto `created`/`updated` timestamps,
+  a `tag` namespace and free-text `content`, plus a `FIND` substring search; agent
+  memory is one example workload.
 - **Genuinely fast** — a built-in `BENCH` command measures the engine directly (see [Performance](#performance)).
 - **A real CLI** — colored banner, sectioned `HELP`, catalog commands, boxed result tables.
 
@@ -129,20 +134,20 @@ Here `tag` is a single token; `content` is the rest of the line (spaces allowed)
 ## Data model & supported types
 
 Every row is a **fixed 256-byte record** — exactly four CPU cache lines. That
-single constraint is what keeps the engine small, predictable, and fast, and the
-fields are shaped for **agent memory**: a numeric score, two automatic
-timestamps, a short category `tag`, and a free-text `content` field. The physical
-layout never changes:
+single constraint is what keeps the engine small, predictable, and fast. The
+fields are general-purpose — a numeric `value`, two automatic timestamps, a
+short category `tag`, and a free-text `content` field — and the physical layout
+never changes:
 
 | Offset | Size | Field | Type | Notes |
 |-------:|-----:|-------|------|-------|
 | `0`  | 8   | `id`      | `u64`       | primary key |
 | `8`  | 1   | `status`  | `u8`        | `0` empty · `1` live · `2` deleted (tombstone) |
-| `9`  | 1   | `kind`    | `u8`        | memory-kind enum (reserved, default `0`) |
+| `9`  | 1   | `kind`    | `u8`        | row-kind tag (reserved, default `0`) |
 | `12` | 4   | `clen`    | `u32`       | content byte length |
 | `16` | 8   | `created` | `i64`       | creation time, unix epoch ms (auto) |
 | `24` | 8   | `updated` | `i64`       | last-update time, unix epoch ms (auto) |
-| `32` | 8   | `value`   | `i64`       | numeric score / payload |
+| `32` | 8   | `value`   | `i64`       | numeric payload / score |
 | `40` | 40  | `tag`     | `char[40]`  | category / namespace, NUL-padded |
 | `80` | 176 | `content` | `char[176]` | free text, NUL-padded |
 
@@ -167,25 +172,32 @@ chooses the interpretation:
 One `.dat` file is one database holding one logical table; its name lives in the
 512-byte header. See [On-disk format](#on-disk-format-dat-and-wal) for the exact bytes.
 
-## Agent memory & the MCP server
+## MCP server & the CRUD interface
 
 asmdb ships with a Node [Model Context Protocol](https://modelcontextprotocol.io)
-server in [`mcp/`](mcp/) that turns the engine into **durable long-term memory
-for an AI agent**. It keeps one long-lived `asmdb.exe` process (the 64 MiB region
-is read once), and exposes five tools:
+server in [`mcp/`](mcp/) that exposes the engine to any MCP client as a
+**generic CRUD store**. It keeps one long-lived `asmdb.exe` process (the 64 MiB
+region is read once) and exposes seven tools:
 
 | Tool | Arguments | Description |
 |------|-----------|-------------|
-| `memory_store`  | `key`, `content`, `tag?`, `value?` | insert or overwrite a memory (upsert on the same key) |
-| `memory_recall` | `key` | fetch one memory with content, tag, value, timestamps |
-| `memory_search` | `query` | case-insensitive substring search over tag + content |
-| `memory_list`   | — | return every stored memory |
-| `memory_delete` | `key` | remove a memory by key |
+| `db_insert` | `id`\|`key`, `content?`, `tag?`, `value?`, `upsert?` | insert a row; `upsert:true` overwrites instead of erroring |
+| `db_update` | `id`\|`key`, `content?`, `tag?`, `value?` | overwrite an existing row |
+| `db_get`    | `id`\|`key` | fetch one row with value, tag, content, timestamps |
+| `db_delete` | `id`\|`key` | remove a row |
+| `db_find`   | `query` | case-insensitive substring search over tag + content |
+| `db_list`   | — | return every live row |
+| `db_count`  | — | number of live rows |
 
-An agent addresses each memory by a free-text `key`, which the server hashes to
-asmdb's `u64` primary id with 64-bit FNV-1a — so the engine stays a pure id-keyed
-store with no secondary index. `tag` becomes a namespace, `value` an optional
-score, `content` the remembered text, and `created`/`updated` are automatic.
+A row is addressed by a numeric `id` (used as-is) **or** a string `key` that the
+server hashes to asmdb's `u64` primary id with 64-bit FNV-1a — so the engine
+stays a pure id-keyed store with no secondary index.
+
+> **Example use case — agent memory.** Address each memory by a string `key`
+> (e.g. `user.timezone`), use `tag` as a namespace, `value` as an optional
+> score and `content` as the remembered text, and call `db_insert` with
+> `upsert:true` to store-or-overwrite. `created`/`updated` are automatic, so an
+> agent gets durable long-term memory for free — one workload among many.
 
 ```bash
 cd mcp && npm install && npm test      # end-to-end test against a scratch DB
@@ -463,6 +475,33 @@ layout was chosen so these are additive, not rewrites.
 Everything marked 🗺️ is future work, called out plainly so the benchmarks above
 stay honest: they measure what asmdb **does today**, not what it might do.
 
+## Transactional-database principles
+
+A serious transactional database is more than fast CRUD. The table below scores
+asmdb against the classic **ACID** guarantees plus the operational pillars every
+real database service needs — ✅ delivered, ◐ partial, 🗺️ planned — and points
+at where each lives (the assembly **engine**, its [roadmap](docs/ENGINE.md#12-roadmap),
+or the hosted [SaaS layer](docs/SAAS.md)).
+
+| # | Principle | asmdb today | Where |
+|--:|-----------|:-----------:|-------|
+| 1 | **Atomicity** — a transaction is all-or-nothing | ✅ | `BEGIN`/`COMMIT`/`ROLLBACK` + undo log (engine) |
+| 2 | **Consistency** — only valid states are committed | ◐ | unique primary key, fixed-width types; richer `CHECK` constraints → roadmap |
+| 3 | **Isolation** — concurrent txns don't interfere | ◐ | single-writer per instance today; MVCC / snapshot isolation → roadmap |
+| 4 | **Durability** — committed data survives a crash | ✅ | WAL + `FlushFileBuffers` (engine) |
+| 5 | **Crash recovery** — atomic redo / discard on restart | ✅ | idempotent WAL replay with commit marker (engine) |
+| 6 | **Concurrency control** — many clients, safely | ◐ | single-writer per DB (SaaS gives one instance per DB); multi-reader MVCC → roadmap |
+| 7 | **Indexing & access paths** — no full scans | ◐ | O(1) primary hash index; secondary / bitmap / range → roadmap |
+| 8 | **Query & access interface** — a defined API | ✅ | REPL grammar + MCP CRUD tools + Python/C#/C clients |
+| 9 | **Backup & restore / PITR** — recover to a point in time | ◐ | copy `.dat`/`.wal`; snapshots + WAL shipping + PITR → SaaS / roadmap |
+| 10 | **Security & observability** — authz, encryption, audit, metrics | 🗺️ | provided by the [SaaS layer](docs/SAAS.md) (engine stays single-node) |
+
+The engine owns the **transactional core** (1, 4, 5, 8 delivered; 2, 3, 7
+advancing on the [engine roadmap](docs/ENGINE.md#12-roadmap)). The **operational
+pillars** that turn a fast engine into a dependable *service* (6, 9, 10) are the
+job of the [SaaS layer](docs/SAAS.md) — and the engine stays 100% assembly
+throughout.
+
 ## Connect from your app (Python · C# · C)
 
 There is **no driver or network protocol** — asmdb is a stdin/stdout REPL. To use
@@ -498,19 +537,21 @@ Two documents, deliberately kept in separate lanes:
   partitioning, an in-asm binary wire protocol, and a Linux syscall port. See
   [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 - **[`docs/SAAS.md`](docs/SAAS.md) — the productization plan.** How the assembly
-  engine becomes a hosted, multi-tenant **agent-memory-as-a-service** (remote
-  MCP over HTTP/SSE): architecture, wire protocols, tenancy & isolation, auth,
-  quotas/metering, durability/backups, HA/replication, security/compliance,
-  observability, deployment, pricing, and a phased GTM. The engine is the data
-  plane and stays assembly; **this control/service layer may use any language**
-  (Rust/Go), by design.
+  engine becomes **asmdb Cloud**: a hosted, pay-as-you-go database service where
+  every database instance runs in its **own isolated micro-container** with a
+  dedicated `asmdb.exe`. Covers provisioning & lifecycle, per-instance isolation,
+  the HTTP/gRPC + remote-MCP access layer, consumption metering & billing,
+  durability/backups, HA, security/compliance, deployment, pricing, and a phased
+  GTM. The engine is the data plane and stays assembly; **this control/service
+  layer may use any language** (Rust/Go), by design. (Hosted agent memory is one
+  example workload on top.)
 
 ## Project layout
 
 ```
 asmdb/
   src/          main.asm + .inc modules (console, parse, store, db, wal, data)
-  mcp/          Model Context Protocol server (agent memory) + tests
+  mcp/          Model Context Protocol server (generic CRUD tools) + tests
   clients/      stdio client examples: Python, C#, C
   examples/     seed-salesdb.ps1 sample loader, bench.ps1 + bench_sqlite.py
   tests/        smoke.ps1 + make_wal.py crash-recovery fixture

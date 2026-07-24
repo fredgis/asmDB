@@ -124,11 +124,11 @@ export function keyToId(key) {
 
 /** Collapse a value into a single-token tag (<= 39 chars, no spaces). */
 export function sanitizeTag(tag) {
-  const t = String(tag || "mem")
+  const t = String(tag || "-")
     .replace(/\s+/g, "_")
     .replace(/[^\x21-\x7e]/g, "")
     .slice(0, 39);
-  return t.length ? t : "mem";
+  return t.length ? t : "-";
 }
 
 /** Flatten content onto one line and clamp to the engine's 175-byte field. */

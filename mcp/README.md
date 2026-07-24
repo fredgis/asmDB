@@ -1,47 +1,58 @@
 # asmdb MCP server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that turns
-**asmdb** into durable long-term **memory for AI agents**. An agent can store
-facts, recall them by key, search them, list them, and delete them — all backed
+A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes
+the **asmdb** transactional engine as a **generic CRUD store** over MCP. Any MCP
+client can insert, update, get, delete, search, list and count rows — all backed
 by the WAL-durable x86-64 assembly engine.
+
+**Agent memory is one example use case** (address each memory by a string key,
+use `tag` as a namespace and `content` as the remembered text) — but the tools
+are a general-purpose database interface, not memory-specific.
 
 ```
 ┌──────────────┐   MCP (stdio)   ┌───────────────┐   stdin/stdout   ┌────────────┐
-│  AI agent /  │ ───────────────▶│ asmdb-mcp     │ ────────────────▶│ asmdb.exe  │
-│  MCP client  │◀─────────────── │ (Node server) │◀──────────────── │  (engine)  │
+│  MCP client  │ ───────────────▶│ asmdb-mcp     │ ────────────────▶│ asmdb.exe  │
+│ (agent, IDE) │◀─────────────── │ (Node server) │◀──────────────── │  (engine)  │
 └──────────────┘   tool calls    └───────────────┘   commands       └────────────┘
-                                                                     agentmem.dat
-                                                                     agentmem.wal
+                                                                       asmdb.dat
+                                                                       asmdb.wal
 ```
 
 The server keeps **one long-lived `asmdb.exe` process** for the whole session,
 so the 64 MiB record region is read from disk once at startup; every tool call
-is then an in-memory hash lookup plus a small durable write.
+is then an in-memory hash lookup plus a small durable write. When the MCP client
+disconnects, the server shuts the engine down cleanly (no orphaned process).
 
-## How keys map to records
+## Addressing rows: `id` or `key`
 
-An agent addresses each memory by a free-text `key` (e.g. `user.name`,
-`project.stack`). The server hashes that key to asmdb's `u64` primary id with
-64-bit FNV-1a, so the engine stays a pure id-keyed store — no secondary string
-index needed. The rest of the record maps naturally:
+Every record-addressed tool accepts **either**:
 
-| MCP field | asmdb column | notes |
+- `id` — a numeric primary key (`u64`), used as-is (the generic-DB pattern), or
+- `key` — a free-text string that the server hashes to a `u64` id with 64-bit
+  **FNV-1a** (the named-record / agent-memory pattern).
+
+So the engine stays a pure id-keyed store — no secondary string index needed.
+The rest of the record maps as:
+
+| Field     | asmdb column | notes |
 |-----------|--------------|-------|
-| `key`     | `id`         | FNV-1a(key) → u64 |
-| `tag`     | `tag`        | short single-word category (≤ 39 chars) |
-| `value`   | `value`      | optional numeric score (i64) |
-| `content` | `content`    | the remembered text (≤ 175 chars) |
+| `id`/`key`| `id`         | integer as-is, or FNV-1a(key) → u64 |
+| `tag`     | `tag`        | short single-word category / namespace (≤ 39 chars) |
+| `value`   | `value`      | optional numeric payload / score (i64) |
+| `content` | `content`    | free text (≤ 175 chars) |
 | —         | `created` / `updated` | set automatically (unix ms) |
 
 ## Tools
 
 | Tool | Arguments | Description |
 |------|-----------|-------------|
-| `memory_store`  | `key`, `content`, `tag?`, `value?` | insert or overwrite a memory (upsert on the same key) |
-| `memory_recall` | `key` | fetch one memory with content, tag, value and timestamps |
-| `memory_search` | `query` | case-insensitive substring search over tag + content |
-| `memory_list`   | — | return every stored memory |
-| `memory_delete` | `key` | remove a memory by key |
+| `db_insert` | `id`\|`key`, `content?`, `tag?`, `value?`, `upsert?` | insert a row; `upsert:true` overwrites instead of erroring |
+| `db_update` | `id`\|`key`, `content?`, `tag?`, `value?` | overwrite an existing row (errors if absent) |
+| `db_get`    | `id`\|`key` | fetch one row with value, tag, content, timestamps |
+| `db_delete` | `id`\|`key` | remove a row |
+| `db_find`   | `query` | case-insensitive substring search over tag + content |
+| `db_list`   | — | return every live row |
+| `db_count`  | — | number of live rows |
 
 ## Install & run
 
@@ -61,7 +72,7 @@ Build the engine first (`powershell -File build.ps1` from the repo root) so
 |---------|---------|---------|
 | `ASMDB_EXE` | `../build/asmdb.exe` | path to the engine binary |
 | `ASMDB_DIR` | `~/.asmdb` | directory holding the data files |
-| `ASMDB_DB`  | `agentmem` | database base name (`<db>.dat` / `<db>.wal`) |
+| `ASMDB_DB`  | `asmdb` | database base name (`<db>.dat` / `<db>.wal`) |
 
 ### Register with an MCP client
 
@@ -71,20 +82,37 @@ Add the server to your client's MCP configuration (example for a
 ```json
 {
   "mcpServers": {
-    "asmdb-memory": {
+    "asmdb": {
       "command": "node",
       "args": ["C:/Users/you/repo-asmdb/mcp/src/server.js"],
       "env": {
         "ASMDB_EXE": "C:/Users/you/repo-asmdb/build/asmdb.exe",
         "ASMDB_DIR": "C:/Users/you/.asmdb",
-        "ASMDB_DB": "agentmem"
+        "ASMDB_DB": "asmdb"
       }
     }
   }
 }
 ```
 
-Once connected, the agent can call e.g. `memory_store` with
-`{ "key": "user.timezone", "content": "Europe/Paris", "tag": "profile" }`, then
-later `memory_recall` with `{ "key": "user.timezone" }` to get it back — durably,
-across restarts, from an assembly database that fits in a cache line ×4.
+## Examples
+
+**Generic key/value+text store**, addressing rows by numeric id:
+
+```jsonc
+db_insert { "id": 1001, "tag": "order", "value": 4200, "content": "invoice #1001 paid" }
+db_get    { "id": 1001 }
+db_find   { "query": "invoice" }
+```
+
+**Agent long-term memory**, addressing rows by string key (create-or-update
+with `upsert`):
+
+```jsonc
+db_insert { "key": "user.timezone", "content": "Europe/Paris", "tag": "profile", "upsert": true }
+db_get    { "key": "user.timezone" }        // → durable across restarts
+db_delete { "key": "user.timezone" }
+```
+
+Both patterns hit the same assembly engine, where each record is four cache
+lines and every write is WAL-durable.
