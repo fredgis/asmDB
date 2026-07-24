@@ -67,6 +67,7 @@ That is the whole point of writing a database in assembly.
 - [How a modern database goes faster](#how-a-modern-database-goes-faster)
 - [Connect from your app](#connect-from-your-app-python--c--c)
 - [Engine specification](#engine-specification)
+- [Roadmap & SaaS plan](#roadmap--saas-plan)
 - [Project layout](#project-layout)
 
 ## Why it's interesting
@@ -486,6 +487,24 @@ convention, record store, hash function, on-disk formats, the two-phase commit
 and recovery protocol, the MCP integration, and the full roadmap — see
 **[`docs/ENGINE.md`](docs/ENGINE.md)**.
 
+## Roadmap & SaaS plan
+
+Two documents, deliberately kept in separate lanes:
+
+- **[`docs/ENGINE.md`](docs/ENGINE.md) — the engine roadmap.** Everything here
+  stays **100% x86-64 assembly**: hardening (CRC32 WAL, incremental checkpoint,
+  group commit, dynamic resize), fast reads (secondary/bitmap indexes, AVX2/512
+  scans, range queries), columnar storage + compression, then concurrency,
+  partitioning, an in-asm binary wire protocol, and a Linux syscall port. See
+  [§12 Roadmap](docs/ENGINE.md#12-roadmap).
+- **[`docs/SAAS.md`](docs/SAAS.md) — the productization plan.** How the assembly
+  engine becomes a hosted, multi-tenant **agent-memory-as-a-service** (remote
+  MCP over HTTP/SSE): architecture, wire protocols, tenancy & isolation, auth,
+  quotas/metering, durability/backups, HA/replication, security/compliance,
+  observability, deployment, pricing, and a phased GTM. The engine is the data
+  plane and stays assembly; **this control/service layer may use any language**
+  (Rust/Go), by design.
+
 ## Project layout
 
 ```
@@ -495,12 +514,13 @@ asmdb/
   clients/      stdio client examples: Python, C#, C
   examples/     seed-salesdb.ps1 sample loader, bench.ps1 + bench_sqlite.py
   tests/        smoke.ps1 + make_wal.py crash-recovery fixture
-  docs/         ENGINE.md spec, assets/ (logo, banner, generator)
+  docs/         ENGINE.md spec, SAAS.md plan, assets/ (logo, banner, generator)
   poc/          minimal 752-byte PE64 proof-of-concept
   build.ps1     locates NASM and assembles from src\
 ```
 
-See [`docs/ENGINE.md`](docs/ENGINE.md) for the full specification and roadmap.
+See [`docs/ENGINE.md`](docs/ENGINE.md) for the full engine specification and
+roadmap, and [`docs/SAAS.md`](docs/SAAS.md) for the SaaS productization plan.
 
 ## License
 

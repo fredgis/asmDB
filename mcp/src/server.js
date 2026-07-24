@@ -165,11 +165,17 @@ server.registerTool(
 );
 
 async function shutdown() {
+  if (shutdown.called) return;
+  shutdown.called = true;
   await session.close();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+// When the MCP client disconnects, our stdin is closed. Shut the engine down
+// gracefully so we never leave an orphaned asmdb.exe holding the data files.
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

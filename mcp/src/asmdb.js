@@ -44,8 +44,24 @@ export class AsmdbSession {
 
   _onData(chunk) {
     this.buf += chunk;
-    let idx;
-    while (this.queue.length && (idx = this.buf.indexOf(PROMPT)) !== -1) {
+    // Resolve queued readers FIFO on each prompt. To be robust against DB
+    // content that happens to contain the literal "asmdb> ", only treat the
+    // prompt as a frame boundary when it starts a line (buffer start or right
+    // after a newline) - the engine always emits it at column 0, while any
+    // echoed content appears mid-line inside a table cell or detail field.
+    while (this.queue.length) {
+      let idx = -1;
+      let from = 0;
+      for (;;) {
+        const hit = this.buf.indexOf(PROMPT, from);
+        if (hit === -1) break;
+        if (hit === 0 || this.buf[hit - 1] === "\n") {
+          idx = hit;
+          break;
+        }
+        from = hit + PROMPT.length;
+      }
+      if (idx === -1) break;
       const segment = this.buf.slice(0, idx);
       this.buf = this.buf.slice(idx + PROMPT.length);
       this.queue.shift().resolve(segment);
@@ -63,12 +79,33 @@ export class AsmdbSession {
 
   async close() {
     if (this.closed) return;
+    this.closed = true;
+    // Resolve only once the engine has fully exited and released its data
+    // files, so callers can safely delete the db directory afterwards.
+    const exited = new Promise((resolve) => {
+      if (this.proc.exitCode !== null || this.proc.signalCode !== null) {
+        resolve();
+        return;
+      }
+      this.proc.once("exit", resolve);
+    });
     try {
       this.proc.stdin.write("EXIT\n");
+      this.proc.stdin.end();
     } catch {
       /* ignore */
     }
-    this.closed = true;
+    // Safety net: if the engine does not exit promptly, terminate it so we
+    // never leave an orphaned asmdb.exe holding the data files open.
+    const killer = setTimeout(() => {
+      try {
+        this.proc.kill();
+      } catch {
+        /* ignore */
+      }
+    }, 2000);
+    await exited;
+    clearTimeout(killer);
   }
 }
 

@@ -121,7 +121,7 @@ db_write_header:
     pop  rbp
     ret
 
-; db_write_slot(rcx = slot ptr) - write one 64-byte record to disk
+; db_write_slot(rcx = slot ptr) - write one 256-byte record to disk
 db_write_slot:
     push rbp
     mov  rbp, rsp
@@ -280,6 +280,8 @@ db_open:
     mov  qword [rsp+0x30], 0
     call [rel iat_CreateFileA]
     mov  [rel g_dat_handle], rax
+    cmp  rax, INVALID_HANDLE
+    je   .openfail
     call wal_open
     call wal_recover
     ; read the header
@@ -352,6 +354,11 @@ db_open:
     mov  rsp, rbp
     pop  rbp
     ret
+.openfail:
+    lea  rcx, [rel s_err_open]
+    call puts
+    mov  ecx, 1
+    call [rel iat_ExitProcess]
 
 ; db_close()
 db_close:

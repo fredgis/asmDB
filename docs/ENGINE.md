@@ -384,6 +384,12 @@ place and bumps `updated`.
 
 ## 12. Roadmap
 
+> **Scope of this roadmap.** Everything here is the **engine** — it stays
+> **100% x86-64 assembly** (NASM, `-f bin`, no linker, no CRT). Turning asmdb
+> into a hosted product (network protocol, multi-tenancy, billing, HA) is a
+> *separate* concern and is tracked in **[`SAAS.md`](SAAS.md)**; that layer may
+> use higher-level languages, but it never replaces the assembly core.
+
 ### Delivered ✅
 
 | # | Milestone | Status |
@@ -400,28 +406,66 @@ place and bumps `updated`.
 | 10 | Agent-memory 256-byte schema (score, timestamps, tag, content) | ✅ done |
 | 11 | `FIND` substring search; `SCHEMA`/`TYPES`/`TABLES`/`DATABASES` | ✅ done |
 | 12 | MCP server (5 memory tools) + language clients (Py/C#/C) | ✅ done |
+| 13 | Fatal-I/O and out-of-memory guards (open failure aborts cleanly) | ✅ done |
 
-### Planned — not yet implemented ⬜
+Everything below is **future work** — listed to set direction honestly, not to
+imply it exists. The current engine is a single-table row store with one hash
+index. Each phase is deliberately achievable *in assembly*.
 
-These are **future work**; the current engine is a row-store with a single hash
-index. They are listed here to be honest about scope, not to imply they exist.
+### v1.0 — Harden the core (durability & safety)
 
-| Area | Idea | Status |
-|------|------|--------|
-| Columnar storage | split hot columns (`value`, `created`) into contiguous arrays for scan-heavy analytics | ⬜ planned |
-| Compression | dictionary-encode `tag`, RLE/delta-encode timestamps, frame-of-reference for `value` | ⬜ planned |
-| Secondary / bitmap indexes | index `tag` and `kind` for O(1) category lookups instead of full scans (`FIND`, `SELECT *`) | ⬜ planned |
-| Partitioning | shard the region into multiple `<db>.partN.dat` files by key range or hash to bound checkpoint I/O | ⬜ planned |
-| Parallel scans | fan `SELECT *`/`FIND` across worker threads over partitions | ⬜ planned |
-| MVCC | multi-version rows + snapshot isolation for concurrent readers/writers | ⬜ planned |
-| Dynamic resize | grow the hash region past load factor 0.75 instead of erroring | ⬜ planned |
-| Incremental checkpoint | flush only dirty slots (a dirty-page bitmap) instead of the touched-set today | ⬜ planned |
+The theme is "never lie about durability, never corrupt on crash."
+
+| Item | What it adds | CRUD path helped |
+|------|--------------|------------------|
+| **CRC32 on WAL frames** | detect torn/garbled logs on recovery (SSE4.2 `crc32` instruction) | durable C/U/D |
+| **Incremental checkpoint** | a dirty-slot bitmap so `COMMIT` flushes only touched pages, not the whole 64 MiB region — the fix for the bulk-durable benchmark | durable bulk write |
+| **Group commit** | coalesce concurrent `COMMIT`s into one `fsync` | high-rate durable writes |
+| **Dynamic resize / rehash** | grow the table past load factor 0.75 instead of erroring; power-of-two doubling + incremental re-probe | all CRUD at scale |
+| **Short-write / error propagation** | check every `WriteFile`/`ReadFile` return, surface `[ERR] io` instead of silently continuing | all persistence |
+
+### v1.5 — Make reads fast at scale (indexing & scans)
+
+The theme is "stop doing O(capacity) scans."
+
+| Item | What it adds | CRUD path helped |
+|------|--------------|------------------|
+| **Secondary hash index on `tag`** | O(1) "all rows with tag = X" instead of a full scan in `FIND` | filtered Read |
+| **Bitmap index on `kind`** | one bit per slot per kind; AND/OR predicates by streaming bitmaps | multi-predicate Read |
+| **AVX2 / AVX-512 scan kernels** | vectorised `SELECT *`/`FIND`/`COUNT`: compare 8–16 status bytes or `value` cells per instruction | analytical Read |
+| **Range queries on `value`/`created`** | `SELECT WHERE value > n`, `created BETWEEN a AND b` over a sorted side-index | temporal recall |
+| **Prefix / fuzzy `FIND`** | substring search accelerated with a SIMD `memchr`-style first-byte filter | search |
+
+### v2.0 — Columnar & compression (analytics)
+
+The theme is "touch only the bytes a query needs."
+
+| Item | What it adds | CRUD path helped |
+|------|--------------|------------------|
+| **Column split** | store `value`, `created`, `updated` in contiguous arrays beside the row store | scan-heavy Read, `SUM`/`COUNT` |
+| **Bit-packing to declared `TYPES` width** | a `u8`-typed `value` column shrinks 8× | Read scans, bulk load |
+| **Frame-of-reference + delta** | encode timestamps as deltas from a base; ints as offsets from a min | storage, cache misses |
+| **Dictionary-encoded `tag`** | replace repeated tags with small codes | storage, group-by |
+| **RLE for `kind`/`status`** | run-length encode low-cardinality columns | scans |
+
+### v3.0 — Concurrency, partitioning & portability
+
+The theme is "more cores, more machines, more OSes — still assembly."
+
+| Item | What it adds | CRUD path helped |
+|------|--------------|------------------|
+| **Partitioning** | shard slots into `<db>.partN.dat` by key hash; prune irrelevant partitions | all CRUD at scale |
+| **Parallel scans** | one worker thread per partition (`CreateThread`), fan-in results | analytical Read, bulk ops |
+| **MVCC + snapshot isolation** | versioned rows so readers never block writers; a lock-free ring for versions | concurrent workloads |
+| **Overlapped / async I/O** | Windows IOCP for checkpoint writes off the commit path | durable throughput |
+| **Linux/macOS port** | a thin syscall layer (`syscall` on Linux, `svc`/BSD on macOS) behind the same core; ELF/Mach-O emitters | portability |
+| **Binary wire protocol** | a length-prefixed request/response codec in assembly, replacing line parsing — the substrate the [SaaS](SAAS.md) data plane speaks | networked access |
 
 > **Honest benchmark note.** Durable *bulk* insert currently checkpoints by
 > writing the entire preallocated region because open-addressed hashing scatters
 > rows across the 64 MiB area. This is why the bulk-durable number trails SQLite
-> slightly in the README table — the incremental/partitioned checkpoint items
-> above are the fix, and are not yet implemented.
+> slightly in the README table — the **incremental checkpoint** (v1.0) and
+> **partitioning** (v3.0) items above are the fix, and are not yet implemented.
 
 ---
 

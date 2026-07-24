@@ -58,7 +58,6 @@ g_hdr:
 ; ------------------------------- strings ------------------------------------
 ; ANSI SGR colors (emitted only when stdout is a real console).
 c_reset:       db 27, '[0m', 0
-c_bold:        db 27, '[1m', 0
 c_dim:         db 27, '[38;5;244m', 0
 c_grey:        db 27, '[38;5;240m', 0
 c_white:       db 27, '[1m', 27, '[38;5;255m', 0
@@ -88,19 +87,18 @@ s_err_dup:     db '[ERR] key already exists', 13, 10, 0
 s_err_nf:      db '[ERR] key not found', 13, 10, 0
 s_err_full:    db '[ERR] table full', 13, 10, 0
 s_err_syntax:  db '[ERR] syntax error - type HELP', 13, 10, 0
+s_err_open:    db '[ERR] cannot open database file', 13, 10, 0
+s_err_mem:     db '[ERR] out of memory', 13, 10, 0
 s_count_pre:   db '[ OK ] ', 0
 s_count_post:  db ' row(s)', 13, 10, 0
 s_find_none:   db '[ OK ] no matching rows', 13, 10, 0
-s_det_sep:     db '  +---------+--------------------------------------------------+', 13, 10, 0
 s_det_id:      db '  id       : ', 0
-s_det_kind:    db '  kind     : ', 0
 s_det_value:   db '  value    : ', 0
 s_det_tag:     db '  tag      : ', 0
 s_det_created: db '  created  : ', 0
 s_det_updated: db '  updated  : ', 0
 s_det_content: db '  content  : ', 0
 s_det_ms:      db ' ms', 0
-s_txn:         db '[ OK ] autocommit mode (each statement is durable)', 13, 10, 0
 s_txn_begin:    db '[ OK ] transaction started', 13, 10, 0
 s_txn_commit:   db '[ OK ] transaction committed', 13, 10, 0
 s_txn_rollback: db '[ OK ] transaction rolled back', 13, 10, 0
@@ -232,7 +230,7 @@ bnr3:  db '   / __ `/ ___/ __ `__ \/ __  / __ \', 0
 bnr4:  db '  / /_/ (__  ) / / / / / /_/ / /_/ /', 0
 bnr5:  db '  \__,_/____/_/ /_/ /_/\__,_/_.___/ ', 0
 s_tagline:  db '  a minimalist transactional database engine, in x86-64 assembly', 0
-s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL durability  .  ~14 KB', 0
+s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL durability  .  ~18 KB', 0
 s_hint_a:   db '  type ', 0
 s_hint_hi1: db 'HELP', 0
 s_hint_b:   db ' for commands, or ', 0

@@ -95,7 +95,17 @@ try {
   fails++;
 } finally {
   await client.close().catch(() => {});
-  rmSync(dataDir, { recursive: true, force: true });
+  // Best-effort cleanup: the engine may take a moment to release the data
+  // files after the client disconnects. Retry, then give up quietly - a
+  // leftover temp dir must never fail the test run.
+  for (let i = 0; i < 30; i++) {
+    try {
+      rmSync(dataDir, { recursive: true, force: true });
+      break;
+    } catch {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
 }
 
 if (fails > 0) {

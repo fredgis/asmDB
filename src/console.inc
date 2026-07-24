@@ -21,6 +21,23 @@ valloc:
     pop  rbp
     ret
 
+; valloc_req(rcx = size) -> rax = pointer; aborts the process if allocation fails
+valloc_req:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call valloc
+    test rax, rax
+    jz   .fail
+    mov  rsp, rbp
+    pop  rbp
+    ret
+.fail:
+    lea  rcx, [rel s_err_mem]
+    call puts
+    mov  ecx, 1
+    call [rel iat_ExitProcess]
+
 ; putn(rcx = ptr, rdx = len) -> writes len bytes to stdout
 putn:
     push rbp

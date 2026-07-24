@@ -30,9 +30,16 @@ wal_open:
     mov  qword [rsp+0x30], 0
     call [rel iat_CreateFileA]
     mov  [rel g_wal_handle], rax
+    cmp  rax, INVALID_HANDLE
+    je   .openfail
     mov  rsp, rbp
     pop  rbp
     ret
+.openfail:
+    lea  rcx, [rel s_err_open]
+    call puts
+    mov  ecx, 1
+    call [rel iat_ExitProcess]
 
 ; wal_write(rcx = offset, rdx = buf, r8 = len)
 wal_write:

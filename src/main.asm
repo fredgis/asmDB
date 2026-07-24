@@ -104,19 +104,19 @@ entry:
 .nocolor:
 
     mov  ecx, READ_BUF_SIZE
-    call valloc
+    call valloc_req
     mov  [rel g_readbuf], rax
     mov  ecx, LINE_MAX
-    call valloc
+    call valloc_req
     mov  [rel g_linebuf], rax
     mov  rcx, CAPACITY*REC_SIZE
-    call valloc
+    call valloc_req
     mov  [rel g_table], rax
     mov  rcx, UNDO_MAX*UNDO_ENTRY
-    call valloc
+    call valloc_req
     mov  [rel g_undo], rax
     mov  rcx, WAL_BUF_SIZE
-    call valloc
+    call valloc_req
     mov  [rel g_walbuf], rax
 
     mov  qword [rel g_readpos], 0

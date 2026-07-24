@@ -1,5 +1,5 @@
 ; -----------------------------------------------------------------------------
-; src/store.inc - open-addressing hash table over fixed 64-byte records.
+; src/store.inc - open-addressing hash table over fixed 256-byte records.
 ; The record array IS the index (allocated via VirtualAlloc at startup).
 ; -----------------------------------------------------------------------------
 
