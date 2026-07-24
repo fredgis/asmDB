@@ -23,6 +23,10 @@ g_undo_n:      dq 0
 g_count_snap:  dq 0
 g_walbuf:      dq 0
 g_color:       dq 0
+g_qpf:         dq 0
+g_qpc0:        dq 0
+g_qpc1:        dq 0
+g_qpc2:        dq 0
 g_conmode:     dd 0
 g_have_argtable: dd 0
 g_onech:       db 0
@@ -91,6 +95,16 @@ s_txn_none:     db '[ERR] no active transaction', 13, 10, 0
 s_txn_active:   db '[ERR] transaction already active', 13, 10, 0
 s_txn_toobig:   db '[ERR] transaction too large - COMMIT or ROLLBACK', 13, 10, 0
 
+                align 8
+bench_name40:   db 'bench_row', 0
+                times 40-($-bench_name40) db 0
+s_bench_pre:    db '[ OK ] BENCH inserted ', 0
+s_bench_rows:   db ' rows', 13, 10, 0
+s_bench_ram:    db '  in-RAM insert            : ', 0
+s_bench_rs:     db ' rows/sec  (engine only, no I/O)', 13, 10, 0
+s_bench_dur:    db '  checkpoint + fsync total : ', 0
+s_bench_ms:     db ' ms  (full-table durable write)', 13, 10, 0
+
 s_cell_l:      db '| ', 0
 s_cell_m:      db ' | ', 0
 s_cell_r:      db ' |', 0
@@ -132,6 +146,8 @@ hc_schema:  db 'SCHEMA', 0
 hd_schema:  db 'show the record layout', 0
 hc_types:   db 'TYPES', 0
 hd_types:   db 'supported column types', 0
+hc_bench:   db 'BENCH <n>', 0
+hd_bench:   db 'insert n synthetic rows, report rows/sec', 0
 
 hc_help:    db 'HELP', 0
 hd_help:    db 'show this reference', 0
@@ -153,11 +169,22 @@ s_schema_body:
 s_types_title: db '  supported column types', 0
 s_types_body:
     db 13, 10
-    db '    u64        unsigned 64-bit integer     id / primary key', 13, 10
-    db '    i64        signed 64-bit integer       value column', 13, 10
-    db '    char[40]   fixed ASCII text, <= 40 B   name column', 13, 10
+    db '    type         bits  domain                      column', 13, 10
+    db '    ----------   ----  --------------------------  -----------', 13, 10
+    db '    u64            64  0 .. 1.8e19                 id (key)', 13, 10
+    db '    i64            64  -9.2e18 .. 9.2e18           value', 13, 10
+    db '    u32 / i32      32  narrowed integer            value', 13, 10
+    db '    u16 / i16      16  narrowed integer            value', 13, 10
+    db '    u8  / i8        8  narrowed integer            value', 13, 10
+    db '    bool            8  0 = false / 1 = true        value', 13, 10
+    db '    f64            64  IEEE-754 double             value (bits)', 13, 10
+    db '    timestamp      64  Unix epoch milliseconds     value', 13, 10
+    db '    char[40]      320  fixed ASCII text, <= 40 B   name', 13, 10
     db 13, 10
-    db '    every row is one fixed 64-byte record - no varints, no BLOBs', 13, 10
+    db '    A physical row is u64 id + u8 status + i64 value + char[40] name', 13, 10
+    db '    (64 bytes, one cache line). Narrow ints, bool, f64 and timestamps', 13, 10
+    db '    all live in the 64-bit value cell - asmdb keeps the raw bits and', 13, 10
+    db '    your app picks the interpretation.', 13, 10
     db 13, 10, 0
 
 ; ---- TABLES / DATABASES ----
@@ -179,7 +206,7 @@ bnr3:  db '   / __ `/ ___/ __ `__ \/ __  / __ \', 0
 bnr4:  db '  / /_/ (__  ) / / / / / /_/ / /_/ /', 0
 bnr5:  db '  \__,_/____/_/ /_/ /_/\__,_/_.___/ ', 0
 s_tagline:  db '  a minimalist transactional database engine, in x86-64 assembly', 0
-s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL durability  .  ~10 KB', 0
+s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL durability  .  ~14 KB', 0
 s_hint_a:   db '  type ', 0
 s_hint_hi1: db 'HELP', 0
 s_hint_b:   db ' for commands, or ', 0
@@ -202,6 +229,7 @@ kw_tables:     db 'TABLES', 0
 kw_databases:  db 'DATABASES', 0
 kw_schema:     db 'SCHEMA', 0
 kw_types:      db 'TYPES', 0
+kw_bench:      db 'BENCH', 0
 
 ; ----------------------------- import table ---------------------------------
                 align 4
@@ -232,6 +260,8 @@ iat_FindFirstFileA:    dq RVA(h_FindFirstFileA)
 iat_FindNextFileA:     dq RVA(h_FindNextFileA)
 iat_FindClose:         dq RVA(h_FindClose)
 iat_ExitProcess:       dq RVA(h_ExitProcess)
+iat_QueryPerformanceCounter:   dq RVA(h_QueryPerformanceCounter)
+iat_QueryPerformanceFrequency: dq RVA(h_QueryPerformanceFrequency)
                        dq 0
 
 dll_name: db 'kernel32.dll', 0
@@ -284,3 +314,9 @@ h_FindClose:         dw 0
                 align 2
 h_ExitProcess:       dw 0
     db 'ExitProcess', 0
+                align 2
+h_QueryPerformanceCounter:   dw 0
+    db 'QueryPerformanceCounter', 0
+                align 2
+h_QueryPerformanceFrequency: dw 0
+    db 'QueryPerformanceFrequency', 0

@@ -541,6 +541,128 @@ cmd_count:
     pop  rbp
     ret
 
+; cmd_bench() - BENCH <n> : reset the table, insert n synthetic rows (timed in
+; RAM), then checkpoint the whole table to disk + fsync (timed). This overwrites
+; the current database with synthetic data - run it against a scratch db.
+cmd_bench:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x80
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    mov  [rbp-32], r12
+    mov  [rbp-40], r13
+    call skip_spaces_rsi
+    call parse_u64                   ; rax = n, rdx = ok flag
+    test rdx, rdx
+    jnz  .haven
+    mov  rax, 100000
+.haven:
+    test rax, rax
+    jnz  .nz
+    mov  rax, 100000
+.nz:
+    mov  rcx, (CAPACITY*3)/4          ; cap to keep the load factor < 0.75
+    cmp  rax, rcx
+    jbe  .ncap
+    mov  rax, rcx
+.ncap:
+    mov  r12, rax                    ; r12 = n
+    mov  [rbp-64], rax               ; n_local
+    ; reset the table: clear every slot, count = 0
+    mov  qword [rel g_count], 0
+    mov  rdi, [rel g_table]
+    mov  rcx, CAPACITY*REC_SIZE
+    xor  eax, eax
+    rep  stosb
+    ; frequency + start timestamp
+    lea  rcx, [rel g_qpf]
+    call [rel iat_QueryPerformanceFrequency]
+    lea  rcx, [rel g_qpc0]
+    call [rel iat_QueryPerformanceCounter]
+    ; insert loop: id = 1 .. n
+    xor  r13, r13
+.loop:
+    cmp  r13, r12
+    jae  .loopend
+    lea  rcx, [r13+1]                ; id = i + 1
+    mov  [rbp-48], rcx
+    call store_locate                ; rdx = insertable slot
+    test rdx, rdx
+    jz   .lnext
+    mov  rdi, rdx
+    mov  rax, [rbp-48]
+    mov  [rdi+REC_ID], rax
+    mov  byte [rdi+REC_STATUS], ST_OCCUPIED
+    mov  [rdi+REC_VALUE], rax
+    lea  rsi, [rel bench_name40]
+    lea  rdi, [rdi+REC_NAME]
+    mov  rcx, NAME_MAX
+    rep  movsb
+    inc  qword [rel g_count]
+.lnext:
+    inc  r13
+    jmp  .loop
+.loopend:
+    lea  rcx, [rel g_qpc1]            ; end of in-RAM phase
+    call [rel iat_QueryPerformanceCounter]
+    ; durable checkpoint: whole slot region + header, then fsync
+    mov  rcx, HDR_SIZE
+    mov  rdx, [rel g_table]
+    mov  r8, CAPACITY*REC_SIZE
+    call write_at
+    call db_write_header
+    call db_flush
+    lea  rcx, [rel g_qpc2]
+    call [rel iat_QueryPerformanceCounter]
+    ; ram_ticks = qpc1 - qpc0 (floor at 1 to avoid divide-by-zero)
+    mov  rax, [rel g_qpc1]
+    sub  rax, [rel g_qpc0]
+    jnz  .rt_ok
+    mov  rax, 1
+.rt_ok:
+    mov  [rbp-56], rax
+    ; rate = n * freq / ram_ticks
+    mov  rax, r12
+    mul  qword [rel g_qpf]
+    div  qword [rbp-56]
+    mov  [rbp-72], rax
+    ; total_ms = (qpc2 - qpc0) * 1000 / freq
+    mov  rax, [rel g_qpc2]
+    sub  rax, [rel g_qpc0]
+    mov  rcx, 1000
+    mul  rcx
+    div  qword [rel g_qpf]
+    mov  [rbp-80], rax
+    ; report
+    lea  rcx, [rel s_bench_pre]
+    call puts
+    mov  rcx, [rbp-64]
+    call put_u64
+    lea  rcx, [rel s_bench_rows]
+    call puts
+    lea  rcx, [rel s_bench_ram]
+    call puts
+    mov  rcx, [rbp-72]
+    call put_u64
+    lea  rcx, [rel s_bench_rs]
+    call puts
+    lea  rcx, [rel s_bench_dur]
+    call puts
+    mov  rcx, [rbp-80]
+    call put_u64
+    lea  rcx, [rel s_bench_ms]
+    call puts
+    mov  r13, [rbp-40]
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; cmd_help() - HELP (sectioned, aligned, colored)
 cmd_help:
     push rbp
@@ -604,6 +726,9 @@ cmd_help:
     call help_row
     lea  rcx, [rel hc_types]
     lea  rdx, [rel hd_types]
+    call help_row
+    lea  rcx, [rel hc_bench]
+    lea  rdx, [rel hd_bench]
     call help_row
     call crlf
     lea  rcx, [rel h_g_sess]
@@ -858,6 +983,10 @@ dispatch:
     call token_eq
     test rax, rax
     jnz  .types
+    lea  rdi, [rel kw_bench]
+    call token_eq
+    test rax, rax
+    jnz  .bench
     lea  rcx, [rel s_unknown]
     call puts
     jmp  .ok0
@@ -903,6 +1032,10 @@ dispatch:
     jmp  .ok0
 .types:
     call cmd_types
+    jmp  .ok0
+.bench:
+    call advance_token
+    call cmd_bench
     jmp  .ok0
 .exit:
     mov  rax, CMD_EXIT

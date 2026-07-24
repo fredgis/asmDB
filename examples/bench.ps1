@@ -1,198 +1,168 @@
 #requires -Version 5
 <#
 .SYNOPSIS
-    Micro-benchmark for asmdb: measures insert throughput (rows/sec).
+    Benchmark asmdb and compare it against SQLite on the same machine.
 
 .DESCRIPTION
-    Streams a large batch of INSERT statements into asmdb.exe and times the
-    end-to-end wall clock with a high-resolution Stopwatch. Two workloads are
-    measured, because they stress very different paths:
+    Reports several throughput figures, each stressing a different layer:
 
-      1. Autocommit  - every INSERT is written to the .dat file AND fsync'd
-                       (FlushFileBuffers) on its own. This is the durable
-                       "one transaction per row" number: disk-bound.
+      A. Engine (in-RAM)   - asmdb's BENCH command inserts N rows in a tight
+                             loop with NO disk I/O and NO text protocol, timed
+                             internally with QueryPerformanceCounter. This is
+                             the raw data-structure speed (hash + record store).
 
-      2. Transaction - inserts are grouped into BEGIN .. COMMIT batches. Rows
-                       are applied in RAM and only the commit is flushed once
-                       per batch (write-ahead log + single fsync). CPU-bound.
+      B. Durable bulk      - BENCH then checkpoints the whole table to disk and
+                             fsyncs once. Rows/sec for a durable bulk load.
 
-    Process-spawn + database-open cost is measured separately (a bare EXIT run)
-    and subtracted, so the reported figures reflect the engine's insert work,
-    not shell overhead. Each workload is run several times; the best (fastest)
-    run is reported, which is standard practice for throughput micro-benchmarks.
+      C. Transaction (stdio) - INSERTs streamed over the stdin protocol in
+                             BEGIN..COMMIT batches. End-to-end, protocol tax
+                             included (command parsing + per-row acks).
 
-.PARAMETER Rows
-    Total rows to insert per workload (default 20000).
+      D. Autocommit (stdio)  - INSERTs streamed one per durable transaction
+                             (fsync per row). The disk-bound worst case.
 
-.PARAMETER BatchSize
-    Rows per BEGIN/COMMIT in the transaction workload (default 4000). Capped at
-    4096, the engine's per-transaction undo-log limit (UNDO_MAX).
-
-.PARAMETER Runs
-    Number of timed repetitions per workload; best run wins (default 3).
+    SQLite (Python's in-process sqlite3, i.e. C API with no text protocol - a
+    generous baseline) is measured for the comparable workloads via
+    bench_sqlite.py, and a comparison table is printed.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\examples\bench.ps1
-
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\examples\bench.ps1 -Rows 40000 -Runs 5
+    powershell -ExecutionPolicy Bypass -File .\examples\bench.ps1 -Rows 100000 -NoCompare
 #>
 [CmdletBinding()]
 param(
-    [int]$Rows      = 20000,
+    [int]$Rows      = 100000,
+    [int]$AutoRows  = 10000,
     [int]$BatchSize = 4000,
     [int]$Runs      = 3,
-    [string]$Database = 'BenchDB'
+    [string]$Database = 'BenchDB',
+    [switch]$NoCompare
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $exe  = Join-Path $root 'build\asmdb.exe'
-
 if (-not (Test-Path $exe)) {
     Write-Host '>> building asmdb.exe ...' -ForegroundColor Cyan
     & powershell -ExecutionPolicy Bypass -File (Join-Path $root 'build.ps1') | Out-Host
 }
 if (-not (Test-Path $exe)) { throw "asmdb.exe not found at $exe - build it first." }
-
 if ($BatchSize -gt 4096) { $BatchSize = 4096 }   # UNDO_MAX
-if ($BatchSize -lt 1)    { $BatchSize = 1 }
 
 $dat = Join-Path $root "$Database.dat"
 $wal = Join-Path $root "$Database.wal"
 function Reset-Db { Remove-Item $dat, $wal -ErrorAction SilentlyContinue }
 
-# Run asmdb once with the given stdin text; return elapsed seconds + stdout.
 function Invoke-Asmdb {
     param([string]$InputText)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName               = $exe
-    $psi.Arguments              = $Database
-    $psi.WorkingDirectory       = $root
-    $psi.RedirectStandardInput  = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.UseShellExecute        = $false
-    $psi.CreateNoWindow         = $true
-
-    $p  = New-Object System.Diagnostics.Process
-    $p.StartInfo = $psi
+    $psi.FileName = $exe; $psi.Arguments = $Database; $psi.WorkingDirectory = $root
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     [void]$p.Start()
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
-    $p.StandardInput.Write($InputText)
-    $p.StandardInput.Close()
-    $p.WaitForExit()
+    $p.StandardInput.Write($InputText); $p.StandardInput.Close(); $p.WaitForExit()
     $sw.Stop()
-    $out = $outTask.Result
-    [void]$errTask.Result
-    return [pscustomobject]@{ Seconds = $sw.Elapsed.TotalSeconds; Out = $out }
+    $o = $outTask.Result; [void]$errTask.Result
+    return [pscustomobject]@{ Seconds = $sw.Elapsed.TotalSeconds; Out = $o }
 }
 
-# Build the two command streams once (StringBuilder = fast for large N).
-function Build-Autocommit {
+function Build-Stream {
+    param([int]$N, [int]$Batch)   # Batch=0 -> autocommit (no BEGIN/COMMIT)
     $sb = New-Object System.Text.StringBuilder
-    for ($i = 1; $i -le $Rows; $i++) {
-        [void]$sb.Append('INSERT ').Append($i).Append(' ').Append(($i * 7) % 100000).Append(' row_').Append($i).Append("`n")
-    }
-    [void]$sb.Append("COUNT`nEXIT`n")
-    return $sb.ToString()
-}
-function Build-Transaction {
-    $sb = New-Object System.Text.StringBuilder
-    $i = 1
-    while ($i -le $Rows) {
-        [void]$sb.Append("BEGIN`n")
-        $end = [Math]::Min($i + $BatchSize - 1, $Rows)
-        for (; $i -le $end; $i++) {
-            [void]$sb.Append('INSERT ').Append($i).Append(' ').Append(($i * 7) % 100000).Append(' row_').Append($i).Append("`n")
+    if ($Batch -le 0) {
+        for ($i = 1; $i -le $N; $i++) { [void]$sb.Append('INSERT ').Append($i).Append(' ').Append($i).Append(' r_').Append($i).Append("`n") }
+    } else {
+        $i = 1
+        while ($i -le $N) {
+            [void]$sb.Append("BEGIN`n")
+            $end = [Math]::Min($i + $Batch - 1, $N)
+            for (; $i -le $end; $i++) { [void]$sb.Append('INSERT ').Append($i).Append(' ').Append($i).Append(' r_').Append($i).Append("`n") }
+            [void]$sb.Append("COMMIT`n")
         }
-        [void]$sb.Append("COMMIT`n")
     }
-    [void]$sb.Append("COUNT`nEXIT`n")
-    return $sb.ToString()
+    [void]$sb.Append("EXIT`n"); return $sb.ToString()
 }
 
-function Get-Count {
-    param([string]$Out)
-    $m = [regex]::Match($Out, '\[ OK \]\s+(\d+)\s+row\(s\)')
-    if ($m.Success) { return [int]$m.Groups[1].Value }
-    return -1
+Write-Host ("=" * 66) -ForegroundColor DarkGray
+Write-Host " asmdb benchmark  (rows=$Rows, best of $Runs)" -ForegroundColor Cyan
+Write-Host ("=" * 66) -ForegroundColor DarkGray
+
+# --- A/B: engine + durable bulk via BENCH ---
+$engBest = 0; $ckBest = [int]::MaxValue
+Write-Host ">> A/B engine + durable checkpoint (BENCH) ..." -ForegroundColor DarkGray
+for ($r = 0; $r -lt $Runs; $r++) {
+    Reset-Db
+    $o = (Invoke-Asmdb "BENCH $Rows`nEXIT").Out
+    $m1 = [regex]::Match($o, 'in-RAM insert\s+:\s+(\d+)')
+    $m2 = [regex]::Match($o, 'fsync total\s+:\s+(\d+)')
+    if ($m1.Success -and [int64]$m1.Groups[1].Value -gt $engBest) { $engBest = [int64]$m1.Groups[1].Value }
+    if ($m2.Success -and [int]$m2.Groups[1].Value -lt $ckBest)    { $ckBest  = [int]$m2.Groups[1].Value }
 }
+if ($ckBest -le 0) { $ckBest = 1 }
+$durBulk = [int][Math]::Round($Rows / ($ckBest / 1000.0))
 
-# Measure baseline: spawn + fresh 4 MB db open + EXIT (no inserts).
-function Measure-Baseline {
-    $best = [double]::MaxValue
-    for ($r = 0; $r -lt $Runs; $r++) {
-        Reset-Db
-        $res = Invoke-Asmdb "EXIT`n"
-        if ($res.Seconds -lt $best) { $best = $res.Seconds }
-    }
-    return $best
-}
+# --- baseline for stdio measurements ---
+$base = [double]::MaxValue
+for ($r = 0; $r -lt $Runs; $r++) { Reset-Db; $s = (Invoke-Asmdb "EXIT`n").Seconds; if ($s -lt $base) { $base = $s } }
 
-# Measure a workload: subtract baseline, keep the fastest net time.
-function Measure-Workload {
-    param([string]$Name, [string]$InputText, [double]$Baseline)
-    $best   = [double]::MaxValue
-    $rows   = -1
-    for ($r = 0; $r -lt $Runs; $r++) {
-        Reset-Db
-        $res = Invoke-Asmdb $InputText
-        $rows = Get-Count $res.Out
-        if ($res.Seconds -lt $best) { $best = $res.Seconds }
-    }
-    $net = [Math]::Max($best - $Baseline, 0.000001)
-    return [pscustomobject]@{
-        Name    = $Name
-        Rows    = $rows
-        Total   = $best
-        Net     = $net
-        PerSec  = [int][Math]::Round($Rows / $net)
-        UsPerOp = [Math]::Round(($net / $Rows) * 1e6, 2)
-    }
-}
+# --- C: transaction over stdio ---
+Write-Host ">> C transaction over stdio ..." -ForegroundColor DarkGray
+$txnStream = Build-Stream $Rows $BatchSize
+$txnBest = [double]::MaxValue
+for ($r = 0; $r -lt $Runs; $r++) { Reset-Db; $s = (Invoke-Asmdb $txnStream).Seconds; if ($s -lt $txnBest) { $txnBest = $s } }
+$txnNet = [Math]::Max($txnBest - $base, 0.000001)
+$txnRps = [int][Math]::Round($Rows / $txnNet)
 
-Write-Host ("=" * 60) -ForegroundColor DarkGray
-Write-Host " asmdb benchmark" -ForegroundColor Cyan
-Write-Host ("   rows/workload : {0}" -f $Rows)
-Write-Host ("   batch size    : {0} (transaction workload)" -f $BatchSize)
-Write-Host ("   runs (best of): {0}" -f $Runs)
-Write-Host ("=" * 60) -ForegroundColor DarkGray
-
-Write-Host ">> warming up + measuring baseline (spawn + open + exit) ..." -ForegroundColor DarkGray
-$baseline = Measure-Baseline
-Write-Host ("   baseline: {0:N4} s" -f $baseline) -ForegroundColor DarkGray
-
-Write-Host ">> workload 1/2: autocommit (durable, 1 fsync per row) ..." -ForegroundColor DarkGray
-$auto = Measure-Workload 'Autocommit (durable per row)' (Build-Autocommit) $baseline
-
-Write-Host ">> workload 2/2: transactions (batched, 1 fsync per commit) ..." -ForegroundColor DarkGray
-$txn = Measure-Workload ("Transaction (batches of {0})" -f $BatchSize) (Build-Transaction) $baseline
-
+# --- D: autocommit over stdio (smaller N; disk-bound) ---
+Write-Host ">> D autocommit over stdio ($AutoRows rows) ..." -ForegroundColor DarkGray
+Reset-Db
+$autoBest = (Invoke-Asmdb (Build-Stream $AutoRows 0)).Seconds
+$autoNet = [Math]::Max($autoBest - $base, 0.000001)
+$autoRps = [int][Math]::Round($AutoRows / $autoNet)
 Reset-Db
 
+# --- SQLite comparison ---
+$sq = $null
+if (-not $NoCompare) {
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if ($py) {
+        Write-Host ">> SQLite baseline (same machine) ..." -ForegroundColor DarkGray
+        $j = & python (Join-Path $PSScriptRoot 'bench_sqlite.py') --rows $Rows --runs $Runs --auto-rows $AutoRows 2>$null
+        if ($j) { $sq = $j | ConvertFrom-Json }
+    } else { Write-Host "   (python not found - skipping SQLite comparison)" -ForegroundColor Yellow }
+}
+
+function Fmt($n) { '{0:N0}' -f $n }
+function Ratio($a, $b) { if ($b -gt 0) { '{0:N1}x' -f ($a / $b) } else { 'n/a' } }
+
 Write-Host ''
-Write-Host (" Results  (best of {0}, {1} rows each)" -f $Runs, $Rows) -ForegroundColor Green
-Write-Host ("-" * 72) -ForegroundColor DarkGray
-$fmt = "{0,-30} {1,14} {2,12} {3,10}"
-Write-Host ($fmt -f 'workload', 'rows/sec', 'us/op', 'net (s)') -ForegroundColor Cyan
-Write-Host ("-" * 72) -ForegroundColor DarkGray
-foreach ($w in @($auto, $txn)) {
-    Write-Host ($fmt -f $w.Name, ("{0:N0}" -f $w.PerSec), ("{0:N2}" -f $w.UsPerOp), ("{0:N4}" -f $w.Net))
-}
-Write-Host ("-" * 72) -ForegroundColor DarkGray
+Write-Host " asmdb results" -ForegroundColor Green
+Write-Host ("   A engine insert (in-RAM, no I/O)   : {0,14} rows/sec" -f (Fmt $engBest))
+Write-Host ("   B durable bulk (checkpoint+fsync)  : {0,14} rows/sec  ({1} ms / {2} rows)" -f (Fmt $durBulk), $ckBest, $Rows)
+Write-Host ("   C transaction over stdio           : {0,14} rows/sec" -f (Fmt $txnRps))
+Write-Host ("   D autocommit over stdio (fsync/row): {0,14} rows/sec" -f (Fmt $autoRps))
 
-$speedup = if ($auto.PerSec -gt 0) { [Math]::Round($txn.PerSec / $auto.PerSec, 1) } else { 0 }
-Write-Host ("`n batched transactions are ~{0}x faster than per-row autocommit" -f $speedup) -ForegroundColor Green
-if ($auto.Rows -ne $Rows -or $txn.Rows -ne $Rows) {
-    Write-Host (" NOTE: expected {0} rows, got auto={1} txn={2}" -f $Rows, $auto.Rows, $txn.Rows) -ForegroundColor Yellow
-}
+if ($sq) {
+    Write-Host ''
+    Write-Host " comparison vs SQLite $($sq.sqlite_version) (same machine)" -ForegroundColor Green
+    Write-Host ("-" * 78) -ForegroundColor DarkGray
+    $f = "{0,-30} {1,14} {2,14} {3,10}"
+    Write-Host ($f -f 'workload', 'asmdb r/s', 'sqlite r/s', 'asmdb x') -ForegroundColor Cyan
+    Write-Host ("-" * 78) -ForegroundColor DarkGray
+    Write-Host ($f -f 'engine insert (in-RAM, 1 txn)', (Fmt $engBest), (Fmt $sq.memory_txn_rps),    (Ratio $engBest $sq.memory_txn_rps))
+    Write-Host ($f -f 'durable bulk (1 fsync)',        (Fmt $durBulk), (Fmt $sq.disk_txn_rps),      (Ratio $durBulk $sq.disk_txn_rps))
+    Write-Host ($f -f 'durable per-row (fsync/row)',   (Fmt $autoRps), (Fmt $sq.disk_autocommit_rps),(Ratio $autoRps $sq.disk_autocommit_rps))
+    Write-Host ("-" * 78) -ForegroundColor DarkGray
 
-# Markdown table (paste-ready for the README).
-Write-Host "`n--- markdown ---" -ForegroundColor DarkGray
-"| Workload | Durability | Throughput (rows/s) | Latency (us/op) |"
-"|---|---|---|---|"
-("| **Autocommit** (1 txn/row) | fsync **per row** | {0:N0} | {1:N2} |" -f $auto.PerSec, $auto.UsPerOp)
-("| **Transaction** (batch {0}) | fsync **per commit** | {1:N0} | {2:N2} |" -f $BatchSize, $txn.PerSec, $txn.UsPerOp)
+    Write-Host "`n--- markdown ---" -ForegroundColor DarkGray
+    "| Workload | asmdb | SQLite $($sq.sqlite_version) | asmdb speed-up |"
+    "|---|--:|--:|--:|"
+    ("| **Engine insert** - in-RAM, one transaction | **$(Fmt $engBest)** rows/s | $(Fmt $sq.memory_txn_rps) rows/s | **$(Ratio $engBest $sq.memory_txn_rps)** |")
+    ("| **Durable bulk load** - one fsync | **$(Fmt $durBulk)** rows/s | $(Fmt $sq.disk_txn_rps) rows/s | **$(Ratio $durBulk $sq.disk_txn_rps)** |")
+    ("| **Durable per-row** - fsync per row | **$(Fmt $autoRps)** rows/s | $(Fmt $sq.disk_autocommit_rps) rows/s | **$(Ratio $autoRps $sq.disk_autocommit_rps)** |")
+}
