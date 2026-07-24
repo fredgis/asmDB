@@ -672,11 +672,14 @@ The theme is "more cores, more machines, more OSes — still assembly."
 | **macOS port** | extend the `os_*` layer with a BSD `syscall`/`svc` backend and a Mach-O emitter (the **Linux ELF64 port is already shipped** — see Delivered #18) | portability |
 | **Binary wire protocol** | a length-prefixed request/response codec in assembly, replacing line parsing — the substrate the [SaaS](SAAS.md) data plane speaks | networked access |
 
-> **Honest benchmark note.** Durable *bulk* insert currently checkpoints by
-> writing the entire preallocated region because open-addressed hashing scatters
-> rows across the 1 GiB area. This is why the bulk-durable number trails SQLite
-> slightly in the README table — the **incremental checkpoint** (v1.0) and
-> **partitioning** (v3.0) items above are the fix, and are not yet implemented.
+> **Honest benchmark note.** Durable *bulk* insert checkpoints by writing the
+> entire preallocated region because open-addressed hashing scatters rows across
+> the 1 GiB area — ~1 GiB flushed regardless of row count. It is the most disk-
+> and page-cache-sensitive figure in the README table: it edges *ahead* of
+> SQLite on warm best-of-3 runs yet can trail it on cold, fresh-file runs. The
+> **incremental (dirty-slot) checkpoint** (v1.0) and **partitioning** (v3.0)
+> items above are what will make it *consistently* fast; they are not yet
+> implemented.
 
 ### Transactional-database principles — coverage
 

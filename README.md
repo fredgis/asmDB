@@ -58,8 +58,9 @@ asmdb> FIND assembly
 
 Because the engine does one thing — fixed-shape rows in a single hash-indexed
 table — it does that one thing at speeds a general-purpose SQL database cannot
-touch: **~25 million inserts/second** in RAM (measured below, and reproducible).
-That is the whole point of writing a database in assembly.
+touch: **over 12 million inserts/second** in RAM (measured below, and
+reproducible — ≈ 12× SQLite on the same machine). That is the whole point of
+writing a database in assembly.
 
 ## Table of contents
 
@@ -464,38 +465,43 @@ created **sparse** on disk so unused slots cost nothing.
 
 | Workload | asmdb | SQLite 3.49.1 | ratio |
 |---|--:|--:|--:|
-| **Engine insert** — in-RAM, one transaction | **≈ 17,746,402** rows/s | 1,709,935 rows/s | **≈ 10.4× faster** |
-| **Durable bulk load** — one checkpoint + `fsync` | ≈ 975,134 rows/s | 1,628,000 rows/s | ≈ 0.6× (slower) |
-| **Durable per-row** — one `fsync` per row | **≈ 1,694** rows/s | 319 rows/s | **≈ 5.3× faster** |
+| **Engine insert** — in-RAM, one transaction | **≈ 12,383,609** rows/s | 1,004,090 rows/s | **≈ 12.3× faster** |
+| **Durable bulk load** — one checkpoint + `fsync` | **≈ 1,170,960** rows/s | 859,784 rows/s | **≈ 1.4× faster*** |
+| **Durable per-row** — one `fsync` per row | **≈ 932** rows/s | 101 rows/s | **≈ 9.2× faster** |
 
 A fourth figure, not in the table because SQLite has no equivalent, is the
 **transaction throughput over the stdio protocol** — the realistic
 "over-the-wire" number a client sees, including command parsing and per-row acks:
-**≈ 21,690 rows/s** (2M rows in `BEGIN…COMMIT` batches).
+**≈ 5,932 rows/s** (2M rows in `BEGIN…COMMIT` batches). It is bounded by the
+line-based text protocol, not the engine — which is exactly why a real
+deployment batches inside `BEGIN … COMMIT`.
 
 The story the numbers tell: the disk flush dominates durability. Autocommit
-`fsync`s after *every* row (~1,694/s); a transaction applies every row in RAM and
+`fsync`s after *every* row (~932/s); a transaction applies every row in RAM and
 `fsync`s **once** (millions/s). Wrapping inserts in `BEGIN … COMMIT` is the single
 biggest speed lever.
 
 ### Why asmdb wins — and the honest caveats
 
-asmdb is faster on **in-RAM inserts (≈ 10×)** and **per-row durability (≈ 5×)**
+asmdb is faster on **in-RAM inserts (≈ 12×)** and **per-row durability (≈ 9×)**
 because **it does far less**: a fixed 256-byte schema, a single table, no SQL
 parser, no query planner, no secondary indexes, no MVCC, no concurrency control.
 SQLite is a full relational engine doing all of that. So this is *not* "assembly
 beats C" — it is **a specialized key/value store beating a general-purpose SQL
 database at the narrow thing it was built for.**
 
-The **durable bulk-load row is honestly ≈ 0.6× — *slower* than SQLite**, and it
-gets *more* pronounced at 2M rows than it was at 100k. The reason is a real,
-documented trade-off: because the open-addressed hash scatters rows across the
-whole 1 GiB region, the bulk checkpoint currently writes (and, on a fresh sparse
-file, first-allocates) the *entire* region rather than just the dirty rows — ~1 GiB
-flushed for 2M rows, far more bytes than SQLite's page-cache commit. The fix —
-an incremental (dirty-slot) checkpoint and partitioned files — is on the
-[roadmap](#how-a-modern-database-goes-faster), not yet implemented, so the number
-is reported as-is rather than hidden.
+**\* The durable bulk-load row is the one to read with care.** In this clean,
+best-of-3 run it edged *ahead* of SQLite (≈ 1.4×), but it is by far the most
+disk- and page-cache-sensitive number here and has measured *slower* than SQLite
+on cold, fresh-file runs. The reason is a real, documented trade-off: because the
+open-addressed hash scatters rows across the whole 1 GiB region, the bulk
+checkpoint currently writes (and, on a fresh sparse file, first-allocates) the
+*entire* region rather than just the dirty rows — ~1 GiB flushed for 2M rows,
+far more bytes than SQLite's page-cache commit. The planned fix — an incremental
+(dirty-slot) checkpoint and partitioned files — is on the
+[roadmap](#how-a-modern-database-goes-faster) and is what will make this figure
+*consistently* fast instead of variance-dependent. It is reported as measured
+rather than cherry-picked.
 
 <sub>Measured on an Intel Core Ultra 7 268V · NVMe SSD · Windows 11 · single-threaded ·
 best of 3 · SQLite 3.49.1 in-process (C API, no protocol). Throughput is disk- and

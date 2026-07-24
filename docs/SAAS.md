@@ -585,9 +585,10 @@ engine's assembly**, though some ride engine roadmap items.
 - **At-rest encryption** is a sidecar/volume responsibility today; some buyers
   may want engine-level field encryption (an optional AES page path in assembly,
   later — not required).
-- **Benchmark honesty:** the bulk-durable path currently trails SQLite; don't
-  build pricing/marketing on numbers the incremental-checkpoint work hasn't
-  delivered yet.
+- **Benchmark honesty:** the bulk-durable path is the most disk-/cache-sensitive
+  figure (ahead of SQLite on warm runs, behind on cold ones); don't build
+  pricing/marketing on numbers the incremental-checkpoint work hasn't made
+  *consistent* yet.
 
 ---
 
