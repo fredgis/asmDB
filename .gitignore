@@ -1,6 +1,7 @@
 # Build output
 build/*.exe
 build/*.obj
+build/asmdb
 
 # Runtime data files
 *.dat

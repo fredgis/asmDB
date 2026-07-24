@@ -172,20 +172,7 @@ parse_rest:
 
 ; now_ms() -> rax = current time in unix epoch milliseconds
 now_ms:
-    push rbp
-    mov  rbp, rsp
-    sub  rsp, 0x20
-    lea  rcx, [rel g_ft]
-    call [rel iat_GetSystemTimeAsFileTime]
-    mov  rax, [rel g_ft]             ; 100-ns ticks since 1601-01-01
-    xor  rdx, rdx
-    mov  rcx, 10000
-    div  rcx                         ; -> ms since 1601
-    mov  rcx, 11644473600000         ; ms between 1601 and 1970
-    sub  rax, rcx
-    mov  rsp, rbp
-    pop  rbp
-    ret
+    jmp  os_now_ms
 
 ; -------------------------- table rendering ---------------------------------
 
@@ -901,13 +888,7 @@ cmd_backup:
     mov  rdx, 200
     call parse_tok
     lea  rcx, [rel g_bakname]
-    mov  rdx, GENERIC_READ | GENERIC_WRITE
-    xor  r8, r8
-    xor  r9, r9
-    mov  dword [rsp+0x20], CREATE_ALWAYS
-    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
-    mov  qword [rsp+0x30], 0
-    call [rel iat_CreateFileA]
+    call os_create
     cmp  rax, INVALID_HANDLE
     je   .openfail
     mov  rbx, rax                    ; backup handle
@@ -923,7 +904,7 @@ cmd_backup:
     mov  rax, [rbp-32]
     mov  [rel g_dat_handle], rax     ; restore live handle
     mov  rcx, rbx
-    call [rel iat_CloseHandle]
+    call os_close
     lea  rcx, [rel s_ok_backup]
     call puts
     jmp  .done
@@ -966,13 +947,7 @@ cmd_restore:
     mov  rdx, 200
     call parse_tok
     lea  rcx, [rel g_bakname]
-    mov  rdx, GENERIC_READ
-    mov  r8d, 1                      ; FILE_SHARE_READ
-    xor  r9, r9
-    mov  dword [rsp+0x20], OPEN_EXISTING
-    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
-    mov  qword [rsp+0x30], 0
-    call [rel iat_CreateFileA]
+    call os_open_read
     cmp  rax, INVALID_HANDLE
     je   .openfail
     mov  rbx, rax                    ; backup handle
@@ -1005,7 +980,7 @@ cmd_restore:
     mov  rax, [rbp-32]
     mov  [rel g_dat_handle], rax     ; restore live handle
     mov  rcx, rbx
-    call [rel iat_CloseHandle]
+    call os_close
     call db_write_header             ; persist restored image to the live .dat
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
@@ -1019,7 +994,7 @@ cmd_restore:
     mov  rax, [rbp-32]
     mov  [rel g_dat_handle], rax     ; restore live handle before erroring
     mov  rcx, rbx
-    call [rel iat_CloseHandle]
+    call os_close
     lea  rcx, [rel s_err_bak_magic]
     call puts
     jmp  .done
@@ -1081,10 +1056,10 @@ cmd_bench:
     call now_ms
     mov  [rbp-88], rax
     ; frequency + start timestamp
-    lea  rcx, [rel g_qpf]
-    call [rel iat_QueryPerformanceFrequency]
-    lea  rcx, [rel g_qpc0]
-    call [rel iat_QueryPerformanceCounter]
+    call os_perf_freq
+    mov  [rel g_qpf], rax
+    call os_perf_counter
+    mov  [rel g_qpc0], rax
     ; insert loop: id = 1 .. n
     xor  r13, r13
 .loop:
@@ -1121,8 +1096,8 @@ cmd_bench:
     inc  r13
     jmp  .loop
 .loopend:
-    lea  rcx, [rel g_qpc1]            ; end of in-RAM phase
-    call [rel iat_QueryPerformanceCounter]
+    call os_perf_counter             ; end of in-RAM phase
+    mov  [rel g_qpc1], rax
     ; durable checkpoint: whole slot region + header, then fsync
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
@@ -1130,8 +1105,8 @@ cmd_bench:
     call write_at
     call db_write_header
     call db_flush
-    lea  rcx, [rel g_qpc2]
-    call [rel iat_QueryPerformanceCounter]
+    call os_perf_counter
+    mov  [rel g_qpc2], rax
     ; ram_ticks = qpc1 - qpc0 (floor at 1 to avoid divide-by-zero)
     mov  rax, [rel g_qpc1]
     sub  rax, [rel g_qpc0]
@@ -1370,12 +1345,18 @@ cmd_databases:
     call puts_col
     call crlf
     lea  rcx, [rel s_pat_dat]
-    lea  rdx, [rel g_finddata]
-    call [rel iat_FindFirstFileA]
+    call os_dir_open
     cmp  rax, INVALID_HANDLE
     je   .none
-    mov  rbx, rax                    ; find handle
+    mov  rbx, rax                    ; directory handle
+    mov  qword [rbp-32], 0           ; entries rendered
 .row:
+    mov  rcx, rbx
+    lea  rdx, [rel g_finddata]
+    call os_dir_next
+    test rax, rax
+    jz   .close
+    inc  qword [rbp-32]
     mov  rcx, 4
     call put_spaces
     lea  rcx, [rel g_finddata+FIND_NAME]
@@ -1405,14 +1386,12 @@ cmd_databases:
     call reset_color
 .nocur:
     call crlf
+    jmp  .row
+.close:
     mov  rcx, rbx
-    lea  rdx, [rel g_finddata]
-    call [rel iat_FindNextFileA]
-    test eax, eax
-    jnz  .row
-    mov  rcx, rbx
-    call [rel iat_FindClose]
-    jmp  .done
+    call os_dir_close
+    cmp  qword [rbp-32], 0
+    jne  .done
 .none:
     lea  rcx, [rel s_dbs_empty]
     call puts

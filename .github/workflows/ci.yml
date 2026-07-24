@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (ELF64, native run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Build ELF64
+        run: ./build.sh
+      - name: Validate ELF header
+        run: python3 tests/validate_elf.py build/asmdb
+      - name: Smoke test (CRUD + txn + persistence)
+        run: |
+          chmod +x tests/smoke.sh
+          ./tests/smoke.sh --no-build
+      - name: Benchmark (100k rows)
+        run: printf 'BENCH 100000\nEXIT\n' | ./build/asmdb bench
+
+  windows:
+    name: Windows (PE64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NASM
+        run: choco install nasm -y --no-progress
+      - name: Add NASM to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
+      - name: Build PE64
+        run: powershell -ExecutionPolicy Bypass -File .\build.ps1
+      - name: Smoke test (CRUD + txn + persistence)
+        run: powershell -ExecutionPolicy Bypass -File .\tests\smoke.ps1 -NoBuild

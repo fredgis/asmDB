@@ -22,13 +22,7 @@ wal_open:
     mov  rbp, rsp
     sub  rsp, 0x50
     lea  rcx, [rel g_walname]
-    mov  rdx, GENERIC_READ | GENERIC_WRITE
-    xor  r8, r8                      ; exclusive - no sharing (single-writer)
-    xor  r9, r9
-    mov  dword [rsp+0x20], OPEN_ALWAYS
-    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
-    mov  qword [rsp+0x30], 0
-    call [rel iat_CreateFileA]
+    call os_open
     mov  [rel g_wal_handle], rax
     cmp  rax, INVALID_HANDLE
     je   .openfail
@@ -39,27 +33,18 @@ wal_open:
     lea  rcx, [rel s_err_open]
     call puts
     mov  ecx, 1
-    call [rel iat_ExitProcess]
+    call os_exit
 
 ; wal_write(rcx = offset, rdx = buf, r8 = len)
 wal_write:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x50
-    mov  [rbp-8], rcx
-    mov  [rbp-16], rdx
-    mov  [rbp-24], r8
-    mov  rcx, [rel g_wal_handle]
-    mov  rdx, [rbp-8]
-    xor  r8, r8
-    mov  r9d, FILE_BEGIN
-    call [rel iat_SetFilePointerEx]
-    mov  rcx, [rel g_wal_handle]
-    mov  rdx, [rbp-16]
-    mov  r8, [rbp-24]
-    lea  r9, [rel g_io_dw]
-    mov  qword [rsp+0x20], 0
-    call [rel iat_WriteFile]
+    sub  rsp, 0x30
+    mov  r9, r8                      ; len
+    mov  r8, rdx                     ; buf
+    mov  rdx, rcx                    ; offset
+    mov  rcx, [rel g_wal_handle]     ; handle
+    call os_pwrite
     mov  rsp, rbp
     pop  rbp
     ret
@@ -68,22 +53,12 @@ wal_write:
 wal_read:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x50
-    mov  [rbp-8], rcx
-    mov  [rbp-16], rdx
-    mov  [rbp-24], r8
-    mov  rcx, [rel g_wal_handle]
-    mov  rdx, [rbp-8]
-    xor  r8, r8
-    mov  r9d, FILE_BEGIN
-    call [rel iat_SetFilePointerEx]
-    mov  rcx, [rel g_wal_handle]
-    mov  rdx, [rbp-16]
-    mov  r8, [rbp-24]
-    lea  r9, [rel g_io_dw]
-    mov  qword [rsp+0x20], 0
-    call [rel iat_ReadFile]
-    mov  eax, [rel g_io_dw]
+    sub  rsp, 0x30
+    mov  r9, r8                      ; len
+    mov  r8, rdx                     ; buf
+    mov  rdx, rcx                    ; offset
+    mov  rcx, [rel g_wal_handle]     ; handle
+    call os_pread
     mov  rsp, rbp
     pop  rbp
     ret
@@ -94,7 +69,7 @@ wal_flush:
     mov  rbp, rsp
     sub  rsp, 0x30
     mov  rcx, [rel g_wal_handle]
-    call [rel iat_FlushFileBuffers]
+    call os_fsync
     mov  rsp, rbp
     pop  rbp
     ret
@@ -106,11 +81,7 @@ wal_truncate:
     sub  rsp, 0x40
     mov  rcx, [rel g_wal_handle]
     xor  rdx, rdx
-    xor  r8, r8
-    mov  r9d, FILE_BEGIN
-    call [rel iat_SetFilePointerEx]
-    mov  rcx, [rel g_wal_handle]
-    call [rel iat_SetEndOfFile]
+    call os_truncate
     call wal_flush
     mov  rsp, rbp
     pop  rbp
@@ -192,7 +163,7 @@ wal_close:
     mov  rbp, rsp
     sub  rsp, 0x30
     mov  rcx, [rel g_wal_handle]
-    call [rel iat_CloseHandle]
+    call os_close
     mov  rsp, rbp
     pop  rbp
     ret

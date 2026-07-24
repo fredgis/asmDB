@@ -7,19 +7,9 @@
 ; locals at [rbp-8], [rbp-16], ...
 ; -----------------------------------------------------------------------------
 
-; valloc(rcx = size) -> rax = pointer (VirtualAlloc, MEM_COMMIT|RESERVE, RW)
+; valloc(rcx = size) -> rax = pointer (os_alloc: committed, zeroed, read/write)
 valloc:
-    push rbp
-    mov  rbp, rsp
-    sub  rsp, 0x30
-    mov  rdx, rcx                    ; dwSize
-    xor  rcx, rcx                    ; lpAddress = NULL
-    mov  r8d, MEM_COMMIT_RESERVE
-    mov  r9d, PAGE_READWRITE
-    call [rel iat_VirtualAlloc]
-    mov  rsp, rbp
-    pop  rbp
-    ret
+    jmp  os_alloc
 
 ; valloc_req(rcx = size) -> rax = pointer; aborts the process if allocation fails
 valloc_req:
@@ -36,19 +26,17 @@ valloc_req:
     lea  rcx, [rel s_err_mem]
     call puts
     mov  ecx, 1
-    call [rel iat_ExitProcess]
+    call os_exit
 
 ; putn(rcx = ptr, rdx = len) -> writes len bytes to stdout
 putn:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x40
-    mov  r8, rdx                     ; nNumberOfBytesToWrite
-    mov  rdx, rcx                    ; lpBuffer
-    mov  rcx, [rel g_stdout]         ; hFile
-    lea  r9, [rel g_written]         ; lpNumberOfBytesWritten
-    mov  qword [rsp+0x20], 0         ; lpOverlapped = NULL
-    call [rel iat_WriteFile]
+    mov  r8, rdx                     ; len
+    mov  rdx, rcx                    ; buf
+    mov  rcx, [rel g_stdout]         ; handle
+    call os_write
     mov  rsp, rbp
     pop  rbp
     ret
@@ -485,13 +473,8 @@ console_fill:
     mov  rcx, [rel g_stdin]
     mov  rdx, [rel g_readbuf]
     mov  r8d, READ_BUF_SIZE
-    lea  r9, [rel g_readlen_dw]
-    mov  qword [rsp+0x20], 0
-    call [rel iat_ReadFile]
+    call os_read
     test rax, rax
-    jz   .eof
-    mov  eax, [rel g_readlen_dw]
-    test eax, eax
     jz   .eof
     mov  [rel g_readlen], rax
     mov  qword [rel g_readpos], 0

@@ -44,22 +44,12 @@ strcpy_n:
 read_at:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x50
-    mov  [rbp-8], rcx
-    mov  [rbp-16], rdx
-    mov  [rbp-24], r8
-    mov  rcx, [rel g_dat_handle]
-    mov  rdx, [rbp-8]
-    xor  r8, r8
-    mov  r9d, FILE_BEGIN
-    call [rel iat_SetFilePointerEx]
-    mov  rcx, [rel g_dat_handle]
-    mov  rdx, [rbp-16]
-    mov  r8, [rbp-24]
-    lea  r9, [rel g_io_dw]
-    mov  qword [rsp+0x20], 0
-    call [rel iat_ReadFile]
-    mov  eax, [rel g_io_dw]
+    sub  rsp, 0x30
+    mov  r9, r8                      ; len
+    mov  r8, rdx                     ; buf
+    mov  rdx, rcx                    ; offset
+    mov  rcx, [rel g_dat_handle]     ; handle
+    call os_pread
     mov  rsp, rbp
     pop  rbp
     ret
@@ -68,21 +58,12 @@ read_at:
 write_at:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x50
-    mov  [rbp-8], rcx
-    mov  [rbp-16], rdx
-    mov  [rbp-24], r8
-    mov  rcx, [rel g_dat_handle]
-    mov  rdx, [rbp-8]
-    xor  r8, r8
-    mov  r9d, FILE_BEGIN
-    call [rel iat_SetFilePointerEx]
-    mov  rcx, [rel g_dat_handle]
-    mov  rdx, [rbp-16]
-    mov  r8, [rbp-24]
-    lea  r9, [rel g_io_dw]
-    mov  qword [rsp+0x20], 0
-    call [rel iat_WriteFile]
+    sub  rsp, 0x30
+    mov  r9, r8                      ; len
+    mov  r8, rdx                     ; buf
+    mov  rdx, rcx                    ; offset
+    mov  rcx, [rel g_dat_handle]     ; handle
+    call os_pwrite
     mov  rsp, rbp
     pop  rbp
     ret
@@ -93,7 +74,7 @@ db_flush:
     mov  rbp, rsp
     sub  rsp, 0x30
     mov  rcx, [rel g_dat_handle]
-    call [rel iat_FlushFileBuffers]
+    call os_fsync
     mov  rsp, rbp
     pop  rbp
     ret
@@ -157,7 +138,7 @@ db_init_names:
     sub  rsp, 0x40
     mov  [rbp-16], rsi
     mov  [rbp-24], rdi
-    call [rel iat_GetCommandLineA]
+    call os_cmdline
     mov  rsi, rax
     ; skip program name (handle quoted path)
     mov  al, [rsi]
@@ -272,13 +253,7 @@ db_open:
     mov  rbp, rsp
     sub  rsp, 0x50
     lea  rcx, [rel g_datname]
-    mov  rdx, GENERIC_READ | GENERIC_WRITE
-    xor  r8, r8                      ; exclusive - no sharing (single-writer)
-    xor  r9, r9
-    mov  dword [rsp+0x20], OPEN_ALWAYS
-    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
-    mov  qword [rsp+0x30], 0
-    call [rel iat_CreateFileA]
+    call os_open
     mov  [rel g_dat_handle], rax
     cmp  rax, INVALID_HANDLE
     je   .openfail
@@ -336,15 +311,7 @@ db_open:
     ; brand-new file: mark it sparse so unwritten slots cost no disk, then set
     ; the logical size to the full region without allocating/zeroing 1 GiB.
     mov  rcx, [rel g_dat_handle]
-    mov  edx, FSCTL_SET_SPARSE
-    xor  r8, r8                      ; lpInBuffer = NULL
-    xor  r9, r9                      ; nInBufferSize = 0
-    mov  qword [rsp+0x20], 0         ; lpOutBuffer = NULL
-    mov  qword [rsp+0x28], 0         ; nOutBufferSize = 0
-    lea  rax, [rel g_io_dw]
-    mov  [rsp+0x30], rax             ; lpBytesReturned
-    mov  qword [rsp+0x38], 0         ; lpOverlapped = NULL
-    call [rel iat_DeviceIoControl]
+    call os_set_sparse
     mov  qword [rel g_count], 0
     cmp  dword [rel g_have_argtable], 0
     jne  .nf_arg
@@ -360,29 +327,24 @@ db_open:
     ; extend the (sparse) file to header + full slot region; holes read as zero
     mov  rcx, [rel g_dat_handle]
     mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
-    xor  r8, r8
-    mov  r9d, FILE_BEGIN
-    call [rel iat_SetFilePointerEx]
-    mov  rcx, [rel g_dat_handle]
-    call [rel iat_SetEndOfFile]
+    call os_truncate
     call db_flush
 .done:
     mov  rsp, rbp
     pop  rbp
     ret
 .openfail:
-    call [rel iat_GetLastError]      ; read before any call clobbers it
-    cmp  eax, ERROR_SHARING_VIOLATION
-    jne  .openfail_generic
+    cmp  qword [rel g_open_locked], 0
+    je   .openfail_generic
     lea  rcx, [rel s_err_lock]
     call puts
     mov  ecx, 1
-    call [rel iat_ExitProcess]
+    call os_exit
 .openfail_generic:
     lea  rcx, [rel s_err_open]
     call puts
     mov  ecx, 1
-    call [rel iat_ExitProcess]
+    call os_exit
 
 ; db_close()
 db_close:
@@ -391,7 +353,7 @@ db_close:
     sub  rsp, 0x30
     call db_flush
     mov  rcx, [rel g_dat_handle]
-    call [rel iat_CloseHandle]
+    call os_close
     call wal_close
     mov  rsp, rbp
     pop  rbp

@@ -2,15 +2,24 @@
 ; src/main.asm - asmdb: a minimalist transactional database in x86-64 assembly.
 ;
 ; Assembled by NASM alone (no linker, no CRT):
-;   nasm -f bin main.asm -o ..\build\asmdb.exe   (run from src\)
+;   Windows: nasm -f bin main.asm -o ..\build\asmdb.exe        (run from src\)
+;   Linux:   nasm -f bin -dLINUX main.asm -o ../build/asmdb    (run from src/)
 ;
-; The PE64 image, kernel32 import table and all code/data live in one section.
-; The record store is allocated at runtime via VirtualAlloc.
+; A single read/write/execute image holds all code, data and globals. On
+; Windows it is a hand-built PE64 with a kernel32 import table; on Linux it is a
+; hand-built ELF64 that issues syscalls directly. Every OS interaction goes
+; through the os_* platform layer (os_win.inc / os_linux.inc). The record store
+; is allocated at runtime (VirtualAlloc on Windows, mmap on Linux).
 ; -----------------------------------------------------------------------------
 BITS 64
-ORG 0x400000
 
 %include "asmdb.inc"
+
+%ifdef LINUX
+; ============================= ELF64 HEADER ==================================
+%include "elf.inc"
+%else
+ORG IMAGEBASE
 
 ; ============================= DOS HEADER ====================================
 dos_header:
@@ -75,33 +84,17 @@ headers_end:
 
 ; ============================= .text SECTION =================================
 sec_start:
+%endif
 
 ; ------------------------------- entry --------------------------------------
 entry:
-    push rbp
-    mov  rbp, rsp
+%ifdef LINUX
+    mov  [rel g_sp0], rsp            ; capture argc/argv pointer before aligning
+%endif
     and  rsp, -16                    ; guarantee 16-byte alignment
     sub  rsp, 0x40
 
-    mov  ecx, STD_OUTPUT_HANDLE
-    call [rel iat_GetStdHandle]
-    mov  [rel g_stdout], rax
-    mov  ecx, STD_INPUT_HANDLE
-    call [rel iat_GetStdHandle]
-    mov  [rel g_stdin], rax
-
-    ; enable ANSI colors only when stdout is a real console (not piped)
-    mov  rcx, [rel g_stdout]
-    lea  rdx, [rel g_conmode]
-    call [rel iat_GetConsoleMode]
-    test eax, eax
-    jz   .nocolor
-    mov  rcx, [rel g_stdout]
-    mov  edx, [rel g_conmode]
-    or   edx, ENABLE_VT
-    call [rel iat_SetConsoleMode]
-    mov  qword [rel g_color], 1
-.nocolor:
+    call os_init_std                 ; std handles + ANSI colour enable
 
     mov  ecx, READ_BUF_SIZE
     call valloc_req
@@ -134,7 +127,7 @@ entry:
 
     call db_close
     xor  ecx, ecx
-    call [rel iat_ExitProcess]
+    call os_exit
 
 ; ----------------------------- REPL loop ------------------------------------
 repl_loop:
@@ -166,9 +159,16 @@ repl_loop:
 %include "store.inc"
 %include "db.inc"
 %include "wal.inc"
+%ifdef LINUX
+%include "os_linux.inc"
+%else
+%include "os_win.inc"
+%endif
 %include "data.inc"
 
 sec_end:
 
+%ifndef LINUX
 sec_raw_size equ ((sec_end - sec_start) + ALIGN - 1) & ~(ALIGN - 1)
 image_size   equ (ALIGN + sec_raw_size + ALIGN - 1) & ~(ALIGN - 1)
+%endif

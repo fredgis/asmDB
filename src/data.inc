@@ -1,14 +1,11 @@
 ; -----------------------------------------------------------------------------
-; src/data.inc - globals, strings, on-disk header template, import table.
+; src/data.inc - globals, strings, on-disk header template.
 ; All of this lives in the single read/write .text section.
 ; -----------------------------------------------------------------------------
 
 ; ------------------------------- globals ------------------------------------
 g_stdout:      dq 0
 g_stdin:       dq 0
-g_written:     dd 0
-g_readlen_dw:  dd 0
-g_io_dw:       dd 0
 g_readbuf:     dq 0
 g_readlen:     dq 0
 g_readpos:     dq 0
@@ -27,7 +24,7 @@ g_qpf:         dq 0
 g_qpc0:        dq 0
 g_qpc1:        dq 0
 g_qpc2:        dq 0
-g_conmode:     dd 0
+g_open_locked: dq 0
 g_have_argtable: dd 0
 g_onech:       db 0
                align 8
@@ -36,7 +33,6 @@ g_spaces:      times 64 db ' '
 g_namebuf:     times 64 db 0
 g_tagbuf:      times 48 db 0
 g_contentbuf:  times 192 db 0
-g_ft:          dq 0
 g_base:        times 216 db 0
 g_datname:     times 224 db 0
 g_walname:     times 224 db 0
@@ -275,105 +271,3 @@ kw_find:       db 'FIND', 0
 kw_range:      db 'RANGE', 0
 kw_backup:     db 'BACKUP', 0
 kw_restore:    db 'RESTORE', 0
-
-; ----------------------------- import table ---------------------------------
-                align 4
-import_dir:
-    dd 0                             ; OriginalFirstThunk
-    dd 0                             ; TimeDateStamp
-    dd 0                             ; ForwarderChain
-    dd RVA(dll_name)                 ; Name
-    dd RVA(iat)                      ; FirstThunk
-    times 5 dd 0                     ; null descriptor
-import_dir_size equ $ - import_dir
-
-                align 8
-iat:
-iat_GetStdHandle:      dq RVA(h_GetStdHandle)
-iat_WriteFile:         dq RVA(h_WriteFile)
-iat_ReadFile:          dq RVA(h_ReadFile)
-iat_VirtualAlloc:      dq RVA(h_VirtualAlloc)
-iat_CreateFileA:       dq RVA(h_CreateFileA)
-iat_SetFilePointerEx:  dq RVA(h_SetFilePointerEx)
-iat_FlushFileBuffers:  dq RVA(h_FlushFileBuffers)
-iat_SetEndOfFile:      dq RVA(h_SetEndOfFile)
-iat_CloseHandle:       dq RVA(h_CloseHandle)
-iat_GetCommandLineA:   dq RVA(h_GetCommandLineA)
-iat_GetConsoleMode:    dq RVA(h_GetConsoleMode)
-iat_SetConsoleMode:    dq RVA(h_SetConsoleMode)
-iat_FindFirstFileA:    dq RVA(h_FindFirstFileA)
-iat_FindNextFileA:     dq RVA(h_FindNextFileA)
-iat_FindClose:         dq RVA(h_FindClose)
-iat_ExitProcess:       dq RVA(h_ExitProcess)
-iat_QueryPerformanceCounter:   dq RVA(h_QueryPerformanceCounter)
-iat_QueryPerformanceFrequency: dq RVA(h_QueryPerformanceFrequency)
-iat_GetSystemTimeAsFileTime:   dq RVA(h_GetSystemTimeAsFileTime)
-iat_GetLastError:      dq RVA(h_GetLastError)
-iat_DeviceIoControl:   dq RVA(h_DeviceIoControl)
-                       dq 0
-
-dll_name: db 'kernel32.dll', 0
-
-                align 2
-h_GetStdHandle:      dw 0
-    db 'GetStdHandle', 0
-                align 2
-h_WriteFile:         dw 0
-    db 'WriteFile', 0
-                align 2
-h_ReadFile:          dw 0
-    db 'ReadFile', 0
-                align 2
-h_VirtualAlloc:      dw 0
-    db 'VirtualAlloc', 0
-                align 2
-h_CreateFileA:       dw 0
-    db 'CreateFileA', 0
-                align 2
-h_SetFilePointerEx:  dw 0
-    db 'SetFilePointerEx', 0
-                align 2
-h_FlushFileBuffers:  dw 0
-    db 'FlushFileBuffers', 0
-                align 2
-h_SetEndOfFile:      dw 0
-    db 'SetEndOfFile', 0
-                align 2
-h_CloseHandle:       dw 0
-    db 'CloseHandle', 0
-                align 2
-h_GetCommandLineA:   dw 0
-    db 'GetCommandLineA', 0
-                align 2
-h_GetConsoleMode:    dw 0
-    db 'GetConsoleMode', 0
-                align 2
-h_SetConsoleMode:    dw 0
-    db 'SetConsoleMode', 0
-                align 2
-h_FindFirstFileA:    dw 0
-    db 'FindFirstFileA', 0
-                align 2
-h_FindNextFileA:     dw 0
-    db 'FindNextFileA', 0
-                align 2
-h_FindClose:         dw 0
-    db 'FindClose', 0
-                align 2
-h_ExitProcess:       dw 0
-    db 'ExitProcess', 0
-                align 2
-h_QueryPerformanceCounter:   dw 0
-    db 'QueryPerformanceCounter', 0
-                align 2
-h_QueryPerformanceFrequency: dw 0
-    db 'QueryPerformanceFrequency', 0
-                align 2
-h_GetSystemTimeAsFileTime: dw 0
-    db 'GetSystemTimeAsFileTime', 0
-                align 2
-h_GetLastError:      dw 0
-    db 'GetLastError', 0
-                align 2
-h_DeviceIoControl:   dw 0
-    db 'DeviceIoControl', 0
