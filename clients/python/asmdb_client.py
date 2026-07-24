@@ -8,8 +8,8 @@ clean, plain ASCII that is easy to parse.
 
 Usage:
     from asmdb_client import Asmdb
-    db = Asmdb(r"..\\..\\build\\asmdb.exe", "SalesDB", "SalesTransactions")
-    print(db.run("INSERT 1 500 alice", "INSERT 2 750 bob"))
+    db = Asmdb(r"..\\..\\build\\asmdb.exe", "MemoryDB", "notes")
+    print(db.run("INSERT 1 500 alice first note", "INSERT 2 750 bob other note"))
     for row in db.select_all():
         print(row)
 """
@@ -38,16 +38,21 @@ class Asmdb:
 
 
 def parse_rows(output: str) -> List[Dict[str, object]]:
-    """Parse asmdb's boxed SELECT output into [{id, name, value}, ...]."""
+    """Parse asmdb's boxed SELECT output into [{id, tag, value, content}, ...]."""
     rows: List[Dict[str, object]] = []
     for raw in output.splitlines():
         line = raw.strip()
         if not line.startswith("|"):
             continue
         cells = [c.strip() for c in line.strip("|").split("|")]
-        if len(cells) == 3 and cells[0].lstrip("-").isdigit():
+        if len(cells) == 4 and cells[0].lstrip("-").isdigit():
             rows.append(
-                {"id": int(cells[0]), "name": cells[1], "value": int(cells[2])}
+                {
+                    "id": int(cells[0]),
+                    "tag": cells[1],
+                    "value": int(cells[2]),
+                    "content": cells[3].rstrip("~"),
+                }
             )
     return rows
 
@@ -56,7 +61,12 @@ if __name__ == "__main__":
     import os
 
     exe = os.path.join(os.path.dirname(__file__), "..", "..", "build", "asmdb.exe")
-    db = Asmdb(exe, "DemoDB", "People")
-    print(db.run("BEGIN", "INSERT 1 500 alice", "INSERT 2 750 bob", "COMMIT"))
+    db = Asmdb(exe, "DemoDB", "notes")
+    print(db.run(
+        "BEGIN",
+        "INSERT 1 500 alice first memory about alice",
+        "INSERT 2 750 bob follow-up on bob",
+        "COMMIT",
+    ))
     for row in db.select_all():
         print(row)

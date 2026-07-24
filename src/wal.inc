@@ -2,7 +2,7 @@
 ; src/wal.inc - write-ahead log, multi-statement transactions, crash recovery.
 ;
 ; Model: during an explicit transaction every mutation is applied in memory only
-; and an undo entry (slot index + old 64-byte image) is recorded. COMMIT stages
+; and an undo entry (slot index + old record image) is recorded. COMMIT stages
 ; the after-images into a WAL file, flushes them, writes a commit marker, flushes
 ; again, then applies the pages to asmdb.dat and truncates the WAL. ROLLBACK
 ; replays the undo log in reverse. On startup a committed-but-unapplied WAL is
@@ -12,7 +12,7 @@
 ;   +0   8   magic  'ASMWAL01'
 ;   +8   8   N      entry count
 ;   +16  8   count  live-row count to store in the header
-;   +24  N * { 8 index ; 64 image }
+;   +24  N * { 8 index ; REC_SIZE image }
 ;   +..  8   marker 'COMMIT01'   (written and flushed last)
 ; -----------------------------------------------------------------------------
 
@@ -158,7 +158,7 @@ wal_recover:
     mov  rdi, [rax]                  ; index
     lea  rdx, [rax+8]                ; image ptr
     mov  rcx, rdi
-    shl  rcx, 6
+    shl  rcx, REC_SHIFT
     add  rcx, HDR_SIZE               ; file offset
     mov  r8, REC_SIZE
     call write_at
@@ -287,7 +287,7 @@ cmd_commit:
     mov  rcx, [rax]                  ; slot index
     mov  [rdi], rcx                  ; dest index
     mov  rsi, rcx
-    shl  rsi, 6
+    shl  rsi, REC_SHIFT
     add  rsi, [rel g_table]          ; live slot ptr
     lea  rdx, [rdi+8]                ; dest image
     mov  rcx, REC_SIZE
@@ -327,10 +327,10 @@ cmd_commit:
     add  rax, [rel g_undo]
     mov  rdi, [rax]                  ; index
     mov  rsi, rdi
-    shl  rsi, 6
+    shl  rsi, REC_SHIFT
     add  rsi, [rel g_table]          ; slot ptr (buffer)
     mov  rcx, rdi
-    shl  rcx, 6
+    shl  rcx, REC_SHIFT
     add  rcx, HDR_SIZE               ; file offset
     mov  rdx, rsi
     mov  r8, REC_SIZE
@@ -376,7 +376,7 @@ cmd_rollback:
     add  rax, [rel g_undo]           ; undo entry
     mov  r8, [rax]                   ; index
     lea  r9, [rax+8]                 ; old image
-    shl  r8, 6
+    shl  r8, REC_SHIFT
     add  r8, [rel g_table]           ; dest slot
     mov  rcx, REC_SIZE
 .cpy:

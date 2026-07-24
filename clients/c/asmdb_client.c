@@ -41,10 +41,10 @@ int main(void)
 {
     const char *script =
         "BEGIN\n"
-        "INSERT 1 500 alice\n"
-        "INSERT 2 750 bob\n"
+        "INSERT 1 500 alice first memory about alice\n"
+        "INSERT 2 750 bob follow-up on bob\n"
         "COMMIT\n"
         "SELECT *";
 
-    return asmdb_exec("DemoDB", "People", script);
+    return asmdb_exec("DemoDB", "notes", script);
 }

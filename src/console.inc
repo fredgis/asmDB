@@ -415,33 +415,45 @@ put_i64_field:
     pop  rbp
     ret
 
-; put_name_field(rcx = ptr, rdx = width) - name (up to NAME_MAX) + right pad
-put_name_field:
+; put_field(rcx = ptr, rdx = width) - print up to `width` printable chars
+; (stopping at NUL), right-pad with spaces. Longer text is truncated with a
+; trailing '~' so columns never overflow.
+put_field:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x40
     mov  [rbp-8], rbx
     mov  [rbp-16], rsi
     mov  rsi, rcx
-    mov  rbx, rdx
+    mov  rbx, rdx                    ; width
     xor  rax, rax
 .len:
-    cmp  rax, NAME_MAX
-    jae  .go
+    cmp  rax, rbx
+    jae  .over
     cmp  byte [rsi+rax], 0
-    je   .go
+    je   .print
     inc  rax
     jmp  .len
-.go:
-    mov  [rbp-24], rax               ; name length
+.over:
+    cmp  byte [rsi+rax], 0
+    je   .print                      ; exactly fills the column
+    mov  rcx, rsi                    ; truncated: width-1 chars + '~'
+    mov  rdx, rbx
+    dec  rdx
+    call putn
+    mov  cl, '~'
+    call putc
+    jmp  .out
+.print:
+    mov  [rbp-24], rax               ; printable length
     mov  rcx, rsi
     mov  rdx, rax
     call putn
     mov  rcx, rbx
     sub  rcx, [rbp-24]
-    jle  .nopad
+    jle  .out
     call put_spaces
-.nopad:
+.out:
     mov  rsi, [rbp-16]
     mov  rbx, [rbp-8]
     mov  rsp, rbp

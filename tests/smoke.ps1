@@ -30,12 +30,12 @@ function Check($name, $cond) {
 
 Push-Location $work
 try {
-    # Run 1: autocommit + rollback + commit
+    # Run 1: autocommit + rollback + commit, memory schema (id value tag content)
     $r1 = (@(
-        'INSERT 1 100 alice',
-        'BEGIN', 'INSERT 2 200 bob', 'INSERT 3 300 carol', 'COUNT', 'ROLLBACK', 'COUNT',
-        'BEGIN', 'INSERT 2 222 bob', 'UPDATE 1 999 alicia', 'COMMIT',
-        'SELECT *', 'COUNT', 'EXIT'
+        'INSERT 1 100 alice first note about alice',
+        'BEGIN', 'INSERT 2 200 bob staged row', 'INSERT 3 300 carol staged row', 'COUNT', 'ROLLBACK', 'COUNT',
+        'BEGIN', 'INSERT 2 222 bob committed content', 'UPDATE 1 999 alice revised note', 'COMMIT',
+        'SELECT *', 'SELECT 1', 'FIND revised', 'COUNT', 'EXIT'
     ) -join "`n") | .\asmdb.exe t
     $r1 = $r1 -join "`n"
 
@@ -43,13 +43,16 @@ try {
     Check 'transaction started'        ($r1 -match 'transaction started')
     Check 'rollback reverts count 3->1'($r1 -match 'rolled back')
     Check 'commit acknowledged'        ($r1 -match 'transaction committed')
-    Check 'updated value persisted'    ($r1 -match 'alicia\s+\|\s+999')
+    Check 'updated value persisted'    ($r1 -match 'alice\s+\|\s+999')
     Check 'committed insert present'   ($r1 -match 'bob\s+\|\s+222')
+    Check 'detail view content'        ($r1 -match 'content\s+:\s+revised note')
+    Check 'detail view timestamps'     ($r1 -match 'created\s+:\s+\d+ ms')
+    Check 'FIND matches content'       ($r1 -match 'alice\s+\|\s+999\s+\|\s+revised note')
 
     # Run 2: reopen -> committed state survives, rolled-back state does not
     $r2 = (@('SELECT *', 'COUNT', 'EXIT') -join "`n") | .\asmdb.exe t
     $r2 = $r2 -join "`n"
-    Check 'persistence: alicia/999'    ($r2 -match 'alicia\s+\|\s+999')
+    Check 'persistence: alice/999'     ($r2 -match 'alice\s+\|\s+999')
     Check 'persistence: bob/222'       ($r2 -match 'bob\s+\|\s+222')
     Check 'persistence: 2 rows'        ($r2 -match '\[ OK \] 2 row\(s\)')
     Check 'rolled-back carol absent'   (-not ($r2 -match 'carol'))

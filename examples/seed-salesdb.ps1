@@ -6,11 +6,12 @@
 .DESCRIPTION
     Pipes a batch of INSERT statements into asmdb.exe, wrapped in a single
     BEGIN/COMMIT transaction so the whole sample loads atomically and durably.
-    The SalesTransactions "table" maps onto asmdb's record shape as:
+    The SalesTransactions "table" maps onto asmdb's memory-oriented record as:
 
-        id     -> transaction id
-        value  -> amount (whole currency units)
-        name   -> customer (single token, use '_' instead of spaces)
+        id      -> transaction id
+        value   -> amount (whole currency units)
+        tag     -> customer code (single token)
+        content -> free-text description (may contain spaces)
 
     Produces SalesDB.dat (+ a transient SalesDB.wal) in the repository root.
 
@@ -44,25 +45,25 @@ try {
         Remove-Item "$Database.dat", "$Database.wal" -ErrorAction SilentlyContinue
     }
 
-    # SalesTransactions sample rows: id, amount, customer
+    # SalesTransactions sample rows: id, amount, customer tag, description
     $sales = @(
-        @{ id = 1001; amount = 1299; customer = 'Contoso_Ltd'      }
-        @{ id = 1002; amount =  499; customer = 'Fabrikam_Inc'     }
-        @{ id = 1003; amount = 2599; customer = 'Adventure_Works'  }
-        @{ id = 1004; amount =  149; customer = 'Northwind_Traders'}
-        @{ id = 1005; amount = 3799; customer = 'Tailspin_Toys'    }
-        @{ id = 1006; amount =  899; customer = 'Wingtip_Toys'     }
-        @{ id = 1007; amount = 4599; customer = 'Litware_Inc'      }
-        @{ id = 1008; amount =  249; customer = 'Proseware_Inc'    }
-        @{ id = 1009; amount = 1899; customer = 'Fourth_Coffee'    }
-        @{ id = 1010; amount =  649; customer = 'Blue_Yonder'      }
+        @{ id = 1001; amount = 1299; tag = 'Contoso';    desc = 'Contoso Ltd - annual license'   }
+        @{ id = 1002; amount =  499; tag = 'Fabrikam';   desc = 'Fabrikam Inc - support renewal'  }
+        @{ id = 1003; amount = 2599; tag = 'Adventure';  desc = 'Adventure Works - hardware order'}
+        @{ id = 1004; amount =  149; tag = 'Northwind';  desc = 'Northwind Traders - add-on seats'}
+        @{ id = 1005; amount = 3799; tag = 'Tailspin';   desc = 'Tailspin Toys - enterprise plan' }
+        @{ id = 1006; amount =  899; tag = 'Wingtip';    desc = 'Wingtip Toys - training package' }
+        @{ id = 1007; amount = 4599; tag = 'Litware';    desc = 'Litware Inc - platform upgrade'  }
+        @{ id = 1008; amount =  249; tag = 'Proseware';  desc = 'Proseware Inc - monthly billing' }
+        @{ id = 1009; amount = 1899; tag = 'Fourth';     desc = 'Fourth Coffee - regional rollout'}
+        @{ id = 1010; amount =  649; tag = 'BlueYonder'; desc = 'Blue Yonder - pilot expansion'   }
     )
 
     # Build the command stream: one atomic transaction, then show the table.
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('BEGIN')
     foreach ($s in $sales) {
-        $lines.Add("INSERT $($s.id) $($s.amount) $($s.customer)")
+        $lines.Add("INSERT $($s.id) $($s.amount) $($s.tag) $($s.desc)")
     }
     $lines.Add('COMMIT')
     $lines.Add('TABLES')

@@ -34,6 +34,9 @@ g_onech:       db 0
 g_tmp:         times 32 db 0
 g_spaces:      times 64 db ' '
 g_namebuf:     times 64 db 0
+g_tagbuf:      times 48 db 0
+g_contentbuf:  times 192 db 0
+g_ft:          dq 0
 g_base:        times 216 db 0
 g_datname:     times 224 db 0
 g_walname:     times 224 db 0
@@ -87,6 +90,16 @@ s_err_full:    db '[ERR] table full', 13, 10, 0
 s_err_syntax:  db '[ERR] syntax error - type HELP', 13, 10, 0
 s_count_pre:   db '[ OK ] ', 0
 s_count_post:  db ' row(s)', 13, 10, 0
+s_find_none:   db '[ OK ] no matching rows', 13, 10, 0
+s_det_sep:     db '  +---------+--------------------------------------------------+', 13, 10, 0
+s_det_id:      db '  id       : ', 0
+s_det_kind:    db '  kind     : ', 0
+s_det_value:   db '  value    : ', 0
+s_det_tag:     db '  tag      : ', 0
+s_det_created: db '  created  : ', 0
+s_det_updated: db '  updated  : ', 0
+s_det_content: db '  content  : ', 0
+s_det_ms:      db ' ms', 0
 s_txn:         db '[ OK ] autocommit mode (each statement is durable)', 13, 10, 0
 s_txn_begin:    db '[ OK ] transaction started', 13, 10, 0
 s_txn_commit:   db '[ OK ] transaction committed', 13, 10, 0
@@ -96,8 +109,11 @@ s_txn_active:   db '[ERR] transaction already active', 13, 10, 0
 s_txn_toobig:   db '[ERR] transaction too large - COMMIT or ROLLBACK', 13, 10, 0
 
                 align 8
-bench_name40:   db 'bench_row', 0
-                times 40-($-bench_name40) db 0
+bench_tag:      db 'bench'
+                times TAG_MAX-($-bench_tag) db 0
+bench_content:  db 'synthetic benchmark record for throughput measurement'
+bench_clen      equ $-bench_content
+                times CONTENT_MAX-bench_clen db 0
 s_bench_pre:    db '[ OK ] BENCH inserted ', 0
 s_bench_rows:   db ' rows', 13, 10, 0
 s_bench_ram:    db '  in-RAM insert            : ', 0
@@ -109,8 +125,9 @@ s_cell_l:      db '| ', 0
 s_cell_m:      db ' | ', 0
 s_cell_r:      db ' |', 0
 s_lbl_id:      db 'id', 0
-s_lbl_name:    db 'name', 0
+s_lbl_tag:     db 'tag', 0
 s_lbl_val:     db 'value', 0
+s_lbl_content: db 'content', 0
 
 h_title:    db '  asmdb command reference', 0
 h_g_data:   db '  Data', 0
@@ -118,14 +135,16 @@ h_g_txn:    db '  Transactions', 0
 h_g_cat:    db '  Catalog', 0
 h_g_sess:   db '  Session', 0
 
-hc_insert:  db 'INSERT <id> <val> <name>', 0
-hd_insert:  db 'add a new row', 0
+hc_insert:  db 'INSERT <id> <val> <tag> <text>', 0
+hd_insert:  db 'store a memory row', 0
 hc_sel1:    db 'SELECT <id>', 0
-hd_sel1:    db 'show one row by key', 0
+hd_sel1:    db 'show one row (full detail)', 0
 hc_selall:  db 'SELECT *', 0
 hd_selall:  db 'list every live row', 0
-hc_update:  db 'UPDATE <id> <val> <name>', 0
-hd_update:  db 'modify an existing row', 0
+hc_update:  db 'UPDATE <id> <val> <tag> <text>', 0
+hd_update:  db 'overwrite an existing row', 0
+hc_find:    db 'FIND <substr>', 0
+hd_find:    db 'search tag + text (substring)', 0
 hc_delete:  db 'DELETE <id>', 0
 hd_delete:  db 'remove a row by key', 0
 hc_count:   db 'COUNT', 0
@@ -155,15 +174,20 @@ hc_exit:    db 'EXIT / QUIT', 0
 hd_exit:    db 'leave asmdb', 0
 
 ; ---- SCHEMA / TYPES (static) ----
-s_schema_title: db '  record layout - fixed 64 bytes per row', 0
+s_schema_title: db '  record layout - fixed 256 bytes per row (agent-memory schema)', 0
 s_schema_body:
     db 13, 10
-    db '    offset  size  field   type', 13, 10
-    db '    ------  ----  ------  --------------------------------', 13, 10
-    db '    0       8     id      u64  primary key', 13, 10
-    db '    8       1     status  u8   0 empty / 1 live / 2 deleted', 13, 10
-    db '    16      8     value   i64  signed', 13, 10
-    db '    24      40    name    char[40] ASCII, NUL-padded', 13, 10
+    db '    offset  size  field    type', 13, 10
+    db '    ------  ----  -------  -------------------------------------', 13, 10
+    db '    0       8     id       u64   primary key', 13, 10
+    db '    8       1     status   u8    0 empty / 1 live / 2 deleted', 13, 10
+    db '    9       1     kind     u8    memory kind (reserved)', 13, 10
+    db '    12      4     clen     u32   content byte length', 13, 10
+    db '    16      8     created  i64   unix epoch ms (auto)', 13, 10
+    db '    24      8     updated  i64   unix epoch ms (auto)', 13, 10
+    db '    32      8     value    i64   numeric score / payload', 13, 10
+    db '    40      40    tag      char[40]  category, NUL-padded', 13, 10
+    db '    80      176   content  char[176] free text, NUL-padded', 13, 10
     db 13, 10, 0
 
 s_types_title: db '  supported column types', 0
@@ -173,18 +197,20 @@ s_types_body:
     db '    ----------   ----  --------------------------  -----------', 13, 10
     db '    u64            64  0 .. 1.8e19                 id (key)', 13, 10
     db '    i64            64  -9.2e18 .. 9.2e18           value', 13, 10
-    db '    u32 / i32      32  narrowed integer            value', 13, 10
+    db '    u32 / i32      32  narrowed integer            value, clen', 13, 10
     db '    u16 / i16      16  narrowed integer            value', 13, 10
-    db '    u8  / i8        8  narrowed integer            value', 13, 10
+    db '    u8  / i8        8  narrowed integer            kind, value', 13, 10
     db '    bool            8  0 = false / 1 = true        value', 13, 10
-    db '    f64            64  IEEE-754 double             value (bits)', 13, 10
-    db '    timestamp      64  Unix epoch milliseconds     value', 13, 10
-    db '    char[40]      320  fixed ASCII text, <= 40 B   name', 13, 10
+    db '    f64            64  IEEE-754 double (raw bits)  value', 13, 10
+    db '    timestamp      64  unix epoch ms               created, updated', 13, 10
+    db '    char[40]      320  fixed ASCII text, <= 40 B   tag', 13, 10
+    db '    char[176]    1408  fixed ASCII text, <=176 B   content', 13, 10
     db 13, 10
-    db '    A physical row is u64 id + u8 status + i64 value + char[40] name', 13, 10
-    db '    (64 bytes, one cache line). Narrow ints, bool, f64 and timestamps', 13, 10
-    db '    all live in the 64-bit value cell - asmdb keeps the raw bits and', 13, 10
-    db '    your app picks the interpretation.', 13, 10
+    db '    A row carries a numeric value cell plus two auto timestamps, a', 13, 10
+    db '    short tag (category / namespace) and a free-text content field.', 13, 10
+    db '    Narrow ints, bool, f64 and timestamps all live in the 64-bit', 13, 10
+    db '    value cell - asmdb keeps the raw bits and your app (or an agent', 13, 10
+    db '    via the MCP server) picks the interpretation.', 13, 10
     db 13, 10, 0
 
 ; ---- TABLES / DATABASES ----
@@ -230,6 +256,7 @@ kw_databases:  db 'DATABASES', 0
 kw_schema:     db 'SCHEMA', 0
 kw_types:      db 'TYPES', 0
 kw_bench:      db 'BENCH', 0
+kw_find:       db 'FIND', 0
 
 ; ----------------------------- import table ---------------------------------
                 align 4
@@ -262,6 +289,7 @@ iat_FindClose:         dq RVA(h_FindClose)
 iat_ExitProcess:       dq RVA(h_ExitProcess)
 iat_QueryPerformanceCounter:   dq RVA(h_QueryPerformanceCounter)
 iat_QueryPerformanceFrequency: dq RVA(h_QueryPerformanceFrequency)
+iat_GetSystemTimeAsFileTime:   dq RVA(h_GetSystemTimeAsFileTime)
                        dq 0
 
 dll_name: db 'kernel32.dll', 0
@@ -320,3 +348,6 @@ h_QueryPerformanceCounter:   dw 0
                 align 2
 h_QueryPerformanceFrequency: dw 0
     db 'QueryPerformanceFrequency', 0
+                align 2
+h_GetSystemTimeAsFileTime: dw 0
+    db 'GetSystemTimeAsFileTime', 0

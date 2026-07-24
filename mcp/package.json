@@ -1,0 +1,22 @@
+{
+  "name": "asmdb-mcp",
+  "version": "1.0.0",
+  "description": "Model Context Protocol server exposing asmdb as durable long-term memory for AI agents.",
+  "type": "module",
+  "bin": {
+    "asmdb-mcp": "src/server.js"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  },
+  "license": "MIT"
+}

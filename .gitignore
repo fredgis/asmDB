@@ -9,3 +9,7 @@ build/*.obj
 # Editor / OS
 *.swp
 Thumbs.db
+
+# Node (MCP server)
+node_modules/
+npm-debug.log*

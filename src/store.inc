@@ -30,7 +30,7 @@ store_locate:
     xor  r8, r8                      ; probe counter
 .probe:
     mov  rax, rsi
-    shl  rax, 6                      ; index * 64
+    shl  rax, REC_SHIFT              ; index * REC_SIZE
     add  rax, rdi                    ; slot pointer
     mov  cl, [rax+REC_STATUS]
     cmp  cl, ST_EMPTY
@@ -79,5 +79,5 @@ store_locate:
 store_slot_index:
     mov  rax, rcx
     sub  rax, [rel g_table]
-    shr  rax, 6
+    shr  rax, REC_SHIFT
     ret

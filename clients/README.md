@@ -19,7 +19,7 @@ asmdb.exe <database> [table]      # commands in on stdin, results out on stdout
 You send commands exactly as you would type them in the REPL:
 
 ```
-INSERT 1 500 alice
+INSERT 1 500 alice first memory about alice
 SELECT *
 QUIT
 ```
@@ -45,9 +45,11 @@ repository root.
 
 ```python
 from asmdb_client import Asmdb
-db = Asmdb(r"..\..\build\asmdb.exe", "SalesDB", "SalesTransactions")
-db.run("INSERT 1 500 alice", "INSERT 2 750 bob", "COMMIT")
-print(db.select_all())     # [{'id': 1, 'name': 'alice', 'value': 500}, ...]
+db = Asmdb(r"..\..\build\asmdb.exe", "MemoryDB", "notes")
+db.run("INSERT 1 500 alice first memory about alice",
+       "INSERT 2 750 bob follow-up on bob", "COMMIT")
+print(db.select_all())
+# [{'id': 1, 'tag': 'alice', 'value': 500, 'content': 'first memory about alice'}, ...]
 ```
 
 ## Want a real driver?

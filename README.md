@@ -4,47 +4,55 @@
   <h1>asmdb</h1>
 
   <p>
-    <strong>A transactional CRUD database engine, hand-written in x86-64 assembly.</strong><br>
-    No linker. No C runtime. No dependencies. ~15 KB. And it is genuinely fast.
+    <strong>A transactional CRUD database engine, hand-written in x86-64 assembly —<br>
+    tuned for agent memory, with a Model Context Protocol server.</strong><br>
+    No linker. No C runtime. No dependencies. ~18 KB. And it is genuinely fast.
   </p>
 
-  <img src="docs/assets/asmdb-hero.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
+  <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
 
   <p>
     <a href="#"><img src="https://img.shields.io/badge/assembler-NASM%203.x-6E4AA0" alt="assembler"></a>
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/runtime-Win32%20%2F%20no%20CRT-bf8700" alt="runtime"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-~15%20KB-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-~18%20KB-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/MCP-agent%20memory-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
 </div>
 
 ---
 
-**asmdb** is a tiny, transactional key/value database engine written from
-scratch in x86-64 assembly. NASM emits the Windows PE executable directly
-(`nasm -f bin`) — there is **no linker, no C runtime, no libraries** — and the
-program talks to `kernel32.dll` through a hand-built import table. Yet it is a
-real database: every statement is flushed to disk, `BEGIN`/`COMMIT`/`ROLLBACK`
-are real transactions, and a write-ahead log makes crash recovery atomic.
+**asmdb** is a tiny, transactional database engine written from scratch in
+x86-64 assembly. NASM emits the Windows PE executable directly (`nasm -f bin`) —
+there is **no linker, no C runtime, no libraries** — and the program talks to
+`kernel32.dll` through a hand-built import table. Yet it is a real database:
+every statement is flushed to disk, `BEGIN`/`COMMIT`/`ROLLBACK` are real
+transactions, and a write-ahead log makes crash recovery atomic.
+
+Its 256-byte record is tuned for **AI-agent memory** — a numeric score,
+automatic created/updated timestamps, a short `tag`, and a free-text `content`
+field — and a bundled **[MCP server](mcp/)** exposes it to any agent as durable
+long-term memory.
 
 ```text
-asmdb> INSERT 1001 1299 Contoso_Ltd
+asmdb> INSERT 1001 5 project asmdb is a database engine written in x86-64 assembly
 [ OK ] 1 row inserted
 asmdb> SELECT *
-+------------+------------------------+----------------+
-| id         | name                   | value          |
-+------------+------------------------+----------------+
-| 1001       | Contoso_Ltd            | 1299           |
-+------------+------------------------+----------------+
++----------+------------------+------------+------------------------------------------+
+| id       | tag              | value      | content                                  |
++----------+------------------+------------+------------------------------------------+
+| 1001     | project          | 5          | asmdb is a database engine written in ~  |
++----------+------------------+------------+------------------------------------------+
+asmdb> FIND assembly
+  1 match
 ```
 
 Because the engine does one thing — fixed-shape rows in a single hash-indexed
 table — it does that one thing at speeds a general-purpose SQL database cannot
-touch: **~65 million inserts/second** in RAM and **~7 million durable
-rows/second** on a bulk load (measured below, and reproducible). That is the
-whole point of writing a database in assembly.
+touch: **~25 million inserts/second** in RAM (measured below, and reproducible).
+That is the whole point of writing a database in assembly.
 
 ## Table of contents
 
@@ -52,23 +60,28 @@ whole point of writing a database in assembly.
 - [Quickstart](#quickstart)
 - [Commands](#commands)
 - [Data model & supported types](#data-model--supported-types)
+- [Agent memory & the MCP server](#agent-memory--the-mcp-server)
 - [How asmdb works](#how-asmdb-works) — the 60-second version, then a deep dive
 - [On-disk format: `.dat` and `.wal`](#on-disk-format-dat-and-wal)
 - [Performance](#performance) — benchmarks vs SQLite
 - [How a modern database goes faster](#how-a-modern-database-goes-faster)
 - [Connect from your app](#connect-from-your-app-python--c--c)
+- [Engine specification](#engine-specification)
 - [Project layout](#project-layout)
 
 ## Why it's interesting
 
 - **Zero dependencies** — assembled by NASM alone. No linker, no CRT, no DLL but `kernel32`.
-- **One cache line per row** — fixed 64-byte records in an open-addressing hash
+- **Four cache lines per row** — fixed 256-byte records in an open-addressing hash
   table; the record array *is* the index. Lookups are Fibonacci hash + linear probe.
+- **Built for agent memory** — a score, auto `created`/`updated` timestamps, a
+  `tag` namespace and free-text `content`, plus a `FIND` substring search.
+- **MCP server included** — [`mcp/`](mcp/) turns asmdb into durable memory for an
+  AI agent (store / recall / search / list / delete).
 - **Durable by default** — autocommit flushes every mutation (`FlushFileBuffers`).
 - **Real transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` backed by an undo log.
 - **Crash-safe** — a WAL with a commit marker is replayed or discarded atomically on startup.
-- **Genuinely fast** — a built-in `BENCH` command measures the engine directly; it
-  beats SQLite on every workload we tested (see [Performance](#performance)).
+- **Genuinely fast** — a built-in `BENCH` command measures the engine directly (see [Performance](#performance)).
 - **A real CLI** — colored banner, sectioned `HELP`, catalog commands, boxed result tables.
 
 ## Quickstart
@@ -94,10 +107,12 @@ Load the bundled sample — ten rows in one atomic transaction:
 
 | Command | Description |
 |---|---|
-| `INSERT <id> <value> <name>` | add a new row |
-| `SELECT <id>` · `SELECT *` | show one row / list all rows |
-| `UPDATE <id> <value> <name>` | modify an existing row |
+| `INSERT <id> <value> <tag> <content...>` | add a new row (auto `created`/`updated`) |
+| `SELECT <id>` | show one row as a detail block (full content + timestamps) |
+| `SELECT *` | list all rows as a 4-column table |
+| `UPDATE <id> <value> <tag> <content...>` | modify an existing row (bumps `updated`) |
 | `DELETE <id>` | remove a row by key |
+| `FIND <substr>` | case-insensitive substring search over `tag` + `content` |
 | `COUNT` | number of live rows |
 | `BEGIN` · `COMMIT` · `ROLLBACK` | transaction control |
 | `BENCH <n>` | insert *n* synthetic rows and report engine rows/sec |
@@ -108,38 +123,75 @@ Load the bundled sample — ten rows in one atomic transaction:
 | `HELP` | command reference |
 | `EXIT` · `QUIT` | leave asmdb |
 
+Here `tag` is a single token; `content` is the rest of the line (spaces allowed).
+
 ## Data model & supported types
 
-Every row is a **fixed 64-byte record** — exactly one CPU cache line. That single
-constraint is what keeps the engine small, predictable, and fast. The physical
+Every row is a **fixed 256-byte record** — exactly four CPU cache lines. That
+single constraint is what keeps the engine small, predictable, and fast, and the
+fields are shaped for **agent memory**: a numeric score, two automatic
+timestamps, a short category `tag`, and a free-text `content` field. The physical
 layout never changes:
 
 | Offset | Size | Field | Type | Notes |
 |-------:|-----:|-------|------|-------|
-| `0`  | 8  | `id`     | `u64`      | primary key |
-| `8`  | 1  | `status` | `u8`       | `0` empty · `1` live · `2` deleted (tombstone) |
-| `16` | 8  | `value`  | `i64`      | signed payload |
-| `24` | 40 | `name`   | `char[40]` | ASCII, NUL-padded |
+| `0`  | 8   | `id`      | `u64`       | primary key |
+| `8`  | 1   | `status`  | `u8`        | `0` empty · `1` live · `2` deleted (tombstone) |
+| `9`  | 1   | `kind`    | `u8`        | memory-kind enum (reserved, default `0`) |
+| `12` | 4   | `clen`    | `u32`       | content byte length |
+| `16` | 8   | `created` | `i64`       | creation time, unix epoch ms (auto) |
+| `24` | 8   | `updated` | `i64`       | last-update time, unix epoch ms (auto) |
+| `32` | 8   | `value`   | `i64`       | numeric score / payload |
+| `40` | 40  | `tag`     | `char[40]`  | category / namespace, NUL-padded |
+| `80` | 176 | `content` | `char[176]` | free text, NUL-padded |
 
 On top of that raw layout, `TYPES` advertises a catalog of **logical types**.
-Narrow integers, booleans, floats and timestamps all ride inside the 64-bit
-`value` cell — asmdb stores the raw bits and your application chooses the
-interpretation:
+Narrow integers, booleans and floats all ride inside the 64-bit `value` cell —
+asmdb stores the raw bits and your application (or an agent via the MCP server)
+chooses the interpretation:
 
-| Type | Bits | Domain | Column |
-|------|-----:|--------|--------|
-| `u64`        | 64  | `0 .. 1.8e19`              | `id` (key) |
-| `i64`        | 64  | `-9.2e18 .. 9.2e18`        | `value` |
-| `u32` / `i32`| 32  | narrowed integer           | `value` |
-| `u16` / `i16`| 16  | narrowed integer           | `value` |
-| `u8`  / `i8` | 8   | narrowed integer           | `value` |
-| `bool`       | 8   | `0 = false` / `1 = true`   | `value` |
-| `f64`        | 64  | IEEE-754 double            | `value` (bits) |
-| `timestamp`  | 64  | Unix epoch milliseconds    | `value` |
-| `char[40]`   | 320 | fixed ASCII text, ≤ 40 B   | `name` |
+| Type | Bits | Domain | Column(s) |
+|------|-----:|--------|-----------|
+| `u64`         | 64   | `0 .. 1.8e19`              | `id` (key) |
+| `i64`         | 64   | `-9.2e18 .. 9.2e18`        | `value` |
+| `u32` / `i32` | 32   | narrowed integer           | `value`, `clen` |
+| `u16` / `i16` | 16   | narrowed integer           | `value` |
+| `u8`  / `i8`  | 8    | narrowed integer           | `kind`, `value` |
+| `bool`        | 8    | `0 = false` / `1 = true`   | `value` |
+| `f64`         | 64   | IEEE-754 double (bits)     | `value` |
+| `timestamp`   | 64   | unix epoch milliseconds    | `created`, `updated` |
+| `char[40]`    | 320  | fixed ASCII text, ≤ 40 B   | `tag` |
+| `char[176]`   | 1408 | fixed ASCII text, ≤ 176 B  | `content` |
 
 One `.dat` file is one database holding one logical table; its name lives in the
 512-byte header. See [On-disk format](#on-disk-format-dat-and-wal) for the exact bytes.
+
+## Agent memory & the MCP server
+
+asmdb ships with a Node [Model Context Protocol](https://modelcontextprotocol.io)
+server in [`mcp/`](mcp/) that turns the engine into **durable long-term memory
+for an AI agent**. It keeps one long-lived `asmdb.exe` process (the 64 MiB region
+is read once), and exposes five tools:
+
+| Tool | Arguments | Description |
+|------|-----------|-------------|
+| `memory_store`  | `key`, `content`, `tag?`, `value?` | insert or overwrite a memory (upsert on the same key) |
+| `memory_recall` | `key` | fetch one memory with content, tag, value, timestamps |
+| `memory_search` | `query` | case-insensitive substring search over tag + content |
+| `memory_list`   | — | return every stored memory |
+| `memory_delete` | `key` | remove a memory by key |
+
+An agent addresses each memory by a free-text `key`, which the server hashes to
+asmdb's `u64` primary id with 64-bit FNV-1a — so the engine stays a pure id-keyed
+store with no secondary index. `tag` becomes a namespace, `value` an optional
+score, `content` the remembered text, and `created`/`updated` are automatic.
+
+```bash
+cd mcp && npm install && npm test      # end-to-end test against a scratch DB
+```
+
+See [`mcp/README.md`](mcp/README.md) for client registration (Claude / VS Code /
+Copilot) and configuration.
 
 ## How asmdb works
 
@@ -147,7 +199,7 @@ One `.dat` file is one database holding one logical table; its name lives in the
 
 Picture a huge coat-check with **262,144 numbered hooks**. To store a row, asmdb
 runs the row's `id` through a scrambling function that turns it into a hook
-number, and hangs the 64-byte row there. To find it again, it runs the *same*
+number, and hangs the 256-byte row there. To find it again, it runs the *same*
 function and walks straight to that hook — no scanning, no index to maintain,
 because **the array of hooks *is* the index**. If two rows want the same hook,
 the second one takes the next free hook along (a "linear probe").
@@ -166,7 +218,7 @@ Now the diagram, then the deep dive.
 flowchart LR
     IN([stdin]) --> REPL[REPL + dispatch]
     REPL --> CRUD[CRUD handlers]
-    CRUD --> HASH[hash table<br/>64-byte records in RAM]
+    CRUD --> HASH[hash table<br/>256-byte records in RAM]
     CRUD -->|autocommit / COMMIT| DAT[(asmdb.dat)]
     CRUD -->|transaction| WAL[(write-ahead log)]
     WAL -. checkpoint .-> DAT
@@ -182,7 +234,7 @@ flowchart LR
 
 ### The deep dive
 
-How ~15 KB of assembly becomes a durable database.
+How ~18 KB of assembly becomes a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -191,16 +243,16 @@ trick is alignment: with `SectionAlignment == FileAlignment == 0x200`, every RVA
 equals its offset in the file, so the import table can be laid out by hand — a
 small array of thunks pointing at hint/name entries that Windows binds to
 `kernel32.dll` at load time. Code, data and imports share a single section; the
-16 MiB record store is `VirtualAlloc`'d at runtime, which is why the binary stays
-~15 KB on disk.
+64 MiB record store is `VirtualAlloc`'d at runtime, which is why the binary stays
+~18 KB on disk.
 
-#### The record store — one cache line per row
+#### The record store — four cache lines per row
 
-Each row is a fixed **64-byte record** (exactly one cache line), and the records
-live in an open-addressing hash table of **262,144 slots** where the record array
-*is* the index — there is no separate structure to keep in sync. The slot for a
-key is a Fibonacci hash: multiply by the 64-bit golden-ratio constant and keep
-the top bits.
+Each row is a fixed **256-byte record** (exactly four cache lines), and the
+records live in an open-addressing hash table of **262,144 slots** where the
+record array *is* the index — there is no separate structure to keep in sync. The
+slot for a key is a Fibonacci hash: multiply by the 64-bit golden-ratio constant
+and keep the top bits.
 
 ```asm
 ; store_hash(rcx = id) -> rax = slot 0 .. 262143
@@ -230,7 +282,7 @@ Two logs do all the work. An **undo log** makes `ROLLBACK` possible; a
 
 - **`BEGIN`** snapshots the live row count and clears the undo log.
 - **Each mutation in a transaction** is applied to the RAM table immediately, and
-  the *previous* 64-byte image of the touched slot is appended to the undo log.
+  the *previous* 256-byte image of the touched slot is appended to the undo log.
   The `.dat` file is **not** written yet.
 - **`ROLLBACK`** walks the undo log in reverse, restoring each saved image, then
   drops back to the snapshot count. Disk was never touched, so there is nothing
@@ -273,19 +325,20 @@ offset  size  field        value / meaning
 ------  ----  -----------  ---------------------------------------------
    0      8   magic        "ASMDB\0\0\0"
    8      4   version      1
-  12      4   record_size  64
+  12      4   record_size  256
   16      8   capacity     262144
   24      8   live_count   number of live rows (rewritten on each flush)
   32     48   table_name   ASCII, NUL-padded
   80    432   reserved     zero-filled to 512
- 512   16 MiB slot array   capacity × 64-byte records
+ 512   64 MiB slot array   capacity × 256-byte records
 ```
 
-Slot *i* lives at file offset `512 + i * 64`. A record is
-`u64 id · u8 status · (7 pad) · i64 value · char[40] name`; `status` is
-`0` empty, `1` live, `2` tombstone. Because the on-disk slot layout mirrors the
-in-RAM table exactly, loading a database is a single `ReadFile` of the whole slot
-region — no parsing, no per-row deserialization.
+Slot *i* lives at file offset `512 + i * 256`. A record is
+`u64 id · u8 status · u8 kind · u32 clen · i64 created · i64 updated · i64 value
+· char[40] tag · char[176] content`; `status` is `0` empty, `1` live, `2`
+tombstone. Because the on-disk slot layout mirrors the in-RAM table exactly,
+loading a database is a single `ReadFile` of the whole slot region — no parsing,
+no per-row deserialization.
 
 > Note: `db_open` validates only the 5-byte magic, not the version or capacity,
 > so a database created by an older build still opens after the capacity was
@@ -302,13 +355,13 @@ offset        size        field    meaning
    0            8         magic    "ASMWAL01"
    8            8         N        number of staged entries
   16            8         count    live_count to stamp into the header
-  24         N × 72       entries  N × { u64 slot_index ; 64-byte after-image }
-24 + N×72       8         marker   "COMMIT01"  (written & flushed LAST)
+  24         N × 264      entries  N × { u64 slot_index ; 256-byte after-image }
+24 + N×264      8         marker   "COMMIT01"  (written & flushed LAST)
 ```
 
 The marker is the commit point. Recovery reads the log, checks the magic, bounds
 `N`, and looks for `COMMIT01` at the computed offset. If everything lines up it
-replays each entry as an absolute write to `512 + slot_index × 64`; otherwise it
+replays each entry as an absolute write to `512 + slot_index × 256`; otherwise it
 discards the log. Since every entry is an absolute slot write, replaying a log
 twice is harmless — recovery is idempotent.
 
@@ -327,39 +380,49 @@ honest baseline — the **same workloads on SQLite** (via Python's in-process
 
 ### asmdb vs SQLite — 100,000 rows
 
-| Workload | asmdb | SQLite 3.49 | asmdb speed-up |
+Records are **256 bytes** and the store is a preallocated **64 MiB** region.
+
+| Workload | asmdb | SQLite 3.49.1 | ratio |
 |---|--:|--:|--:|
-| **Engine insert** — in-RAM, one transaction | **≈ 65,300,000** rows/s | 1,767,090 rows/s | **≈ 37×** |
-| **Durable bulk load** — one `fsync` at the end | **≈ 7,140,000** rows/s | 1,610,884 rows/s | **≈ 4.4×** |
-| **Durable per-row** — one `fsync` per row | **≈ 2,250** rows/s | 349 rows/s | **≈ 6.4×** |
+| **Engine insert** — in-RAM, one transaction | **≈ 25,425,883** rows/s | 1,807,704 rows/s | **≈ 14.1× faster** |
+| **Durable bulk load** — one checkpoint + `fsync` | ≈ 1,351,351 rows/s | 1,488,082 rows/s | ≈ 0.9× (slightly slower) |
+| **Durable per-row** — one `fsync` per row | **≈ 2,067** rows/s | 276 rows/s | **≈ 7.5× faster** |
 
 A fourth figure, not in the table because SQLite has no equivalent, is the
 **transaction throughput over the stdio protocol** — the realistic
 "over-the-wire" number a client sees, including command parsing and per-row acks:
-**≈ 79,500 rows/s** (100k rows in 4,000-row `BEGIN…COMMIT` batches).
+**≈ 23,090 rows/s** (100k rows in `BEGIN…COMMIT` batches).
 
 The story the numbers tell: the disk flush dominates durability. Autocommit
-`fsync`s after *every* row (~2,250/s); a transaction applies every row in RAM and
+`fsync`s after *every* row (~2,067/s); a transaction applies every row in RAM and
 `fsync`s **once** (millions/s). Wrapping inserts in `BEGIN … COMMIT` is the single
 biggest speed lever.
 
-### Why asmdb wins — and the honest caveat
+### Why asmdb wins — and the honest caveats
 
-asmdb is faster because **it does far less**. It has a fixed 64-byte schema, a
-single table, no SQL parser, no query planner, no secondary indexes, no MVCC, and
-no concurrency control. SQLite is a full relational engine doing all of that. So
-this is *not* "assembly beats C" — it is **a specialized key/value store beats a
-general-purpose SQL database at the one thing the key/value store was built for.**
-The comparison is engine-to-engine and fair (both measured in-process, same
-machine, same 100k rows), but it is a comparison of *scope*, not just language.
+asmdb is faster on **in-RAM inserts (≈ 14×)** and **per-row durability (≈ 7.5×)**
+because **it does far less**: a fixed 256-byte schema, a single table, no SQL
+parser, no query planner, no secondary indexes, no MVCC, no concurrency control.
+SQLite is a full relational engine doing all of that. So this is *not* "assembly
+beats C" — it is **a specialized key/value store beating a general-purpose SQL
+database at the narrow thing it was built for.**
+
+The **durable bulk-load row is honestly ≈ 0.9× — slightly *slower* than SQLite**.
+The reason is a real, documented trade-off: because the open-addressed hash
+scatters rows across the whole 64 MiB region, the bulk checkpoint currently
+writes the *entire* preallocated region rather than just the dirty rows. At 256
+bytes/row that is more bytes to flush than SQLite's page cache commits. The fix —
+an incremental (dirty-page) checkpoint and partitioned files — is on the
+[roadmap](#how-a-modern-database-goes-faster), not yet implemented, so the number
+is reported as-is rather than hidden.
 
 <sub>Measured on an Intel Core Ultra 7 268V · NVMe SSD · Windows 11 · single-threaded ·
-best of 3. Throughput is disk- and machine-dependent — reproduce it with the
-command above.</sub>
+best of 3 · SQLite 3.49.1 in-process (C API, no protocol). Throughput is disk- and
+machine-dependent — reproduce it with the command above.</sub>
 
 ## How a modern database goes faster
 
-asmdb today is a **row store**: whole 64-byte records, one table, one thread. That
+asmdb today is a **row store**: whole 256-byte records, one table, one thread. That
 is a deliberate v1 tradeoff — small, predictable, cache-friendly. Here is how the
 big engines (SQL Server, PostgreSQL, DuckDB, ClickHouse) push further, which CRUD
 path each technique accelerates, and where it sits on asmdb's roadmap.
@@ -376,7 +439,7 @@ path each technique accelerates, and where it sits on asmdb's roadmap.
 | SIMD + multi-threading | process many rows per instruction / per core | analytical Reads, bulk ops | 🗺️ roadmap |
 | MVCC | readers never block writers | concurrent workloads | 🗺️ roadmap |
 
-**Columnar + compression.** A row store reads a whole 64-byte record even to sum
+**Columnar + compression.** A row store reads a whole 256-byte record even to sum
 one column. A *column* store keeps each column in its own contiguous run, so a
 `SUM(value)` streams only the `value` array through the CPU — and because a column
 holds one kind of data, it compresses hard: run-length encoding for repeats,
@@ -408,27 +471,36 @@ disabled automatically when the output is redirected, so you get clean ASCII bac
 ```python
 from asmdb_client import Asmdb
 db = Asmdb(r".\build\asmdb.exe", "SalesDB", "SalesTransactions")
-db.run("BEGIN", "INSERT 1 500 alice", "COMMIT")
-print(db.select_all())     # [{'id': 1, 'name': 'alice', 'value': 500}]
+db.run("BEGIN", "INSERT 1 500 customer Contoso Ltd - key account", "COMMIT")
+print(db.select_all())     # [{'id': 1, 'tag': 'customer', 'value': 500, 'content': 'Contoso Ltd - key account'}]
 ```
 
 Ready-to-run examples live in [`clients/`](clients/) (Python, C#, C), along with
 notes on adding a proper `--json` batch mode or a TCP server for a real driver.
+For AI agents, the [`mcp/`](mcp/) server is the turnkey path — no piping required.
+
+## Engine specification
+
+For the precise, byte-level technical reference — PE64 layout, calling
+convention, record store, hash function, on-disk formats, the two-phase commit
+and recovery protocol, the MCP integration, and the full roadmap — see
+**[`docs/ENGINE.md`](docs/ENGINE.md)**.
 
 ## Project layout
 
 ```
 asmdb/
   src/          main.asm + .inc modules (console, parse, store, db, wal, data)
+  mcp/          Model Context Protocol server (agent memory) + tests
   clients/      stdio client examples: Python, C#, C
   examples/     seed-salesdb.ps1 sample loader, bench.ps1 + bench_sqlite.py
   tests/        smoke.ps1 + make_wal.py crash-recovery fixture
-  docs/         PLAN.md design notes, assets/ (logo, hero, generator)
+  docs/         ENGINE.md spec, assets/ (logo, banner, generator)
   poc/          minimal 752-byte PE64 proof-of-concept
   build.ps1     locates NASM and assembles from src\
 ```
 
-See [`docs/PLAN.md`](docs/PLAN.md) for the full design and roadmap.
+See [`docs/ENGINE.md`](docs/ENGINE.md) for the full specification and roadmap.
 
 ## License
 

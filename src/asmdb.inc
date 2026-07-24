@@ -5,17 +5,29 @@
 %define ALIGN     0x200
 %define RVA(x)    ((x) - IMAGEBASE)
 
-; ---- Record layout (64 bytes, one cache line) ----
-%define REC_SIZE   64
-%define REC_ID     0        ; u64 primary key
-%define REC_STATUS 8        ; u8 status
-%define REC_VALUE  16       ; i64 value
-%define REC_NAME   24       ; char[40]
-%define NAME_MAX   40
+; ---- Record layout (256 bytes, four cache lines) ----
+; Tuned for agent memory: a numeric score, creation/update timestamps, a short
+; category tag, and a free-text content field, all fixed-width.
+%define REC_SIZE    256
+%define REC_SHIFT   8        ; log2(REC_SIZE) - slot index <-> byte offset
+%define REC_ID      0        ; u64  primary key
+%define REC_STATUS  8        ; u8   0 empty / 1 live / 2 deleted
+%define REC_KIND    9        ; u8   memory kind enum (reserved, default 0)
+%define REC_CLEN    12       ; u32  content byte length
+%define REC_CREATED 16       ; i64  created  (unix epoch ms)
+%define REC_UPDATED 24       ; i64  updated  (unix epoch ms)
+%define REC_VALUE   32       ; i64  numeric payload / score
+%define REC_TAG     40       ; char[40]  category / namespace, NUL-padded
+%define REC_CONTENT 80       ; char[176] free text, NUL-padded
+%define TAG_MAX     40
+%define CONTENT_MAX 176
 
 %define ST_EMPTY    0
 %define ST_OCCUPIED 1
 %define ST_DELETED  2
+
+; ---- Memory kind enum (stored in REC_KIND; reserved for future use) ----
+%define KIND_GENERIC 0
 
 ; ---- Hash table (v1: fixed power-of-two capacity) ----
 %define CAPACITY   262144
@@ -25,18 +37,19 @@
 ; ---- Buffers ----
 %define LINE_MAX       512
 %define READ_BUF_SIZE  4096
-%define WAL_BUF_SIZE   0x100000   ; 1 MiB in-memory WAL staging
+%define WAL_BUF_SIZE   0x200000   ; 2 MiB in-memory WAL staging
 %define UNDO_MAX       4096       ; max slots touched per transaction
-%define UNDO_ENTRY     72         ; 8-byte slot index + 64-byte record image
+%define UNDO_ENTRY     (8+REC_SIZE) ; 8-byte slot index + record image
 
 ; ---- Dispatch results ----
 %define CMD_OK   0
 %define CMD_EXIT 1
 
 ; ---- SELECT table column widths ----
-%define W_ID   10
-%define W_NAME 22
-%define W_VAL  14
+%define W_ID      8
+%define W_TAG     16
+%define W_VAL     12
+%define W_CONTENT 40
 
 ; ---- Win32 constants ----
 %define STD_INPUT_HANDLE   -10

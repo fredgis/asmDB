@@ -114,11 +114,12 @@ parse_i64:
     xor  rdx, rdx
     ret
 
-; parse_name(rdi = dest[NAME_MAX]) - copy a token from rsi, zero-pad -> rax = len
-parse_name:
+; parse_tok(rdi = dest, rdx = max) - copy a space-delimited token from rsi,
+; zero-pad to max -> rax = length (<= max). rsi stops at first unconsumed byte.
+parse_tok:
     xor  rcx, rcx
 .loop:
-    cmp  rcx, NAME_MAX
+    cmp  rcx, rdx
     jae  .fill
     movzx eax, byte [rsi]
     test al, al
@@ -134,13 +135,56 @@ parse_name:
 .fill:
     mov  r8, rcx                     ; length
 .z:
-    cmp  rcx, NAME_MAX
+    cmp  rcx, rdx
     jae  .done
     mov  byte [rdi+rcx], 0
     inc  rcx
     jmp  .z
 .done:
     mov  rax, r8
+    ret
+
+; parse_rest(rdi = dest, rdx = max) - copy rest-of-line from rsi verbatim
+; (internal spaces kept), zero-pad to max -> rax = length (<= max).
+parse_rest:
+    xor  rcx, rcx
+.loop:
+    cmp  rcx, rdx
+    jae  .fill
+    movzx eax, byte [rsi]
+    test al, al
+    je   .fill
+    mov  [rdi+rcx], al
+    inc  rsi
+    inc  rcx
+    jmp  .loop
+.fill:
+    mov  r8, rcx
+.z:
+    cmp  rcx, rdx
+    jae  .done
+    mov  byte [rdi+rcx], 0
+    inc  rcx
+    jmp  .z
+.done:
+    mov  rax, r8
+    ret
+
+; now_ms() -> rax = current time in unix epoch milliseconds
+now_ms:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20
+    lea  rcx, [rel g_ft]
+    call [rel iat_GetSystemTimeAsFileTime]
+    mov  rax, [rel g_ft]             ; 100-ns ticks since 1601-01-01
+    xor  rdx, rdx
+    mov  rcx, 10000
+    div  rcx                         ; -> ms since 1601
+    mov  rcx, 11644473600000         ; ms between 1601 and 1970
+    sub  rax, rcx
+    mov  rsp, rbp
+    pop  rbp
     ret
 
 ; -------------------------- table rendering ---------------------------------
@@ -191,12 +235,17 @@ tbl_sep:
     mov  cl, '+'
     call putc
     mov  cl, '-'
-    mov  rdx, W_NAME+2
+    mov  rdx, W_TAG+2
     call put_repeat
     mov  cl, '+'
     call putc
     mov  cl, '-'
     mov  rdx, W_VAL+2
+    call put_repeat
+    mov  cl, '+'
+    call putc
+    mov  cl, '-'
+    mov  rdx, W_CONTENT+2
     call put_repeat
     mov  cl, '+'
     call putc
@@ -220,13 +269,18 @@ tbl_head:
     call put_label
     lea  rcx, [rel s_cell_m]
     call puts
-    lea  rcx, [rel s_lbl_name]
-    mov  rdx, W_NAME
+    lea  rcx, [rel s_lbl_tag]
+    mov  rdx, W_TAG
     call put_label
     lea  rcx, [rel s_cell_m]
     call puts
     lea  rcx, [rel s_lbl_val]
     mov  rdx, W_VAL
+    call put_label
+    lea  rcx, [rel s_cell_m]
+    call puts
+    lea  rcx, [rel s_lbl_content]
+    mov  rdx, W_CONTENT
     call put_label
     lea  rcx, [rel s_cell_r]
     call puts
@@ -251,15 +305,21 @@ print_row:
     lea  rcx, [rel s_cell_m]
     call puts
     mov  rcx, [rbp-8]
-    lea  rcx, [rcx+REC_NAME]
-    mov  rdx, W_NAME
-    call put_name_field
+    lea  rcx, [rcx+REC_TAG]
+    mov  rdx, W_TAG
+    call put_field
     lea  rcx, [rel s_cell_m]
     call puts
     mov  rcx, [rbp-8]
     mov  rcx, [rcx+REC_VALUE]
     mov  rdx, W_VAL
     call put_i64_field
+    lea  rcx, [rel s_cell_m]
+    call puts
+    mov  rcx, [rbp-8]
+    lea  rcx, [rcx+REC_CONTENT]
+    mov  rdx, W_CONTENT
+    call put_field
     lea  rcx, [rel s_cell_r]
     call puts
     call crlf
@@ -267,9 +327,69 @@ print_row:
     pop  rbp
     ret
 
+; print_detail(rcx = record ptr) - full single-row view for SELECT <id>
+print_detail:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rbx
+    mov  rbx, rcx                    ; slot
+    call crlf
+    lea  rcx, [rel s_det_id]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    mov  rcx, [rbx+REC_ID]
+    lea  rdx, [rel c_white]
+    call set_color
+    call put_u64
+    call reset_color
+    call crlf
+    lea  rcx, [rel s_det_tag]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    lea  rcx, [rbx+REC_TAG]
+    lea  rdx, [rel c_cyan]
+    call puts_col
+    call crlf
+    lea  rcx, [rel s_det_value]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    mov  rcx, [rbx+REC_VALUE]
+    xor  rdx, rdx
+    call put_i64_field
+    call crlf
+    lea  rcx, [rel s_det_created]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    mov  rcx, [rbx+REC_CREATED]
+    call put_u64
+    lea  rcx, [rel s_det_ms]
+    call puts
+    call crlf
+    lea  rcx, [rel s_det_updated]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    mov  rcx, [rbx+REC_UPDATED]
+    call put_u64
+    lea  rcx, [rel s_det_ms]
+    call puts
+    call crlf
+    lea  rcx, [rel s_det_content]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    lea  rcx, [rbx+REC_CONTENT]
+    mov  edx, dword [rbx+REC_CLEN]
+    call putn
+    call crlf
+    call crlf
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; -------------------------- command handlers --------------------------------
 
-; cmd_insert() - INSERT <id> <value> <name>
+; cmd_insert() - INSERT <id> <value> <tag> <content...>
 cmd_insert:
     push rbp
     mov  rbp, rsp
@@ -288,36 +408,49 @@ cmd_insert:
     jz   .syntax
     mov  [rbp-40], rax               ; value
     call skip_spaces_rsi
-    lea  rdi, [rel g_namebuf]
-    call parse_name
+    lea  rdi, [rel g_tagbuf]
+    mov  rdx, TAG_MAX-1
+    call parse_tok
+    call advance_token               ; drop any overflow of a long tag token
+    call skip_spaces_rsi
+    lea  rdi, [rel g_contentbuf]
+    mov  rdx, CONTENT_MAX-1
+    call parse_rest
+    mov  [rbp-48], rax               ; content length
     mov  rcx, [rbp-32]
     call store_locate                ; rax=found, rdx=insert
     test rax, rax
     jnz  .dup
     test rdx, rdx
     jz   .full
-    mov  rdi, rdx                    ; target slot
-    mov  rcx, rdi
+    mov  rbx, rdx                    ; target slot (preserved across calls)
+    mov  rcx, rbx
     call txn_capture                 ; record undo image (no-op outside a txn)
     test rax, rax
     jz   .toobig
     mov  rax, [rbp-32]
-    mov  [rdi+REC_ID], rax
-    mov  byte [rdi+REC_STATUS], ST_OCCUPIED
+    mov  [rbx+REC_ID], rax
+    mov  byte [rbx+REC_STATUS], ST_OCCUPIED
+    mov  byte [rbx+REC_KIND], KIND_GENERIC
+    mov  eax, [rbp-48]
+    mov  [rbx+REC_CLEN], eax
+    call now_ms
+    mov  [rbx+REC_CREATED], rax
+    mov  [rbx+REC_UPDATED], rax
     mov  rax, [rbp-40]
-    mov  [rdi+REC_VALUE], rax
-    lea  rsi, [rel g_namebuf]
-    xor  rcx, rcx
-.cpy:
-    mov  al, [rsi+rcx]
-    mov  [rdi+REC_NAME+rcx], al
-    inc  rcx
-    cmp  rcx, NAME_MAX
-    jb   .cpy
+    mov  [rbx+REC_VALUE], rax
+    lea  rsi, [rel g_tagbuf]
+    lea  rdi, [rbx+REC_TAG]
+    mov  rcx, TAG_MAX
+    rep  movsb
+    lea  rsi, [rel g_contentbuf]
+    lea  rdi, [rbx+REC_CONTENT]
+    mov  rcx, CONTENT_MAX
+    rep  movsb
     inc  qword [rel g_count]
     cmp  qword [rel g_in_txn], 0
     jne  .deferred
-    mov  rcx, rdi
+    mov  rcx, rbx
     call db_persist_slot
 .deferred:
     lea  rcx, [rel s_ok_ins]
@@ -346,7 +479,7 @@ cmd_insert:
     pop  rbp
     ret
 
-; cmd_update() - UPDATE <id> <value> <name>
+; cmd_update() - UPDATE <id> <value> <tag> <content...>
 cmd_update:
     push rbp
     mov  rbp, rsp
@@ -365,30 +498,41 @@ cmd_update:
     jz   .syntax
     mov  [rbp-40], rax
     call skip_spaces_rsi
-    lea  rdi, [rel g_namebuf]
-    call parse_name
+    lea  rdi, [rel g_tagbuf]
+    mov  rdx, TAG_MAX-1
+    call parse_tok
+    call advance_token
+    call skip_spaces_rsi
+    lea  rdi, [rel g_contentbuf]
+    mov  rdx, CONTENT_MAX-1
+    call parse_rest
+    mov  [rbp-48], rax               ; content length
     mov  rcx, [rbp-32]
     call store_locate
     test rax, rax
     jz   .notfound
-    mov  rdi, rax
-    mov  rcx, rdi
+    mov  rbx, rax                    ; slot (preserved)
+    mov  rcx, rbx
     call txn_capture
     test rax, rax
     jz   .toobig
+    mov  eax, [rbp-48]
+    mov  [rbx+REC_CLEN], eax
+    call now_ms
+    mov  [rbx+REC_UPDATED], rax      ; created is left untouched
     mov  rax, [rbp-40]
-    mov  [rdi+REC_VALUE], rax
-    lea  rsi, [rel g_namebuf]
-    xor  rcx, rcx
-.cpy:
-    mov  al, [rsi+rcx]
-    mov  [rdi+REC_NAME+rcx], al
-    inc  rcx
-    cmp  rcx, NAME_MAX
-    jb   .cpy
+    mov  [rbx+REC_VALUE], rax
+    lea  rsi, [rel g_tagbuf]
+    lea  rdi, [rbx+REC_TAG]
+    mov  rcx, TAG_MAX
+    rep  movsb
+    lea  rsi, [rel g_contentbuf]
+    lea  rdi, [rbx+REC_CONTENT]
+    mov  rcx, CONTENT_MAX
+    rep  movsb
     cmp  qword [rel g_in_txn], 0
     jne  .deferred
-    mov  rcx, rdi
+    mov  rcx, rbx
     call db_persist_slot
 .deferred:
     lea  rcx, [rel s_ok_upd]
@@ -482,13 +626,8 @@ cmd_select:
     call store_locate
     test rax, rax
     jz   .notfound
-    mov  [rbp-32], rax
-    call tbl_sep
-    call tbl_head
-    call tbl_sep
-    mov  rcx, [rbp-32]
-    call print_row
-    call tbl_sep
+    mov  rcx, rax
+    call print_detail
     jmp  .done
 .all:
     call tbl_sep
@@ -499,7 +638,7 @@ cmd_select:
     cmp  rbx, CAPACITY
     jae  .aend
     mov  rax, rbx
-    shl  rax, 6
+    shl  rax, REC_SHIFT
     add  rax, [rel g_table]
     cmp  byte [rax+REC_STATUS], ST_OCCUPIED
     jne  .anext
@@ -541,13 +680,133 @@ cmd_count:
     pop  rbp
     ret
 
+; contains_ci(rsi = haystack, rdi = needle) -> rax=1 if needle is a substring.
+; Both NUL-terminated; ASCII case-insensitive. Empty needle matches.
+contains_ci:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    cmp  byte [rdi], 0
+    je   .yes
+    mov  r12, rsi
+.outer:
+    cmp  byte [r12], 0
+    je   .no
+    mov  rbx, r12                    ; haystack cursor
+    mov  r13, rdi                    ; needle cursor
+.inner:
+    mov  dl, [r13]
+    test dl, dl
+    je   .yes
+    mov  al, [rbx]
+    test al, al
+    je   .no
+    cmp  al, 'A'
+    jb   .a_ok
+    cmp  al, 'Z'
+    ja   .a_ok
+    add  al, 32
+.a_ok:
+    cmp  dl, 'A'
+    jb   .d_ok
+    cmp  dl, 'Z'
+    ja   .d_ok
+    add  dl, 32
+.d_ok:
+    cmp  al, dl
+    jne  .advance
+    inc  rbx
+    inc  r13
+    jmp  .inner
+.advance:
+    inc  r12
+    jmp  .outer
+.yes:
+    mov  rax, 1
+    jmp  .out
+.no:
+    xor  rax, rax
+.out:
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; cmd_find() - FIND <substr...> : list rows whose tag or content contains substr
+cmd_find:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    mov  [rbp-32], r12
+    call skip_spaces_rsi
+    lea  rdi, [rel g_namebuf]
+    mov  rdx, 63
+    call parse_rest                  ; needle = rest of line
+    xor  r12, r12                    ; match count
+    xor  rbx, rbx                    ; slot index
+.scan:
+    cmp  rbx, CAPACITY
+    jae  .done_scan
+    mov  rax, rbx
+    shl  rax, REC_SHIFT
+    add  rax, [rel g_table]
+    cmp  byte [rax+REC_STATUS], ST_OCCUPIED
+    jne  .next
+    mov  [rbp-40], rax               ; slot ptr
+    lea  rsi, [rax+REC_TAG]
+    lea  rdi, [rel g_namebuf]
+    call contains_ci
+    test rax, rax
+    jnz  .hit
+    mov  rax, [rbp-40]
+    lea  rsi, [rax+REC_CONTENT]
+    lea  rdi, [rel g_namebuf]
+    call contains_ci
+    test rax, rax
+    jz   .next
+.hit:
+    test r12, r12
+    jnz  .have_hdr
+    call tbl_sep
+    call tbl_head
+    call tbl_sep
+.have_hdr:
+    mov  rcx, [rbp-40]
+    call print_row
+    inc  r12
+.next:
+    inc  rbx
+    jmp  .scan
+.done_scan:
+    test r12, r12
+    jz   .none
+    call tbl_sep
+    jmp  .done
+.none:
+    lea  rcx, [rel s_find_none]
+    call puts
+.done:
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; cmd_bench() - BENCH <n> : reset the table, insert n synthetic rows (timed in
 ; RAM), then checkpoint the whole table to disk + fsync (timed). This overwrites
 ; the current database with synthetic data - run it against a scratch db.
 cmd_bench:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x80
+    sub  rsp, 0xA0
     mov  [rbp-8], rbx
     mov  [rbp-16], rsi
     mov  [rbp-24], rdi
@@ -576,6 +835,9 @@ cmd_bench:
     mov  rcx, CAPACITY*REC_SIZE
     xor  eax, eax
     rep  stosb
+    ; capture one timestamp for all synthetic rows (kept out of the timed loop)
+    call now_ms
+    mov  [rbp-88], rax
     ; frequency + start timestamp
     lea  rcx, [rel g_qpf]
     call [rel iat_QueryPerformanceFrequency]
@@ -592,13 +854,25 @@ cmd_bench:
     test rdx, rdx
     jz   .lnext
     mov  rdi, rdx
+    mov  [rbp-96], rdi               ; slot base
     mov  rax, [rbp-48]
     mov  [rdi+REC_ID], rax
     mov  byte [rdi+REC_STATUS], ST_OCCUPIED
+    mov  byte [rdi+REC_KIND], KIND_GENERIC
     mov  [rdi+REC_VALUE], rax
-    lea  rsi, [rel bench_name40]
-    lea  rdi, [rdi+REC_NAME]
-    mov  rcx, NAME_MAX
+    mov  eax, bench_clen
+    mov  [rdi+REC_CLEN], eax
+    mov  rax, [rbp-88]
+    mov  [rdi+REC_CREATED], rax
+    mov  [rdi+REC_UPDATED], rax
+    lea  rsi, [rel bench_tag]
+    lea  rdi, [rdi+REC_TAG]
+    mov  rcx, TAG_MAX
+    rep  movsb
+    mov  rdi, [rbp-96]
+    lea  rsi, [rel bench_content]
+    lea  rdi, [rdi+REC_CONTENT]
+    mov  rcx, CONTENT_MAX
     rep  movsb
     inc  qword [rel g_count]
 .lnext:
@@ -689,6 +963,9 @@ cmd_help:
     call help_row
     lea  rcx, [rel hc_update]
     lea  rdx, [rel hd_update]
+    call help_row
+    lea  rcx, [rel hc_find]
+    lea  rdx, [rel hd_find]
     call help_row
     lea  rcx, [rel hc_delete]
     lea  rdx, [rel hd_delete]
@@ -987,6 +1264,10 @@ dispatch:
     call token_eq
     test rax, rax
     jnz  .bench
+    lea  rdi, [rel kw_find]
+    call token_eq
+    test rax, rax
+    jnz  .find
     lea  rcx, [rel s_unknown]
     call puts
     jmp  .ok0
@@ -1036,6 +1317,10 @@ dispatch:
 .bench:
     call advance_token
     call cmd_bench
+    jmp  .ok0
+.find:
+    call advance_token
+    call cmd_find
     jmp  .ok0
 .exit:
     mov  rax, CMD_EXIT

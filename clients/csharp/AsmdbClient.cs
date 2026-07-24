@@ -50,7 +50,12 @@ public sealed class AsmdbClient
     public static void Main()
     {
         var exe = System.IO.Path.Combine("..", "..", "build", "asmdb.exe");
-        var db = new AsmdbClient(exe, "DemoDB", "People");
-        Console.Write(db.Run("BEGIN", "INSERT 1 500 alice", "INSERT 2 750 bob", "COMMIT", "SELECT *"));
+        var db = new AsmdbClient(exe, "DemoDB", "notes");
+        Console.Write(db.Run(
+            "BEGIN",
+            "INSERT 1 500 alice first memory about alice",
+            "INSERT 2 750 bob follow-up on bob",
+            "COMMIT",
+            "SELECT *"));
     }
 }

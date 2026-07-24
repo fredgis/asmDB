@@ -128,7 +128,7 @@ db_write_slot:
     sub  rsp, 0x30
     mov  [rbp-8], rcx
     call store_slot_index            ; rax = index (rcx = slot ptr)
-    shl  rax, 6
+    shl  rax, REC_SHIFT
     add  rax, HDR_SIZE
     mov  rcx, rax
     mov  rdx, [rbp-8]
