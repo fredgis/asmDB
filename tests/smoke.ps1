@@ -80,5 +80,18 @@ finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
 
-if ($fail -gt 0) { Write-Host "`n$fail check(s) failed." -ForegroundColor Red; exit 1 }
+if ($fail -gt 0) {
+    # Dump raw captured output so CI reveals exactly what asmdb produced.
+    function Dump($name, $txt) {
+        Write-Host "`n===== RAW $name =====" -ForegroundColor Yellow
+        $bytes = [Text.Encoding]::UTF8.GetBytes([string]$txt)
+        Write-Host ("len={0} bytes; first-16-hex={1}" -f $bytes.Length, (($bytes | Select-Object -First 16 | ForEach-Object { $_.ToString('x2') }) -join ' '))
+        Write-Host ([string]$txt)
+        Write-Host "===== END $name ====="
+    }
+    Dump 'r1' $r1
+    Dump 'r2' $r2
+    Dump 'r3' $r3
+    Write-Host "`n$fail check(s) failed." -ForegroundColor Red; exit 1
+}
 Write-Host "`nAll checks passed." -ForegroundColor Green
