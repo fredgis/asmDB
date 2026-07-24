@@ -80,6 +80,8 @@ s_unknown:     db '[ERR] unknown command - type HELP', 13, 10, 0
 s_ok_ins:      db '[ OK ] 1 row inserted', 13, 10, 0
 s_ok_upd:      db '[ OK ] 1 row updated', 13, 10, 0
 s_ok_del:      db '[ OK ] 1 row deleted', 13, 10, 0
+s_ok_trunc:    db '[ OK ] table truncated - ', 0
+s_trunc_post:  db ' row(s) removed', 13, 10, 0
 s_err_dup:     db '[ERR] key already exists', 13, 10, 0
 s_err_nf:      db '[ERR] key not found', 13, 10, 0
 s_err_full:    db '[ERR] table full', 13, 10, 0
@@ -153,6 +155,8 @@ hc_range:   db 'RANGE <lo> <hi>', 0
 hd_range:   db 'list rows with value in [lo,hi]', 0
 hc_delete:  db 'DELETE <id>', 0
 hd_delete:  db 'remove a row by key', 0
+hc_trunc:   db 'TRUNCATE', 0
+hd_trunc:   db 'remove every row (respects transactions)', 0
 hc_count:   db 'COUNT', 0
 hd_count:   db 'number of live rows', 0
 
@@ -255,6 +259,7 @@ kw_insert:     db 'INSERT', 0
 kw_select:     db 'SELECT', 0
 kw_update:     db 'UPDATE', 0
 kw_delete:     db 'DELETE', 0
+kw_truncate:   db 'TRUNCATE', 0
 kw_count:      db 'COUNT', 0
 kw_help:       db 'HELP', 0
 kw_exit:       db 'EXIT', 0

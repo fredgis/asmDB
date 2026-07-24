@@ -56,12 +56,19 @@ os_init_std:
     mov  qword [rel g_stdout], 1
     mov  qword [rel g_stdin], 0
     mov  qword [rel g_color], 0
-    mov  edi, 1                      ; fd 1
+    mov  edi, 1                      ; fd 1 (stdout)
     mov  esi, TCGETS
     lea  rdx, [rel g_termbuf]
     mov  eax, SYS_ioctl
     syscall
     test rax, rax                    ; 0 on a real tty, -ENOTTY otherwise
+    jnz  .done
+    mov  edi, 0                      ; fd 0 (stdin) must be a tty too
+    mov  esi, TCGETS
+    lea  rdx, [rel g_termbuf]
+    mov  eax, SYS_ioctl
+    syscall
+    test rax, rax
     jnz  .done
     mov  qword [rel g_color], 1
 .done:
@@ -156,7 +163,7 @@ os_alloc:
 
 ; ------------------------------ console I/O ---------------------------------
 
-; os_write(rcx = fd, rdx = buf, r8 = len)
+; os_write(rcx = fd, rdx = buf, r8 = len) -> rax = bytes written (0 on error)
 os_write:
     push rbp
     mov  rbp, rsp
@@ -168,6 +175,10 @@ os_write:
     mov  rdx, r8
     mov  eax, SYS_write
     syscall
+    test rax, rax
+    jns  .done                       ; >= 0 = byte count
+    xor  eax, eax                    ; error -> report 0 written
+.done:
     mov  rdi, [rbp-16]
     mov  rsi, [rbp-8]
     mov  rsp, rbp

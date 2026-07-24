@@ -28,15 +28,32 @@ valloc_req:
     mov  ecx, 1
     call os_exit
 
-; putn(rcx = ptr, rdx = len) -> writes len bytes to stdout
+; putn(rcx = ptr, rdx = len) -> writes len bytes to stdout, looping over
+; os_write until the whole buffer is flushed (a pipe/ConPTY can accept a write
+; only partially, which previously truncated long output such as SELECT *).
 putn:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x40
-    mov  r8, rdx                     ; len
-    mov  rdx, rcx                    ; buf
+    mov  [rbp-8], rbx                ; buffer cursor
+    mov  [rbp-16], rsi               ; bytes remaining
+    mov  rbx, rcx
+    mov  rsi, rdx
+.loop:
+    test rsi, rsi
+    jz   .done
     mov  rcx, [rel g_stdout]         ; handle
+    mov  rdx, rbx                    ; buf
+    mov  r8, rsi                     ; len
     call os_write
+    test rax, rax
+    jz   .done                       ; error - stop
+    add  rbx, rax
+    sub  rsi, rax
+    jmp  .loop
+.done:
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret

@@ -40,30 +40,83 @@ strcpy_n:
 .d:
     ret
 
-; read_at(rcx = offset, rdx = buf, r8 = len) -> rax = bytes read
+; read_at(rcx = offset, rdx = buf, r8 = len) -> rax = total bytes read
+;   Loops over os_pread until the whole range is read or EOF/short-read stops
+;   it. A single ReadFile/pread is NOT guaranteed to transfer a large request
+;   in one call (the 1 GiB slot region routinely comes back short), so relying
+;   on one call silently dropped records whose hash slot lived past the prefix.
 read_at:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x30
-    mov  r9, r8                      ; len
-    mov  r8, rdx                     ; buf
-    mov  rdx, rcx                    ; offset
-    mov  rcx, [rel g_dat_handle]     ; handle
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx                ; total transferred
+    mov  [rbp-16], rsi               ; current file offset
+    mov  [rbp-24], rdi               ; current buffer pointer
+    mov  [rbp-32], r12               ; bytes remaining
+    xor  rbx, rbx
+    mov  rsi, rcx                    ; offset
+    mov  rdi, rdx                    ; buf
+    mov  r12, r8                     ; remaining
+.loop:
+    test r12, r12
+    jz   .done
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, rsi                    ; offset
+    mov  r8, rdi                     ; buf
+    mov  r9, r12                     ; len
     call os_pread
+    test rax, rax
+    jz   .done                       ; EOF or error - stop
+    add  rbx, rax
+    add  rsi, rax
+    add  rdi, rax
+    sub  r12, rax
+    jmp  .loop
+.done:
+    mov  rax, rbx
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret
 
-; write_at(rcx = offset, rdx = buf, r8 = len)
+; write_at(rcx = offset, rdx = buf, r8 = len) -> rax = total bytes written
+;   Loops over os_pwrite for the same short-transfer reason as read_at.
 write_at:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x30
-    mov  r9, r8                      ; len
-    mov  r8, rdx                     ; buf
-    mov  rdx, rcx                    ; offset
-    mov  rcx, [rel g_dat_handle]     ; handle
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx                ; total transferred
+    mov  [rbp-16], rsi               ; current file offset
+    mov  [rbp-24], rdi               ; current buffer pointer
+    mov  [rbp-32], r12               ; bytes remaining
+    xor  rbx, rbx
+    mov  rsi, rcx                    ; offset
+    mov  rdi, rdx                    ; buf
+    mov  r12, r8                     ; remaining
+.loop:
+    test r12, r12
+    jz   .done
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, rsi                    ; offset
+    mov  r8, rdi                     ; buf
+    mov  r9, r12                     ; len
     call os_pwrite
+    test rax, rax
+    jz   .done                       ; error - stop
+    add  rbx, rax
+    add  rsi, rax
+    add  rdi, rax
+    sub  r12, rax
+    jmp  .loop
+.done:
+    mov  rax, rbx
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret

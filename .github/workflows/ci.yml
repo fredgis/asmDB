@@ -15,13 +15,11 @@ jobs:
       - name: Install NASM
         run: sudo apt-get update && sudo apt-get install -y nasm
       - name: Build ELF64
-        run: ./build.sh
+        run: bash ./build.sh
       - name: Validate ELF header
         run: python3 tests/validate_elf.py build/asmdb
       - name: Smoke test (CRUD + txn + persistence)
-        run: |
-          chmod +x tests/smoke.sh
-          ./tests/smoke.sh --no-build
+        run: bash ./tests/smoke.sh --no-build
       - name: Benchmark (100k rows)
         run: printf 'BENCH 100000\nEXIT\n' | ./build/asmdb bench
 

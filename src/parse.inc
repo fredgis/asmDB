@@ -604,6 +604,81 @@ cmd_delete:
     pop  rbp
     ret
 
+; cmd_truncate() - TRUNCATE : empty the table (every live row -> deleted).
+;   Autocommit: clears the slots in RAM then does ONE durable whole-region
+;   checkpoint (single fsync), and reports how many rows were removed.
+;   In a transaction: each live row's before-image is captured in the undo log
+;   so ROLLBACK restores the whole table; the change is applied to disk by
+;   COMMIT. Rejected up front if that would exceed the per-txn undo capacity.
+cmd_truncate:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx                ; slot index
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    cmp  qword [rel g_in_txn], 0
+    je   .go
+    mov  rax, [rel g_count]
+    add  rax, [rel g_undo_n]         ; existing undo + rows still to capture
+    cmp  rax, UNDO_MAX
+    ja   .toobig
+.go:
+    xor  rbx, rbx                    ; index
+    mov  qword [rbp-32], 0           ; removed count
+.loop:
+    cmp  rbx, CAPACITY
+    jae  .loopend
+    mov  rax, rbx
+    shl  rax, REC_SHIFT
+    add  rax, [rel g_table]          ; slot ptr
+    cmp  byte [rax+REC_STATUS], ST_OCCUPIED
+    jne  .lnext
+    mov  rdi, rax                    ; live slot
+    cmp  qword [rel g_in_txn], 0
+    je   .clear
+    mov  rcx, rdi
+    call txn_capture                 ; record before-image (undo)
+    test rax, rax
+    jz   .toobig                     ; safety net (precheck should prevent this)
+.clear:
+    mov  byte [rdi+REC_STATUS], ST_DELETED
+    inc  qword [rbp-32]
+    cmp  qword [rel g_in_txn], 0
+    jne  .lnext
+    mov  rcx, rdi                    ; autocommit: persist just this cleared slot
+    call db_write_slot
+.lnext:
+    inc  rbx
+    jmp  .loop
+.loopend:
+    mov  rax, [rel g_count]
+    sub  rax, [rbp-32]
+    mov  [rel g_count], rax
+    cmp  qword [rel g_in_txn], 0
+    jne  .deferred
+    ; autocommit: refresh header row-count and fsync once
+    call db_write_header
+    call db_flush
+.deferred:
+    lea  rcx, [rel s_ok_trunc]
+    call puts
+    mov  rcx, [rbp-32]
+    call put_u64
+    lea  rcx, [rel s_trunc_post]
+    call puts
+    jmp  .tdone
+.toobig:
+    lea  rcx, [rel s_txn_toobig]
+    call puts
+.tdone:
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; cmd_select() - SELECT <id> | SELECT *
 cmd_select:
     push rbp
@@ -1190,6 +1265,9 @@ cmd_help:
     lea  rcx, [rel hc_delete]
     lea  rdx, [rel hd_delete]
     call help_row
+    lea  rcx, [rel hc_trunc]
+    lea  rdx, [rel hd_trunc]
+    call help_row
     lea  rcx, [rel hc_count]
     lea  rdx, [rel hd_count]
     call help_row
@@ -1463,6 +1541,10 @@ dispatch:
     call token_eq
     test rax, rax
     jnz  .delete
+    lea  rdi, [rel kw_truncate]
+    call token_eq
+    test rax, rax
+    jnz  .truncate
     lea  rdi, [rel kw_count]
     call token_eq
     test rax, rax
@@ -1533,6 +1615,9 @@ dispatch:
 .delete:
     call advance_token
     call cmd_delete
+    jmp  .ok0
+.truncate:
+    call cmd_truncate
     jmp  .ok0
 .count:
     call cmd_count

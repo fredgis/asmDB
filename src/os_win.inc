@@ -11,7 +11,10 @@
 
 ; --------------------------- process / startup ------------------------------
 
-; os_init_std() - resolve std handles and enable ANSI colour on a real console
+; os_init_std() - resolve std handles and enable ANSI colour only for a real
+; interactive console. Colour is enabled only when BOTH stdin and stdout are
+; consoles; if either is redirected (a pipe, as in scripted/CI use) output stays
+; plain so captured text carries no escape codes.
 os_init_std:
     push rbp
     mov  rbp, rsp
@@ -22,6 +25,12 @@ os_init_std:
     mov  ecx, STD_INPUT_HANDLE
     call [rel iat_GetStdHandle]
     mov  [rel g_stdin], rax
+    ; stdin must be a console too, else treat the session as non-interactive
+    mov  rcx, [rel g_stdin]
+    lea  rdx, [rel g_conmode]
+    call [rel iat_GetConsoleMode]
+    test eax, eax
+    jz   .nocolor
     mov  rcx, [rel g_stdout]
     lea  rdx, [rel g_conmode]
     call [rel iat_GetConsoleMode]
@@ -70,7 +79,7 @@ os_alloc:
 
 ; ------------------------------ console I/O ---------------------------------
 
-; os_write(rcx = handle, rdx = buf, r8 = len)
+; os_write(rcx = handle, rdx = buf, r8 = len) -> rax = bytes written
 os_write:
     push rbp
     mov  rbp, rsp
@@ -78,6 +87,13 @@ os_write:
     lea  r9, [rel g_written]         ; lpNumberOfBytesWritten
     mov  qword [rsp+0x20], 0         ; lpOverlapped = NULL
     call [rel iat_WriteFile]
+    test rax, rax
+    jz   .zero
+    mov  eax, [rel g_written]
+    jmp  .done
+.zero:
+    xor  eax, eax
+.done:
     mov  rsp, rbp
     pop  rbp
     ret
