@@ -22,6 +22,9 @@ g_undo:        dq 0
 g_undo_n:      dq 0
 g_count_snap:  dq 0
 g_walbuf:      dq 0
+g_color:       dq 0
+g_conmode:     dd 0
+g_have_argtable: dd 0
 g_onech:       db 0
                align 8
 g_tmp:         times 32 db 0
@@ -30,6 +33,9 @@ g_namebuf:     times 64 db 0
 g_base:        times 216 db 0
 g_datname:     times 224 db 0
 g_walname:     times 224 db 0
+g_tablename:   times 64 db 0
+g_argtable:    times 64 db 0
+g_finddata:    times FIND_STRUCT db 0
 g_hdr_read:    times HDR_SIZE db 0
 
 ; --------------------------- on-disk header ---------------------------------
@@ -43,9 +49,24 @@ g_hdr:
     times HDR_SIZE-32 db 0           ; pad to 512
 
 ; ------------------------------- strings ------------------------------------
+; ANSI SGR colors (emitted only when stdout is a real console).
+c_reset:       db 27, '[0m', 0
+c_bold:        db 27, '[1m', 0
+c_dim:         db 27, '[38;5;244m', 0
+c_grey:        db 27, '[38;5;240m', 0
+c_white:       db 27, '[1m', 27, '[38;5;255m', 0
+c_cyan:        db 27, '[38;5;45m', 0
+c_blue:        db 27, '[38;5;39m', 0
+c_indigo:      db 27, '[38;5;99m', 0
+c_green:       db 27, '[38;5;41m', 0
+c_red:         db 27, '[38;5;203m', 0
+c_yellow:      db 27, '[38;5;221m', 0
+c_prompt:      db 27, '[1m', 27, '[38;5;45m', 0
+
 s_magic:       db 'ASMDB', 0
 s_defbase:     db 'asmdb', 0
 s_dotdat:      db '.dat', 0
+s_pat_dat:     db '*.dat', 0
 s_dotwal:      db '.wal', 0
                 align 8
 wal_magic:     db 'ASMWAL01'
@@ -77,37 +98,93 @@ s_lbl_id:      db 'id', 0
 s_lbl_name:    db 'name', 0
 s_lbl_val:     db 'value', 0
 
-s_help:
+h_title:    db '  asmdb command reference', 0
+h_g_data:   db '  Data', 0
+h_g_txn:    db '  Transactions', 0
+h_g_cat:    db '  Catalog', 0
+h_g_sess:   db '  Session', 0
+
+hc_insert:  db 'INSERT <id> <val> <name>', 0
+hd_insert:  db 'add a new row', 0
+hc_sel1:    db 'SELECT <id>', 0
+hd_sel1:    db 'show one row by key', 0
+hc_selall:  db 'SELECT *', 0
+hd_selall:  db 'list every live row', 0
+hc_update:  db 'UPDATE <id> <val> <name>', 0
+hd_update:  db 'modify an existing row', 0
+hc_delete:  db 'DELETE <id>', 0
+hd_delete:  db 'remove a row by key', 0
+hc_count:   db 'COUNT', 0
+hd_count:   db 'number of live rows', 0
+
+hc_begin:   db 'BEGIN', 0
+hd_begin:   db 'start a transaction', 0
+hc_commit:  db 'COMMIT', 0
+hd_commit:  db 'make pending changes durable', 0
+hc_rback:   db 'ROLLBACK', 0
+hd_rback:   db 'discard pending changes', 0
+
+hc_tables:  db 'TABLES', 0
+hd_tables:  db 'tables in the current database', 0
+hc_dbs:     db 'DATABASES', 0
+hd_dbs:     db 'list *.dat files in this folder', 0
+hc_schema:  db 'SCHEMA', 0
+hd_schema:  db 'show the record layout', 0
+hc_types:   db 'TYPES', 0
+hd_types:   db 'supported column types', 0
+
+hc_help:    db 'HELP', 0
+hd_help:    db 'show this reference', 0
+hc_exit:    db 'EXIT / QUIT', 0
+hd_exit:    db 'leave asmdb', 0
+
+; ---- SCHEMA / TYPES (static) ----
+s_schema_title: db '  record layout - fixed 64 bytes per row', 0
+s_schema_body:
     db 13, 10
-    db '  asmdb commands', 13, 10
-    db '  ------------------------------------------------------', 13, 10
-    db '  INSERT <id> <value> <name>   add a row', 13, 10
-    db '  SELECT <id>                  show one row', 13, 10
-    db '  SELECT *                     show all rows', 13, 10
-    db '  UPDATE <id> <value> <name>   modify a row', 13, 10
-    db '  DELETE <id>                  remove a row', 13, 10
-    db '  COUNT                        number of live rows', 13, 10
-    db '  BEGIN | COMMIT | ROLLBACK    transaction control', 13, 10
-    db '  HELP                         this screen', 13, 10
-    db '  EXIT | QUIT                  leave asmdb', 13, 10
+    db '    offset  size  field   type', 13, 10
+    db '    ------  ----  ------  --------------------------------', 13, 10
+    db '    0       8     id      u64  primary key', 13, 10
+    db '    8       1     status  u8   0 empty / 1 live / 2 deleted', 13, 10
+    db '    16      8     value   i64  signed', 13, 10
+    db '    24      40    name    char[40] ASCII, NUL-padded', 13, 10
     db 13, 10, 0
 
-; -------------------------------- banner ------------------------------------
-banner:
+s_types_title: db '  supported column types', 0
+s_types_body:
     db 13, 10
-    db '    _    ____  __  __ ____  ____ ', 13, 10
-    db '   / \  / ___||  \/  |  _ \| __ )', 13, 10
-    db '  / _ \ \___ \| |\/| | | | |  _ \', 13, 10
-    db ' / ___ \ ___) | |  | | |_| | |_) |', 13, 10
-    db '/_/   \_\____/|_|  |_|____/|____/ ', 13, 10
+    db '    u64        unsigned 64-bit integer     id / primary key', 13, 10
+    db '    i64        signed 64-bit integer       value column', 13, 10
+    db '    char[40]   fixed ASCII text, <= 40 B   name column', 13, 10
     db 13, 10
-    db '  +---------------------------------------------+', 13, 10
-    db '  |  minimalist transactional DB - x86-64 asm   |', 13, 10
-    db '  |  NASM -f bin | no linker | no CRT           |', 13, 10
-    db '  +---------------------------------------------+', 13, 10
-    db 13, 10
-    db '  Type HELP for commands, EXIT to quit.', 13, 10
+    db '    every row is one fixed 64-byte record - no varints, no BLOBs', 13, 10
     db 13, 10, 0
+
+; ---- TABLES / DATABASES ----
+s_tables_title: db '  tables in database ', 0
+s_tables_hdr:
+    db '    table                        rows', 13, 10
+    db '    -------------------------    ----------', 0
+s_dbs_title:    db '  databases in this folder', 0
+s_dbs_hdr:
+    db '    database                     size (bytes)   current', 13, 10
+    db '    -------------------------    ------------   -------', 0
+s_dbs_empty:    db '    (none found)', 0
+
+; -------------------------------- banner ------------------------------------
+; Printed by print_banner (console.inc) with color when stdout is a console.
+bnr1:  db '                              ____  ', 0
+bnr2:  db '    ____ __________ ___  ____/ / /_ ', 0
+bnr3:  db '   / __ `/ ___/ __ `__ \/ __  / __ \', 0
+bnr4:  db '  / /_/ (__  ) / / / / / /_/ / /_/ /', 0
+bnr5:  db '  \__,_/____/_/ /_/ /_/\__,_/_.___/ ', 0
+s_tagline:  db '  a minimalist transactional database engine, in x86-64 assembly', 0
+s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL durability  .  ~10 KB', 0
+s_hint_a:   db '  type ', 0
+s_hint_hi1: db 'HELP', 0
+s_hint_b:   db ' for commands, or ', 0
+s_hint_hi2: db 'QUIT', 0
+s_hint_c:   db ' to exit', 0
 
 ; ------------------------------- keywords -----------------------------------
 kw_insert:     db 'INSERT', 0
@@ -121,6 +198,10 @@ kw_quit:       db 'QUIT', 0
 kw_begin:      db 'BEGIN', 0
 kw_commit:     db 'COMMIT', 0
 kw_rollback:   db 'ROLLBACK', 0
+kw_tables:     db 'TABLES', 0
+kw_databases:  db 'DATABASES', 0
+kw_schema:     db 'SCHEMA', 0
+kw_types:      db 'TYPES', 0
 
 ; ----------------------------- import table ---------------------------------
                 align 4
@@ -145,6 +226,11 @@ iat_FlushFileBuffers:  dq RVA(h_FlushFileBuffers)
 iat_SetEndOfFile:      dq RVA(h_SetEndOfFile)
 iat_CloseHandle:       dq RVA(h_CloseHandle)
 iat_GetCommandLineA:   dq RVA(h_GetCommandLineA)
+iat_GetConsoleMode:    dq RVA(h_GetConsoleMode)
+iat_SetConsoleMode:    dq RVA(h_SetConsoleMode)
+iat_FindFirstFileA:    dq RVA(h_FindFirstFileA)
+iat_FindNextFileA:     dq RVA(h_FindNextFileA)
+iat_FindClose:         dq RVA(h_FindClose)
 iat_ExitProcess:       dq RVA(h_ExitProcess)
                        dq 0
 
@@ -180,6 +266,21 @@ h_CloseHandle:       dw 0
                 align 2
 h_GetCommandLineA:   dw 0
     db 'GetCommandLineA', 0
+                align 2
+h_GetConsoleMode:    dw 0
+    db 'GetConsoleMode', 0
+                align 2
+h_SetConsoleMode:    dw 0
+    db 'SetConsoleMode', 0
+                align 2
+h_FindFirstFileA:    dw 0
+    db 'FindFirstFileA', 0
+                align 2
+h_FindNextFileA:     dw 0
+    db 'FindNextFileA', 0
+                align 2
+h_FindClose:         dw 0
+    db 'FindClose', 0
                 align 2
 h_ExitProcess:       dw 0
     db 'ExitProcess', 0

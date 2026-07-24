@@ -15,6 +15,31 @@ strcpy_z:
 .done:
     ret
 
+; strcpy_n(rdi = dest, rsi = src, rcx = count) - copy src until NUL, zero-pad to
+; exactly count bytes. Clobbers rax, r8, r10.
+strcpy_n:
+    xor  r8, r8
+    xor  r10b, r10b
+.l:
+    cmp  r8, rcx
+    jae  .d
+    test r10b, r10b
+    jnz  .pad
+    mov  al, [rsi+r8]
+    test al, al
+    jz   .startpad
+    mov  [rdi+r8], al
+    inc  r8
+    jmp  .l
+.startpad:
+    mov  r10b, 1
+.pad:
+    mov  byte [rdi+r8], 0
+    inc  r8
+    jmp  .l
+.d:
+    ret
+
 ; read_at(rcx = offset, rdx = buf, r8 = len) -> rax = bytes read
 read_at:
     push rbp
@@ -78,12 +103,20 @@ db_write_header:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
     mov  rax, [rel g_count]
     mov  [rel g_hdr+24], rax
+    lea  rdi, [rel g_hdr+HDR_TABLE]
+    lea  rsi, [rel g_tablename]
+    mov  rcx, TABLE_MAX
+    call strcpy_n
     xor  rcx, rcx
     lea  rdx, [rel g_hdr]
     mov  r8, HDR_SIZE
     call write_at
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret
@@ -176,6 +209,41 @@ db_init_names:
     mov  byte [rdi+rcx], 0
     test rcx, rcx
     jz   .default
+    ; optional 2nd arg = table name
+    mov  al, [rsi]
+    cmp  al, '"'
+    jne  .tsp
+    inc  rsi
+.tsp:
+    call skip_spaces_rsi
+    mov  al, [rsi]
+    test al, al
+    je   .build
+    cmp  al, '"'
+    jne  .tcopy
+    inc  rsi
+.tcopy:
+    lea  rdi, [rel g_argtable]
+    xor  rcx, rcx
+.tl:
+    mov  al, [rsi]
+    test al, al
+    je   .tend
+    cmp  al, ' '
+    je   .tend
+    cmp  al, '"'
+    je   .tend
+    cmp  rcx, TABLE_MAX-1
+    jae  .tend
+    mov  [rdi+rcx], al
+    inc  rsi
+    inc  rcx
+    jmp  .tl
+.tend:
+    mov  byte [rdi+rcx], 0
+    test rcx, rcx
+    jz   .build
+    mov  dword [rel g_have_argtable], 1
     jmp  .build
 .default:
     lea  rdi, [rel g_base]
@@ -236,6 +304,27 @@ db_open:
     ; load count and slot region
     mov  rax, [rel g_hdr_read+24]
     mov  [rel g_count], rax
+    ; resolve table name: CLI arg overrides, else header, else base
+    cmp  dword [rel g_have_argtable], 0
+    jne  .name_arg
+    lea  rsi, [rel g_hdr_read+HDR_TABLE]
+    mov  al, [rsi]
+    test al, al
+    jnz  .name_copy
+    lea  rsi, [rel g_base]
+.name_copy:
+    lea  rdi, [rel g_tablename]
+    mov  rcx, TABLE_MAX
+    call strcpy_n
+    jmp  .name_done
+.name_arg:
+    lea  rsi, [rel g_argtable]
+    lea  rdi, [rel g_tablename]
+    mov  rcx, TABLE_MAX
+    call strcpy_n
+    call db_write_header
+    call db_flush
+.name_done:
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
     mov  r8, CAPACITY*REC_SIZE
@@ -243,6 +332,16 @@ db_open:
     jmp  .done
 .newfile:
     mov  qword [rel g_count], 0
+    cmp  dword [rel g_have_argtable], 0
+    jne  .nf_arg
+    lea  rsi, [rel g_base]
+    jmp  .nf_copy
+.nf_arg:
+    lea  rsi, [rel g_argtable]
+.nf_copy:
+    lea  rdi, [rel g_tablename]
+    mov  rcx, TABLE_MAX
+    call strcpy_n
     call db_write_header
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]

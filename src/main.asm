@@ -90,6 +90,19 @@ entry:
     call [rel iat_GetStdHandle]
     mov  [rel g_stdin], rax
 
+    ; enable ANSI colors only when stdout is a real console (not piped)
+    mov  rcx, [rel g_stdout]
+    lea  rdx, [rel g_conmode]
+    call [rel iat_GetConsoleMode]
+    test eax, eax
+    jz   .nocolor
+    mov  rcx, [rel g_stdout]
+    mov  edx, [rel g_conmode]
+    or   edx, ENABLE_VT
+    call [rel iat_SetConsoleMode]
+    mov  qword [rel g_color], 1
+.nocolor:
+
     mov  ecx, READ_BUF_SIZE
     call valloc
     mov  [rel g_readbuf], rax
@@ -115,8 +128,7 @@ entry:
     call db_init_names
     call db_open
 
-    lea  rcx, [rel banner]
-    call puts
+    call print_banner
 
     call repl_loop
 
@@ -131,7 +143,8 @@ repl_loop:
     sub  rsp, 0x30
 .loop:
     lea  rcx, [rel s_prompt]
-    call puts
+    lea  rdx, [rel c_prompt]
+    call puts_col
     mov  rcx, [rel g_linebuf]
     mov  rdx, LINE_MAX
     call read_line

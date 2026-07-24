@@ -181,6 +181,8 @@ tbl_sep:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
+    lea  rcx, [rel c_grey]
+    call set_color
     mov  cl, '+'
     call putc
     mov  cl, '-'
@@ -198,6 +200,7 @@ tbl_sep:
     call put_repeat
     mov  cl, '+'
     call putc
+    call reset_color
     call crlf
     mov  rsp, rbp
     pop  rbp
@@ -208,6 +211,8 @@ tbl_head:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
+    lea  rcx, [rel c_cyan]
+    call set_color
     lea  rcx, [rel s_cell_l]
     call puts
     lea  rcx, [rel s_lbl_id]
@@ -225,6 +230,7 @@ tbl_head:
     call put_label
     lea  rcx, [rel s_cell_r]
     call puts
+    call reset_color
     call crlf
     mov  rsp, rbp
     pop  rbp
@@ -535,15 +541,248 @@ cmd_count:
     pop  rbp
     ret
 
-; cmd_help() - HELP
+; cmd_help() - HELP (sectioned, aligned, colored)
 cmd_help:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
-    lea  rcx, [rel s_help]
-    call puts
+    call crlf
+    lea  rcx, [rel h_title]
+    lea  rdx, [rel c_white]
+    call puts_col
+    call crlf
+    call crlf
+    lea  rcx, [rel h_g_data]
+    lea  rdx, [rel c_yellow]
+    call puts_col
+    call crlf
+    lea  rcx, [rel hc_insert]
+    lea  rdx, [rel hd_insert]
+    call help_row
+    lea  rcx, [rel hc_sel1]
+    lea  rdx, [rel hd_sel1]
+    call help_row
+    lea  rcx, [rel hc_selall]
+    lea  rdx, [rel hd_selall]
+    call help_row
+    lea  rcx, [rel hc_update]
+    lea  rdx, [rel hd_update]
+    call help_row
+    lea  rcx, [rel hc_delete]
+    lea  rdx, [rel hd_delete]
+    call help_row
+    lea  rcx, [rel hc_count]
+    lea  rdx, [rel hd_count]
+    call help_row
+    call crlf
+    lea  rcx, [rel h_g_txn]
+    lea  rdx, [rel c_yellow]
+    call puts_col
+    call crlf
+    lea  rcx, [rel hc_begin]
+    lea  rdx, [rel hd_begin]
+    call help_row
+    lea  rcx, [rel hc_commit]
+    lea  rdx, [rel hd_commit]
+    call help_row
+    lea  rcx, [rel hc_rback]
+    lea  rdx, [rel hd_rback]
+    call help_row
+    call crlf
+    lea  rcx, [rel h_g_cat]
+    lea  rdx, [rel c_yellow]
+    call puts_col
+    call crlf
+    lea  rcx, [rel hc_tables]
+    lea  rdx, [rel hd_tables]
+    call help_row
+    lea  rcx, [rel hc_dbs]
+    lea  rdx, [rel hd_dbs]
+    call help_row
+    lea  rcx, [rel hc_schema]
+    lea  rdx, [rel hd_schema]
+    call help_row
+    lea  rcx, [rel hc_types]
+    lea  rdx, [rel hd_types]
+    call help_row
+    call crlf
+    lea  rcx, [rel h_g_sess]
+    lea  rdx, [rel c_yellow]
+    call puts_col
+    call crlf
+    lea  rcx, [rel hc_help]
+    lea  rdx, [rel hd_help]
+    call help_row
+    lea  rcx, [rel hc_exit]
+    lea  rdx, [rel hd_exit]
+    call help_row
+    call crlf
     mov  rsp, rbp
     pop  rbp
+    ret
+
+; cmd_schema() - SCHEMA (static record layout)
+cmd_schema:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call crlf
+    lea  rcx, [rel s_schema_title]
+    lea  rdx, [rel c_white]
+    call puts_col
+    lea  rcx, [rel s_schema_body]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_types() - TYPES (static supported types)
+cmd_types:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call crlf
+    lea  rcx, [rel s_types_title]
+    lea  rdx, [rel c_white]
+    call puts_col
+    lea  rcx, [rel s_types_body]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_tables() - TABLES (this database holds one logical table)
+cmd_tables:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    call crlf
+    lea  rcx, [rel s_tables_title]
+    lea  rdx, [rel c_white]
+    call puts_col
+    lea  rcx, [rel g_base]
+    lea  rdx, [rel c_cyan]
+    call puts_col
+    call crlf
+    call crlf
+    lea  rcx, [rel s_tables_hdr]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    call crlf
+    mov  rcx, 4
+    call put_spaces
+    lea  rcx, [rel g_tablename]
+    lea  rdx, [rel c_cyan]
+    call puts_col
+    lea  rcx, [rel g_tablename]
+    call strlen
+    mov  rcx, 29
+    sub  rcx, rax
+    cmp  rcx, 1
+    jge  .pad
+    mov  rcx, 1
+.pad:
+    call put_spaces
+    mov  rcx, [rel g_count]
+    call put_u64
+    call crlf
+    call crlf
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_databases() - DATABASES (enumerate *.dat in the current folder)
+cmd_databases:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    call crlf
+    lea  rcx, [rel s_dbs_title]
+    lea  rdx, [rel c_white]
+    call puts_col
+    call crlf
+    call crlf
+    lea  rcx, [rel s_dbs_hdr]
+    lea  rdx, [rel c_grey]
+    call puts_col
+    call crlf
+    lea  rcx, [rel s_pat_dat]
+    lea  rdx, [rel g_finddata]
+    call [rel iat_FindFirstFileA]
+    cmp  rax, INVALID_HANDLE
+    je   .none
+    mov  rbx, rax                    ; find handle
+.row:
+    mov  rcx, 4
+    call put_spaces
+    lea  rcx, [rel g_finddata+FIND_NAME]
+    lea  rdx, [rel c_cyan]
+    call puts_col
+    lea  rcx, [rel g_finddata+FIND_NAME]
+    call strlen
+    mov  rcx, 29
+    sub  rcx, rax
+    cmp  rcx, 1
+    jge  .pad
+    mov  rcx, 1
+.pad:
+    call put_spaces
+    mov  ecx, [rel g_finddata+FIND_SIZELOW]
+    mov  rdx, 15
+    call put_u64_field
+    lea  rsi, [rel g_finddata+FIND_NAME]
+    lea  rdi, [rel g_datname]
+    call streq
+    test rax, rax
+    jz   .nocur
+    lea  rcx, [rel c_green]
+    call set_color
+    mov  cl, '*'
+    call putc
+    call reset_color
+.nocur:
+    call crlf
+    mov  rcx, rbx
+    lea  rdx, [rel g_finddata]
+    call [rel iat_FindNextFileA]
+    test eax, eax
+    jnz  .row
+    mov  rcx, rbx
+    call [rel iat_FindClose]
+    jmp  .done
+.none:
+    lea  rcx, [rel s_dbs_empty]
+    call puts
+    call crlf
+.done:
+    call crlf
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; streq(rsi = a, rdi = b) -> rax = 1 if equal (case-sensitive). Clobbers rsi/rdi.
+streq:
+    mov  cl, [rsi]
+    cmp  cl, [rdi]
+    jne  .no
+    test cl, cl
+    je   .yes
+    inc  rsi
+    inc  rdi
+    jmp  streq
+.yes:
+    mov  rax, 1
+    ret
+.no:
+    xor  rax, rax
     ret
 
 ; cmd_begin / cmd_commit / cmd_rollback live in wal.inc (real transactions).
@@ -603,6 +842,22 @@ dispatch:
     call token_eq
     test rax, rax
     jnz  .rollback
+    lea  rdi, [rel kw_tables]
+    call token_eq
+    test rax, rax
+    jnz  .tables
+    lea  rdi, [rel kw_databases]
+    call token_eq
+    test rax, rax
+    jnz  .databases
+    lea  rdi, [rel kw_schema]
+    call token_eq
+    test rax, rax
+    jnz  .schema
+    lea  rdi, [rel kw_types]
+    call token_eq
+    test rax, rax
+    jnz  .types
     lea  rcx, [rel s_unknown]
     call puts
     jmp  .ok0
@@ -636,6 +891,18 @@ dispatch:
     jmp  .ok0
 .rollback:
     call cmd_rollback
+    jmp  .ok0
+.tables:
+    call cmd_tables
+    jmp  .ok0
+.databases:
+    call cmd_databases
+    jmp  .ok0
+.schema:
+    call cmd_schema
+    jmp  .ok0
+.types:
+    call cmd_types
     jmp  .ok0
 .exit:
     mov  rax, CMD_EXIT

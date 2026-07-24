@@ -23,6 +23,7 @@
 [CmdletBinding()]
 param(
     [string]$Database = 'SalesDB',
+    [string]$Table    = 'SalesTransactions',
     [switch]$Rebuild,
     [switch]$Fresh
 )
@@ -64,12 +65,13 @@ try {
         $lines.Add("INSERT $($s.id) $($s.amount) $($s.customer)")
     }
     $lines.Add('COMMIT')
+    $lines.Add('TABLES')
     $lines.Add('SELECT *')
     $lines.Add('COUNT')
     $lines.Add('EXIT')
 
-    Write-Host ">> seeding $($sales.Count) SalesTransactions into '$Database' ..." -ForegroundColor Cyan
-    ($lines -join "`n") | & $exe $Database
+    Write-Host ">> seeding $($sales.Count) rows into table '$Table' of '$Database' ..." -ForegroundColor Cyan
+    ($lines -join "`n") | & $exe $Database $Table
 }
 finally {
     Pop-Location

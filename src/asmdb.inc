@@ -48,10 +48,19 @@
 %define OPEN_ALWAYS        4
 %define FILE_ATTRIBUTE_NORMAL 0x80
 %define FILE_BEGIN         0
+%define ENABLE_VT          0x0004    ; ENABLE_VIRTUAL_TERMINAL_PROCESSING
+%define INVALID_HANDLE     -1
+
+; ---- WIN32_FIND_DATAA field offsets ----
+%define FIND_SIZELOW  32
+%define FIND_NAME     44
+%define FIND_STRUCT   592
 
 ; ---- On-disk ----
 %define HDR_SIZE   512
 %define DB_VERSION 1
+%define HDR_TABLE  32         ; table-name field offset in the header
+%define TABLE_MAX  48         ; max table-name length
 
 ; ---- WAL record tags ----
 %define WAL_BEGIN  1
