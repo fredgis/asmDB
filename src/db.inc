@@ -1,0 +1,268 @@
+; -----------------------------------------------------------------------------
+; src/db.inc - on-disk persistence for asmdb.dat (header + slot region).
+; Autocommit durability: every mutation writes the slot + header and flushes.
+; -----------------------------------------------------------------------------
+
+; strcpy_z(rdi = dest, rsi = src) -> rdi points at the terminating NUL written
+strcpy_z:
+    mov  al, [rsi]
+    mov  [rdi], al
+    test al, al
+    je   .done
+    inc  rsi
+    inc  rdi
+    jmp  strcpy_z
+.done:
+    ret
+
+; read_at(rcx = offset, rdx = buf, r8 = len) -> rax = bytes read
+read_at:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50
+    mov  [rbp-8], rcx
+    mov  [rbp-16], rdx
+    mov  [rbp-24], r8
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, [rbp-8]
+    xor  r8, r8
+    mov  r9d, FILE_BEGIN
+    call [rel iat_SetFilePointerEx]
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, [rbp-16]
+    mov  r8, [rbp-24]
+    lea  r9, [rel g_io_dw]
+    mov  qword [rsp+0x20], 0
+    call [rel iat_ReadFile]
+    mov  eax, [rel g_io_dw]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; write_at(rcx = offset, rdx = buf, r8 = len)
+write_at:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50
+    mov  [rbp-8], rcx
+    mov  [rbp-16], rdx
+    mov  [rbp-24], r8
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, [rbp-8]
+    xor  r8, r8
+    mov  r9d, FILE_BEGIN
+    call [rel iat_SetFilePointerEx]
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, [rbp-16]
+    mov  r8, [rbp-24]
+    lea  r9, [rel g_io_dw]
+    mov  qword [rsp+0x20], 0
+    call [rel iat_WriteFile]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; db_flush()
+db_flush:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  rcx, [rel g_dat_handle]
+    call [rel iat_FlushFileBuffers]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; db_write_header() - refresh count field then persist the 512-byte header
+db_write_header:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  rax, [rel g_count]
+    mov  [rel g_hdr+24], rax
+    xor  rcx, rcx
+    lea  rdx, [rel g_hdr]
+    mov  r8, HDR_SIZE
+    call write_at
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; db_write_slot(rcx = slot ptr) - write one 64-byte record to disk
+db_write_slot:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rcx
+    call store_slot_index            ; rax = index (rcx = slot ptr)
+    shl  rax, 6
+    add  rax, HDR_SIZE
+    mov  rcx, rax
+    mov  rdx, [rbp-8]
+    mov  r8, REC_SIZE
+    call write_at
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; db_persist_slot(rcx = slot ptr) - slot + header + flush (durable autocommit)
+db_persist_slot:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call db_write_slot               ; rcx = slot ptr
+    call db_write_header
+    call db_flush
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; db_init_names() - derive g_datname / g_walname from the command-line arg
+db_init_names:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    call [rel iat_GetCommandLineA]
+    mov  rsi, rax
+    ; skip program name (handle quoted path)
+    mov  al, [rsi]
+    cmp  al, '"'
+    jne  .noq
+    inc  rsi
+.q:
+    mov  al, [rsi]
+    test al, al
+    je   .default
+    inc  rsi
+    cmp  al, '"'
+    jne  .q
+    jmp  .afterprog
+.noq:
+    mov  al, [rsi]
+    test al, al
+    je   .default
+    cmp  al, ' '
+    je   .afterprog
+    inc  rsi
+    jmp  .noq
+.afterprog:
+    call skip_spaces_rsi
+    mov  al, [rsi]
+    test al, al
+    je   .default
+    cmp  al, '"'
+    jne  .copy
+    inc  rsi
+.copy:
+    lea  rdi, [rel g_base]
+    xor  rcx, rcx
+.cl:
+    mov  al, [rsi]
+    test al, al
+    je   .cend
+    cmp  al, ' '
+    je   .cend
+    cmp  al, '"'
+    je   .cend
+    cmp  rcx, 200
+    jae  .cend
+    mov  [rdi+rcx], al
+    inc  rsi
+    inc  rcx
+    jmp  .cl
+.cend:
+    mov  byte [rdi+rcx], 0
+    test rcx, rcx
+    jz   .default
+    jmp  .build
+.default:
+    lea  rdi, [rel g_base]
+    lea  rsi, [rel s_defbase]
+    call strcpy_z
+.build:
+    lea  rdi, [rel g_datname]
+    lea  rsi, [rel g_base]
+    call strcpy_z
+    lea  rsi, [rel s_dotdat]
+    call strcpy_z
+    lea  rdi, [rel g_walname]
+    lea  rsi, [rel g_base]
+    call strcpy_z
+    lea  rsi, [rel s_dotwal]
+    call strcpy_z
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; db_open() - open/create g_datname; load header + slots, or initialize a new file
+db_open:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50
+    lea  rcx, [rel g_datname]
+    mov  rdx, GENERIC_READ | GENERIC_WRITE
+    mov  r8d, 1                      ; FILE_SHARE_READ
+    xor  r9, r9
+    mov  dword [rsp+0x20], OPEN_ALWAYS
+    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
+    mov  qword [rsp+0x30], 0
+    call [rel iat_CreateFileA]
+    mov  [rel g_dat_handle], rax
+    call wal_open
+    call wal_recover
+    ; read the header
+    xor  rcx, rcx
+    lea  rdx, [rel g_hdr_read]
+    mov  r8, HDR_SIZE
+    call read_at
+    cmp  rax, HDR_SIZE
+    jb   .newfile
+    ; validate magic (5 bytes)
+    lea  rsi, [rel g_hdr_read]
+    lea  rdi, [rel s_magic]
+    mov  rcx, 5
+.magic:
+    mov  al, [rsi]
+    cmp  al, [rdi]
+    jne  .newfile
+    inc  rsi
+    inc  rdi
+    dec  rcx
+    jnz  .magic
+    ; load count and slot region
+    mov  rax, [rel g_hdr_read+24]
+    mov  [rel g_count], rax
+    mov  rcx, HDR_SIZE
+    mov  rdx, [rel g_table]
+    mov  r8, CAPACITY*REC_SIZE
+    call read_at
+    jmp  .done
+.newfile:
+    mov  qword [rel g_count], 0
+    call db_write_header
+    mov  rcx, HDR_SIZE
+    mov  rdx, [rel g_table]
+    mov  r8, CAPACITY*REC_SIZE
+    call write_at
+    call db_flush
+.done:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; db_close()
+db_close:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call db_flush
+    mov  rcx, [rel g_dat_handle]
+    call [rel iat_CloseHandle]
+    call wal_close
+    mov  rsp, rbp
+    pop  rbp
+    ret

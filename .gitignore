@@ -1,0 +1,11 @@
+# Build output
+build/*.exe
+build/*.obj
+
+# Runtime data files
+*.dat
+*.wal
+
+# Editor / OS
+*.swp
+Thumbs.db
