@@ -53,9 +53,10 @@ compute time. Idle instances **scale to zero** and cost almost nothing.
 Why this can win:
 
 - **The engine is tiny and starts instantly.** `asmdb.exe` is ~20 KB, has no
-  runtime to warm up, and maps a single 64 MiB region on boot. That makes
-  **per-instance micro-containers** and **scale-to-zero** economically viable in
-  a way a heavyweight DB image (hundreds of MB, slow warmup) is not — cold start
+  runtime to warm up, and maps a single 1 GiB record region on boot — **sparse
+  on disk**, so an empty or idle instance's data file costs only kilobytes. That
+  makes **per-instance micro-containers** and **scale-to-zero** economically
+  viable in a way a heavyweight DB image (hundreds of MB, slow warmup) is not — cold start
   is milliseconds, so we can hibernate idle databases and still feel "always on."
 - **Cost per operation is dominated by a hash probe + a WAL append.** The engine
   spends almost nothing per op, so **pay-per-use** pricing can be aggressive and
@@ -116,35 +117,48 @@ the target.
 
 ## 4. High-level architecture
 
-```
-                         ┌──────────────────────────────────────────────┐
-   clients              │                 CONTROL PLANE                  │
-   ───────              │  (Rust/Go — NOT assembly)                      │
-   REST  ─┐             │                                               │
-   gRPC  ─┼───TLS──────▶│  API gateway ─ auth ─ rate limit ─ router      │
-   MCP   ─┘             │       │              │            │           │
-                        │       │ provision    │ meter      │ route      │
-                        │       ▼              ▼            │            │
-                        │  provisioner   usage pipeline     │            │
-                        └───────┼───────────────────────────┼──────────┘
-                                │ create/stop/resume         │ per-instance
-                                ▼                            ▼ endpoint
-                         ┌──────────────────────────────────────────────┐
-                         │                  DATA PLANE                    │
-                         │  one micro-container per database instance     │
-                         │                                               │
-                         │  ┌───────────────┐  ┌───────────────┐  ...    │
-                         │  │ instance A     │  │ instance B     │        │
-                         │  │ ┌───────────┐  │  │ ┌───────────┐  │        │
-                         │  │ │ sidecar    │  │  │ │ sidecar    │  │        │
-                         │  │ │ (Rust/Go)  │  │  │ │ (Rust/Go)  │  │        │
-                         │  │ └────┬──────┘  │  │ └────┬──────┘  │        │
-                         │  │  asmdb.exe     │  │  asmdb.exe     │        │
-                         │  │  A.dat / A.wal │  │  B.dat / B.wal │        │
-                         │  └───────┬───────┘  └───────┬───────┘         │
-                         └──────────┼──────────────────┼─────────────────┘
-                                    ▼                  ▼
-                         object storage: per-instance snapshots + WAL segments
+```mermaid
+flowchart TB
+    subgraph clients["clients"]
+        REST[REST]
+        GRPC[gRPC]
+        MCP[MCP]
+    end
+    subgraph cp["CONTROL PLANE &mdash; Rust/Go (NOT assembly)"]
+        GW["API gateway<br/>auth · rate limit · router"]
+        PROV["provisioner"]
+        USAGE["usage pipeline"]
+        GW --> PROV
+        GW --> USAGE
+    end
+    subgraph dp["DATA PLANE &mdash; one micro-container per instance"]
+        subgraph instA["instance A"]
+            SIDEA["sidecar (Rust/Go)"] --> ENGA["asmdb.exe<br/>A.dat / A.wal"]
+        end
+        subgraph instB["instance B"]
+            SIDEB["sidecar (Rust/Go)"] --> ENGB["asmdb.exe<br/>B.dat / B.wal"]
+        end
+    end
+    OBJ[("object storage<br/>per-instance snapshots + WAL segments")]
+
+    REST -->|TLS| GW
+    GRPC -->|TLS| GW
+    MCP  -->|TLS| GW
+    PROV -.->|create / stop / resume| SIDEA
+    PROV -.->|create / stop / resume| SIDEB
+    GW -->|route per-instance endpoint| SIDEA
+    GW -->|route per-instance endpoint| SIDEB
+    ENGA --> OBJ
+    ENGB --> OBJ
+
+    classDef client fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef ctrl fill:#6e4aa0,stroke:#3b1e75,color:#fff
+    classDef engine fill:#1a7f37,stroke:#0b4a20,color:#fff
+    classDef store fill:#9a6700,stroke:#5a3d00,color:#fff
+    class REST,GRPC,MCP client
+    class GW,PROV,USAGE ctrl
+    class SIDEA,SIDEB,ENGA,ENGB engine
+    class OBJ store
 ```
 
 - **Control plane** (Rust/Go, stateless, horizontally scaled): API gateway (TLS,
@@ -170,11 +184,29 @@ already uses — see [`ENGINE.md §11`](ENGINE.md#11-mcp-server--crud-interface)
 
 An instance is the product's core object. Its states:
 
-```
-   create ─▶ PROVISIONING ─▶ RUNNING ⇄ IDLE ─▶ HIBERNATED
-                                │                   │
-                                └──── resume ◀───────┘
-   RUNNING/HIBERNATED ─▶ (backup/restore, resize) ─▶ DELETING ─▶ deleted
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> PROVISIONING: create
+    PROVISIONING --> RUNNING
+    RUNNING --> IDLE: no requests for N s
+    IDLE --> RUNNING: request
+    IDLE --> HIBERNATED: idle timeout
+    HIBERNATED --> RUNNING: resume
+    RUNNING --> RUNNING: backup / restore / resize
+    HIBERNATED --> HIBERNATED: backup / restore
+    RUNNING --> DELETING: delete
+    HIBERNATED --> DELETING: delete
+    DELETING --> [*]
+
+    classDef run fill:#1a7f37,stroke:#0b4a20,color:#fff
+    classDef warm fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef cold fill:#9a6700,stroke:#5a3d00,color:#fff
+    classDef gone fill:#8b1a1a,stroke:#4a0b0b,color:#fff
+    class RUNNING run
+    class IDLE warm
+    class HIBERNATED cold
+    class DELETING gone
 ```
 
 | Transition | What happens | Billing effect |
@@ -249,6 +281,110 @@ small ops.
 Keys map to the engine's `u64` id exactly as the MCP server does: pass an integer
 `id`, or a string `key` the layer hashes with FNV-1a.
 
+### 7.4 Connecting a web application (end-to-end)
+
+The common case: **your web app's backend talks to asmdb over REST; the browser
+never does.** An instance endpoint + API key is a server-side credential — treat
+it like a database password. Your frontend calls *your* API; your API calls the
+asmdb instance. This is the standard backend-for-frontend (BFF) pattern.
+
+```mermaid
+flowchart LR
+    BROWSER["browser / SPA<br/>(no API key)"]
+    APP["your web backend<br/>(Node / .NET / Go)<br/>holds ASMDB_API_KEY"]
+    GW["asmdb Cloud gateway<br/>auth · rate limit · route"]
+    SIDE["instance sidecar"]
+    ENG["asmdb.exe<br/>&lt;instance&gt;.dat / .wal"]
+
+    BROWSER -->|"HTTPS · your session cookie / JWT"| APP
+    APP -->|"HTTPS · Bearer &lt;API key&gt;<br/>/v1/db/&#123;instance&#125;/rows"| GW
+    GW -->|"routed to this tenant only"| SIDE
+    SIDE -->|"stdin/stdout"| ENG
+    ENG -.->|rows| SIDE
+    SIDE -.-> GW
+    GW -.-> APP
+    APP -.->|"JSON your frontend needs"| BROWSER
+
+    classDef edge fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef app fill:#6e4aa0,stroke:#3b1e75,color:#fff
+    classDef ctrl fill:#b35900,stroke:#5a3d00,color:#fff
+    classDef engine fill:#1a7f37,stroke:#0b4a20,color:#fff
+    class BROWSER edge
+    class APP app
+    class GW,SIDE ctrl
+    class ENG engine
+```
+
+**Steps**
+
+1. **Provision** an instance (dashboard, CLI, or the provisioning API). You get
+   back an **endpoint URL** (`https://api.asmdb.cloud/v1/db/{instance}`) and an
+   **API key**.
+2. **Store the key as a server secret** (env var / Key Vault / Secrets Manager) —
+   never bundle it in frontend code or expose it to the browser.
+3. **Call the REST API from your backend** with `Authorization: Bearer <key>`.
+   Map your app's identifiers to a row `key` (hashed to the engine's `u64` id).
+
+```js
+// server-side only — the API key is a secret, never sent to the browser
+const ASMDB = "https://api.asmdb.cloud/v1/db/inst_8f3c"; // your instance endpoint
+const KEY   = process.env.ASMDB_API_KEY;                 // from your secret store
+const H = { Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" };
+
+// CREATE / upsert a row
+await fetch(`${ASMDB}/rows`, {
+  method: "POST", headers: H,
+  body: JSON.stringify({ key: "user:42:profile", tag: "profile",
+                         content: "Ada Lovelace", value: 42, upsert: true }),
+});
+
+// READ one row
+const row = await fetch(`${ASMDB}/rows/user:42:profile`, { headers: H })
+                    .then(r => r.json());
+
+// ATOMIC multi-row write (one BEGIN…COMMIT round-trip)
+await fetch(`${ASMDB}/tx`, {
+  method: "POST", headers: H,
+  body: JSON.stringify({ ops: [
+    { op: "insert", key: "order:1001", value: 5, content: "pending", upsert: true },
+    { op: "update", key: "user:42:profile", content: "Ada L. (updated)" },
+  ]}),
+});
+```
+
+Wrap those calls behind your own routes so the browser only ever talks to your
+app (which enforces *its* user auth before touching the shared instance key):
+
+```js
+// Express BFF route: browser -> your API -> asmdb instance
+app.get("/api/profile/:uid", requireLogin, async (req, res) => {
+  const row = await fetch(`${ASMDB}/rows/user:${req.params.uid}:profile`,
+                          { headers: H }).then(r => r.json());
+  res.json(row);            // return only what the frontend needs
+});
+```
+
+**Operational notes**
+
+- **Multi-tenant apps:** run **one instance per tenant** (clean isolation and
+  metering) and have your backend select the right endpoint + key per request,
+  or a single shared instance keyed by `tenant:<id>:...` when isolation is not
+  required.
+- **Scale-to-zero cold starts:** the first request after **hibernation** wakes
+  the container (WAL-recovered in ms). Use a short **retry with backoff** on the
+  initial call so a resume is invisible to users.
+- **Reuse connections:** keep HTTP keep-alive on (a pooled `fetch`/`HttpClient`);
+  the sidecar keeps one warm engine process, so back-to-back ops are in-memory
+  hash lookups plus a small durable write.
+- **Idempotency:** `upsert: true` makes writes safe to retry; wrap related
+  writes in `/tx` so a partial failure rolls back.
+- **Pagination:** `GET /rows` is paginated (cursor/limit) — stream large lists
+  rather than materialising them in the browser.
+- **On-box equivalent:** the bundled [`clients/`](../clients) (Python · C# · C)
+  show the same verbs over local stdio; first-party **HTTP SDKs** are on the
+  [roadmap](#15-go-to-market-roadmap). Until then the REST surface above is the
+  stable contract.
+
 ---
 
 ## 8. Consumption metering & billing
@@ -268,7 +404,7 @@ engine hot path). Billable dimensions:
   durable stream (Kafka/Kinesis → warehouse); billing and quotas derive from it.
 - **Quotas & rate limits** are enforced at the gateway per API key (ops/sec,
   concurrent connections, max rows/bytes). Hitting the per-instance capacity
-  (`2^18` slots today) triggers a **resize** (engine v1.0 dynamic resize) or an
+  (`2^22` slots today) triggers a **resize** (engine v1.0 dynamic resize) or an
   upsell.
 - **Free tier** leans entirely on scale-to-zero: a hibernated instance costs
   only its (tiny) storage, so a generous free allowance is affordable.
@@ -432,7 +568,7 @@ engine's assembly**, though some ride engine roadmap items.
 - **Single-writer per instance** caps one database's write throughput to one
   engine. Mitigation: partition a hot workload across instances (engine v3.0).
   Open question: expose sharding to users or keep it internal.
-- **Fixed capacity per instance** (`2^18` slots) means we must resize or shard
+- **Fixed capacity per instance** (`2^22` slots) means we must resize or shard
   before the hash table saturates (load factor 0.75). Needs a capacity watchdog
   + engine dynamic resize (v1.0).
 - **Resume latency under load** (thundering-herd wake of many hibernated

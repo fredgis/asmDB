@@ -182,7 +182,7 @@ One `.dat` file is one database holding one logical table; its name lives in the
 
 asmdb ships with a Node [Model Context Protocol](https://modelcontextprotocol.io)
 server in [`mcp/`](mcp/) that exposes the engine to any MCP client as a
-**generic CRUD store**. It keeps one long-lived `asmdb.exe` process (the 64 MiB
+**generic CRUD store**. It keeps one long-lived `asmdb.exe` process (the 1 GiB
 region is read once) and exposes seven tools:
 
 | Tool | Arguments | Description |
@@ -216,7 +216,7 @@ Copilot) and configuration.
 
 ### The 60-second version
 
-Picture a huge coat-check with **262,144 numbered hooks**. To store a row, asmdb
+Picture a huge coat-check with **4,194,304 numbered hooks**. To store a row, asmdb
 runs the row's `id` through a scrambling function that turns it into a hook
 number, and hangs the 256-byte row there. To find it again, it runs the *same*
 function and walks straight to that hook — no scanning, no index to maintain,
@@ -262,23 +262,23 @@ trick is alignment: with `SectionAlignment == FileAlignment == 0x200`, every RVA
 equals its offset in the file, so the import table can be laid out by hand — a
 small array of thunks pointing at hint/name entries that Windows binds to
 `kernel32.dll` at load time. Code, data and imports share a single section; the
-64 MiB record store is `VirtualAlloc`'d at runtime, which is why the binary stays
+1 GiB record store is `VirtualAlloc`'d at runtime, which is why the binary stays
 ~20 KB on disk.
 
 #### The record store — four cache lines per row
 
 Each row is a fixed **256-byte record** (exactly four cache lines), and the
-records live in an open-addressing hash table of **262,144 slots** where the
+records live in an open-addressing hash table of **4,194,304 slots** where the
 record array *is* the index — there is no separate structure to keep in sync. The
 slot for a key is a Fibonacci hash: multiply by the 64-bit golden-ratio constant
 and keep the top bits.
 
 ```asm
-; store_hash(rcx = id) -> rax = slot 0 .. 262143
+; store_hash(rcx = id) -> rax = slot 0 .. 4194303
 mov  rax, rcx
 mov  rdx, 0x9E3779B97F4A7C15   ; 2^64 / golden ratio
 imul rax, rdx                  ; scramble the key across the whole table
-shr  rax, 46                   ; keep the top 18 bits (log2 of 262,144)
+shr  rax, 42                   ; keep the top 22 bits (log2 of 4,194,304)
 ```
 
 Collisions are resolved by linear probing (`slot = (slot + 1) & (CAPACITY-1)`),
@@ -345,11 +345,11 @@ offset  size  field        value / meaning
    0      8   magic        "ASMDB\0\0\0"
    8      4   version      1
   12      4   record_size  256
-  16      8   capacity     262144
+  16      8   capacity     4194304
   24      8   live_count   number of live rows (rewritten on each flush)
   32     48   table_name   ASCII, NUL-padded
   80    432   reserved     zero-filled to 512
- 512   64 MiB slot array   capacity × 256-byte records
+ 512    1 GiB slot array   capacity × 256-byte records (sparse on disk)
 ```
 
 Slot *i* lives at file offset `512 + i * 256`. A record is
@@ -393,45 +393,47 @@ honest baseline — the **same workloads on SQLite** (via Python's in-process
 `sqlite3`, i.e. the C API with no protocol overhead, which is generous to SQLite).
 
 ```powershell
-.\examples\bench.ps1                         # 100,000 rows, best of 3, + SQLite compare
-.\examples\bench.ps1 -Rows 100000 -NoCompare # asmdb only
+.\examples\bench.ps1 -Rows 2000000            # 2,000,000 rows, best of 3, + SQLite compare
+.\examples\bench.ps1 -Rows 2000000 -NoCompare # asmdb only
 ```
 
-### asmdb vs SQLite — 100,000 rows
+### asmdb vs SQLite — 2,000,000 rows
 
-Records are **256 bytes** and the store is a preallocated **64 MiB** region.
+Records are **256 bytes** and the store is a **1 GiB** hash region (`2^22` slots),
+created **sparse** on disk so unused slots cost nothing.
 
 | Workload | asmdb | SQLite 3.49.1 | ratio |
 |---|--:|--:|--:|
-| **Engine insert** — in-RAM, one transaction | **≈ 25,425,883** rows/s | 1,807,704 rows/s | **≈ 14.1× faster** |
-| **Durable bulk load** — one checkpoint + `fsync` | ≈ 1,351,351 rows/s | 1,488,082 rows/s | ≈ 0.9× (slightly slower) |
-| **Durable per-row** — one `fsync` per row | **≈ 2,067** rows/s | 276 rows/s | **≈ 7.5× faster** |
+| **Engine insert** — in-RAM, one transaction | **≈ 17,746,402** rows/s | 1,709,935 rows/s | **≈ 10.4× faster** |
+| **Durable bulk load** — one checkpoint + `fsync` | ≈ 975,134 rows/s | 1,628,000 rows/s | ≈ 0.6× (slower) |
+| **Durable per-row** — one `fsync` per row | **≈ 1,694** rows/s | 319 rows/s | **≈ 5.3× faster** |
 
 A fourth figure, not in the table because SQLite has no equivalent, is the
 **transaction throughput over the stdio protocol** — the realistic
 "over-the-wire" number a client sees, including command parsing and per-row acks:
-**≈ 23,090 rows/s** (100k rows in `BEGIN…COMMIT` batches).
+**≈ 21,690 rows/s** (2M rows in `BEGIN…COMMIT` batches).
 
 The story the numbers tell: the disk flush dominates durability. Autocommit
-`fsync`s after *every* row (~2,067/s); a transaction applies every row in RAM and
+`fsync`s after *every* row (~1,694/s); a transaction applies every row in RAM and
 `fsync`s **once** (millions/s). Wrapping inserts in `BEGIN … COMMIT` is the single
 biggest speed lever.
 
 ### Why asmdb wins — and the honest caveats
 
-asmdb is faster on **in-RAM inserts (≈ 14×)** and **per-row durability (≈ 7.5×)**
+asmdb is faster on **in-RAM inserts (≈ 10×)** and **per-row durability (≈ 5×)**
 because **it does far less**: a fixed 256-byte schema, a single table, no SQL
 parser, no query planner, no secondary indexes, no MVCC, no concurrency control.
 SQLite is a full relational engine doing all of that. So this is *not* "assembly
 beats C" — it is **a specialized key/value store beating a general-purpose SQL
 database at the narrow thing it was built for.**
 
-The **durable bulk-load row is honestly ≈ 0.9× — slightly *slower* than SQLite**.
-The reason is a real, documented trade-off: because the open-addressed hash
-scatters rows across the whole 64 MiB region, the bulk checkpoint currently
-writes the *entire* preallocated region rather than just the dirty rows. At 256
-bytes/row that is more bytes to flush than SQLite's page cache commits. The fix —
-an incremental (dirty-page) checkpoint and partitioned files — is on the
+The **durable bulk-load row is honestly ≈ 0.6× — *slower* than SQLite**, and it
+gets *more* pronounced at 2M rows than it was at 100k. The reason is a real,
+documented trade-off: because the open-addressed hash scatters rows across the
+whole 1 GiB region, the bulk checkpoint currently writes (and, on a fresh sparse
+file, first-allocates) the *entire* region rather than just the dirty rows — ~1 GiB
+flushed for 2M rows, far more bytes than SQLite's page-cache commit. The fix —
+an incremental (dirty-slot) checkpoint and partitioned files — is on the
 [roadmap](#how-a-modern-database-goes-faster), not yet implemented, so the number
 is reported as-is rather than hidden.
 

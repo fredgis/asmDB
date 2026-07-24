@@ -2,7 +2,7 @@
 //
 // asmdb is a REPL: it prints "asmdb> ", reads one command line, prints the
 // result, and repeats. We keep ONE process alive for the whole MCP session so
-// the 64 MiB record region is read from disk exactly once (at startup); every
+// the 1 GiB record region is read from disk exactly once (at startup); every
 // tool call is then an in-memory hash lookup plus a small durable write.
 //
 // Framing: every command produces exactly one "asmdb> " prompt afterwards, so

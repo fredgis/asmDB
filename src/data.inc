@@ -309,6 +309,7 @@ iat_QueryPerformanceCounter:   dq RVA(h_QueryPerformanceCounter)
 iat_QueryPerformanceFrequency: dq RVA(h_QueryPerformanceFrequency)
 iat_GetSystemTimeAsFileTime:   dq RVA(h_GetSystemTimeAsFileTime)
 iat_GetLastError:      dq RVA(h_GetLastError)
+iat_DeviceIoControl:   dq RVA(h_DeviceIoControl)
                        dq 0
 
 dll_name: db 'kernel32.dll', 0
@@ -373,3 +374,6 @@ h_GetSystemTimeAsFileTime: dw 0
                 align 2
 h_GetLastError:      dw 0
     db 'GetLastError', 0
+                align 2
+h_DeviceIoControl:   dw 0
+    db 'DeviceIoControl', 0

@@ -9,17 +9,30 @@ by the WAL-durable x86-64 assembly engine.
 use `tag` as a namespace and `content` as the remembered text) — but the tools
 are a general-purpose database interface, not memory-specific.
 
-```
-┌──────────────┐   MCP (stdio)   ┌───────────────┐   stdin/stdout   ┌────────────┐
-│  MCP client  │ ───────────────▶│ asmdb-mcp     │ ────────────────▶│ asmdb.exe  │
-│ (agent, IDE) │◀─────────────── │ (Node server) │◀──────────────── │  (engine)  │
-└──────────────┘   tool calls    └───────────────┘   commands       └────────────┘
-                                                                       asmdb.dat
-                                                                       asmdb.wal
+```mermaid
+flowchart LR
+    CLIENT["MCP client<br/>(agent, IDE)"]
+    SERVER["asmdb-mcp<br/>(Node server)"]
+    ENGINE["asmdb.exe<br/>(engine)"]
+    FILES[("asmdb.dat<br/>asmdb.wal")]
+    CLIENT -->|"MCP (stdio) · tool calls"| SERVER
+    SERVER -->|"stdin/stdout · commands"| ENGINE
+    ENGINE --> FILES
+    SERVER -.->|responses| CLIENT
+    ENGINE -.->|rows| SERVER
+
+    classDef client fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef server fill:#6e4aa0,stroke:#3b1e75,color:#fff
+    classDef engine fill:#1a7f37,stroke:#0b4a20,color:#fff
+    classDef store fill:#9a6700,stroke:#5a3d00,color:#fff
+    class CLIENT client
+    class SERVER server
+    class ENGINE engine
+    class FILES store
 ```
 
 The server keeps **one long-lived `asmdb.exe` process** for the whole session,
-so the 64 MiB record region is read from disk once at startup; every tool call
+so the 1 GiB record region is read from disk once at startup; every tool call
 is then an in-memory hash lookup plus a small durable write. When the MCP client
 disconnects, the server shuts the engine down cleanly (no orphaned process).
 

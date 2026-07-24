@@ -31,8 +31,11 @@
 %define KIND_GENERIC 0
 
 ; ---- Hash table (v1: fixed power-of-two capacity) ----
-%define CAPACITY   262144
-%define CAP_SHIFT  46        ; 64 - log2(CAPACITY) = 64 - 18
+; CAPACITY = 2^22 slots x 256 B = a 1 GiB record region, sized so the table can
+; hold millions of rows below the 0.75 load-factor cap (BENCH tops out at 3.1M).
+; The .dat file is created sparse (see db_open), so an empty DB costs ~0 on disk.
+%define CAPACITY   4194304
+%define CAP_SHIFT  42        ; 64 - log2(CAPACITY) = 64 - 22
 %define GOLDEN     0x9E3779B97F4A7C15
 
 ; ---- Buffers ----
@@ -64,6 +67,7 @@
 %define CREATE_ALWAYS      2
 %define FILE_ATTRIBUTE_NORMAL 0x80
 %define FILE_BEGIN         0
+%define FSCTL_SET_SPARSE   0x000900C4
 %define ENABLE_VT          0x0004    ; ENABLE_VIRTUAL_TERMINAL_PROCESSING
 %define INVALID_HANDLE     -1
 %define ERROR_SHARING_VIOLATION 32

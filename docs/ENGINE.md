@@ -81,7 +81,7 @@ nasm -f bin -i src\ src\main.asm -o build\asmdb.exe
 - Build/run helpers live in `build.ps1` (`-Run` launches the REPL).
 
 The resulting binary is a **single self-contained ~20 KB PE64** with no external
-dependency besides `kernel32.dll`. The 64 MiB record region is **not** in the
+dependency besides `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the
 exe — it is obtained from `VirtualAlloc` at startup.
 
 ### kernel32 imports
@@ -94,7 +94,8 @@ GetStdHandle   ReadFile        WriteFile       CreateFileA
 SetFilePointerEx  FlushFileBuffers  SetEndOfFile  CloseHandle
 VirtualAlloc   ExitProcess     GetSystemTimeAsFileTime
 QueryPerformanceCounter  QueryPerformanceFrequency
-GetConsoleMode  SetConsoleMode  FindFirstFileA  FindClose
+GetConsoleMode  SetConsoleMode  FindFirstFileA  FindNextFileA  FindClose
+GetCommandLineA  GetLastError  DeviceIoControl
 ```
 
 `GetSystemTimeAsFileTime` powers automatic timestamps (§8);
@@ -154,8 +155,9 @@ The `SCHEMA` command prints this exact table at runtime.
 
 ## 5. Hash table — the store *is* the index
 
-- The store is a single array of **`CAPACITY = 262144`** slots (`2^18`),
-  `256 B` each → a **64 MiB** contiguous region from `VirtualAlloc`.
+- The store is a single array of **`CAPACITY = 4194304`** slots (`2^22`),
+  `256 B` each → a **1 GiB** contiguous region from `VirtualAlloc`. The backing
+  `.dat` file is created **sparse** (see §6.1), so unused slots cost no disk.
 - **Hash function** (Fibonacci / multiplicative):
 
   ```
@@ -195,6 +197,14 @@ of the live hash table, so load = `ReadFile` into the `VirtualAlloc` region and
 persist = `WriteFile` of the touched slots plus the header. `count` is refreshed
 in the header on every durable write. The logical table name is resolved from
 (in priority order) a CLI argument, the header, or the DB base name.
+
+A brand-new `.dat` is created **sparse**: `db_open` issues `DeviceIoControl`
+with `FSCTL_SET_SPARSE`, then `SetEndOfFile` extends the file to the full
+`HDR_SIZE + CAPACITY*256` logical size **without allocating or zeroing 1 GiB**.
+Unwritten slots read back as zero and cost nothing on disk, so an empty database
+occupies a few kilobytes while still presenting the whole slot region to
+`ReadFile`. Individual `WriteFile`s (autocommit, `COMMIT`, `BENCH` checkpoint)
+lazily materialise only the slots they touch.
 
 ### 6.2 `<db>.wal` — write-ahead log
 
@@ -360,11 +370,20 @@ The `mcp/` package is a Node [Model Context Protocol](https://modelcontextprotoc
 server that exposes asmdb to any MCP client as a **generic CRUD store**. See
 [`mcp/README.md`](../mcp/README.md) for setup and client registration.
 
-```
-MCP client (agent / IDE) ──MCP stdio──▶ asmdb-mcp (Node) ──stdin/stdout──▶ asmdb.exe
+```mermaid
+flowchart LR
+    CLIENT["MCP client<br/>(agent / IDE)"] -->|MCP stdio| SERVER["asmdb-mcp<br/>(Node)"]
+    SERVER -->|stdin/stdout| ENGINE["asmdb.exe<br/>(engine)"]
+
+    classDef client fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef server fill:#6e4aa0,stroke:#3b1e75,color:#fff
+    classDef engine fill:#1a7f37,stroke:#0b4a20,color:#fff
+    class CLIENT client
+    class SERVER server
+    class ENGINE engine
 ```
 
-- The server keeps **one long-lived `asmdb.exe` process**, so the 64 MiB region
+- The server keeps **one long-lived `asmdb.exe` process**, so the 1 GiB region
   is read once at startup and every tool call is an in-memory hash lookup plus a
   durable write. On client disconnect it shuts the engine down cleanly (no
   orphaned process).
@@ -429,6 +448,7 @@ recall. This is one workload the record shape suits — not the only one.
 | 14 | `RANGE` value access path; `id ≥ 1` CHECK constraint | ✅ done |
 | 15 | `BACKUP`/`RESTORE` snapshot commands | ✅ done |
 | 16 | Exclusive single-writer lock (concurrent open refused) | ✅ done |
+| 17 | 1 GiB capacity (`2^22` slots) on **sparse** `.dat`; 2M-row benchmark vs SQLite | ✅ done |
 
 Everything below is **future work** — listed to set direction honestly, not to
 imply it exists. The current engine is a single-table row store with one hash
@@ -441,7 +461,7 @@ The theme is "never lie about durability, never corrupt on crash."
 | Item | What it adds | CRUD path helped |
 |------|--------------|------------------|
 | **CRC32 on WAL frames** | detect torn/garbled logs on recovery (SSE4.2 `crc32` instruction) | durable C/U/D |
-| **Incremental checkpoint** | a dirty-slot bitmap so `COMMIT` flushes only touched pages, not the whole 64 MiB region — the fix for the bulk-durable benchmark | durable bulk write |
+| **Incremental checkpoint** | a dirty-slot bitmap so `COMMIT` flushes only touched pages, not the whole 1 GiB region — the fix for the bulk-durable benchmark | durable bulk write |
 | **Group commit** | coalesce concurrent `COMMIT`s into one `fsync` | high-rate durable writes |
 | **Dynamic resize / rehash** | grow the table past load factor 0.75 instead of erroring; power-of-two doubling + incremental re-probe | all CRUD at scale |
 | **Short-write / error propagation** | check every `WriteFile`/`ReadFile` return, surface `[ERR] io` instead of silently continuing | all persistence |
@@ -485,7 +505,7 @@ The theme is "more cores, more machines, more OSes — still assembly."
 
 > **Honest benchmark note.** Durable *bulk* insert currently checkpoints by
 > writing the entire preallocated region because open-addressed hashing scatters
-> rows across the 64 MiB area. This is why the bulk-durable number trails SQLite
+> rows across the 1 GiB area. This is why the bulk-durable number trails SQLite
 > slightly in the README table — the **incremental checkpoint** (v1.0) and
 > **partitioning** (v3.0) items above are the fix, and are not yet implemented.
 
@@ -535,5 +555,5 @@ src/
   data.inc      ; strings, globals, buffers, kernel32 import table
 ```
 
-The store itself is **not** in the exe — it is the 64 MiB `VirtualAlloc` region
+The store itself is **not** in the exe — it is the 1 GiB `VirtualAlloc` region
 loaded from `<db>.dat` at startup.

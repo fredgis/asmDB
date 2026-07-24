@@ -333,6 +333,18 @@ db_open:
     call read_at
     jmp  .done
 .newfile:
+    ; brand-new file: mark it sparse so unwritten slots cost no disk, then set
+    ; the logical size to the full region without allocating/zeroing 1 GiB.
+    mov  rcx, [rel g_dat_handle]
+    mov  edx, FSCTL_SET_SPARSE
+    xor  r8, r8                      ; lpInBuffer = NULL
+    xor  r9, r9                      ; nInBufferSize = 0
+    mov  qword [rsp+0x20], 0         ; lpOutBuffer = NULL
+    mov  qword [rsp+0x28], 0         ; nOutBufferSize = 0
+    lea  rax, [rel g_io_dw]
+    mov  [rsp+0x30], rax             ; lpBytesReturned
+    mov  qword [rsp+0x38], 0         ; lpOverlapped = NULL
+    call [rel iat_DeviceIoControl]
     mov  qword [rel g_count], 0
     cmp  dword [rel g_have_argtable], 0
     jne  .nf_arg
@@ -345,10 +357,14 @@ db_open:
     mov  rcx, TABLE_MAX
     call strcpy_n
     call db_write_header
-    mov  rcx, HDR_SIZE
-    mov  rdx, [rel g_table]
-    mov  r8, CAPACITY*REC_SIZE
-    call write_at
+    ; extend the (sparse) file to header + full slot region; holes read as zero
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    xor  r8, r8
+    mov  r9d, FILE_BEGIN
+    call [rel iat_SetFilePointerEx]
+    mov  rcx, [rel g_dat_handle]
+    call [rel iat_SetEndOfFile]
     call db_flush
 .done:
     mov  rsp, rbp
