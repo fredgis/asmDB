@@ -81,47 +81,74 @@ def rounded_mask(size, box, radius):
     return m
 
 
-def db_glyph(draw, cx, cy, w, h, color, ring=None):
-    """A clean stacked-disk database cylinder centered at (cx, cy)."""
-    rx = w / 2
-    ry = w / 6.2
-    top = cy - h / 2
-    bot = cy + h / 2
-    # body
-    draw.rectangle([cx - rx, top, cx + rx, bot], fill=color)
-    draw.ellipse([cx - rx, bot - ry, cx + rx, bot + ry], fill=color)
-    # disk seams
-    seam = ring or (255, 255, 255)
-    for frac in (0.0, 0.5):
-        yy = top + h * frac
-        draw.ellipse([cx - rx, yy - ry, cx + rx, yy + ry], fill=color,
-                     outline=seam, width=px(3))
-    # top cap
-    draw.ellipse([cx - rx, top - ry, cx + rx, top + ry], fill=color,
-                 outline=seam, width=px(3))
+def db_glyph(draw, cx, cy, w, h, base=(255, 255, 255)):
+    """A segmented 'data-stack' database: three stacked disks with gaps between
+    them (evoking memory rows / registers). Drawn top-down; gaps reveal the
+    tile gradient so the stack reads as separated blocks of storage."""
+    rx = w / 2.0
+    ry = w / 5.2
+    n = 3
+    gap = h * 0.10
+    seg_h = (h - gap * (n - 1)) / n
+    top0 = cy - h / 2.0
+    side = tuple(int(c * 0.82) for c in base)          # shaded cylinder side
+    for i in range(n):
+        st = top0 + i * (seg_h + gap) + ry             # top-ellipse center
+        sb = st + seg_h                                # bottom-ellipse center
+        draw.rectangle([cx - rx, st, cx + rx, sb], fill=side)
+        draw.ellipse([cx - rx, sb - ry, cx + rx, sb + ry], fill=side)
+        draw.ellipse([cx - rx, st - ry, cx + rx, st + ry], fill=base)
+        # accent groove on each disk face
+        draw.ellipse([cx - rx, st - ry, cx + rx, st + ry], outline=ACC_A,
+                     width=max(1, px(2)))
+
+
+def brackets(size, cx, cy, w, h, color):
+    """Two bold '[ ]' memory-operand brackets framing the glyph, on their own
+    layer for correct translucency."""
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    bd = ImageDraw.Draw(layer)
+    t = px(13)
+    bx = w * 0.86
+    by = h * 0.62
+    cap = w * 0.20
+    lx = cx - bx
+    rx2 = cx + bx
+    bd.line([(lx + cap, cy - by), (lx, cy - by), (lx, cy + by), (lx + cap, cy + by)],
+            fill=color, width=int(t), joint="curve")
+    bd.line([(rx2 - cap, cy - by), (rx2, cy - by), (rx2, cy + by), (rx2 - cap, cy + by)],
+            fill=color, width=int(t), joint="curve")
+    return layer
 
 
 def tile(side, radius):
-    """The square gradient app-tile with the DB glyph + a >_ accent."""
+    """The square gradient app-tile: a segmented data-stack framed by [ ]."""
     canvas = px(side)
     g = vgrad(canvas, canvas, ACC_A, ACC_B)
     # diagonal sheen
     sheen = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
     ImageDraw.Draw(sheen).polygon(
-        [(0, 0), (canvas * 0.6, 0), (0, canvas * 0.6)], fill=(255, 255, 255, 26))
+        [(0, 0), (canvas * 0.62, 0), (0, canvas * 0.62)], fill=(255, 255, 255, 28))
     g = Image.alpha_composite(g.convert("RGBA"), sheen)
     mask = rounded_mask((canvas, canvas), [0, 0, canvas - 1, canvas - 1], px(radius))
+
+    inner = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+    gcx, gcy = canvas * 0.5, canvas * 0.5
+    gw, gh = canvas * 0.40, canvas * 0.52
+    # soft white glow behind the stack
+    inner.alpha_composite(
+        glow((canvas, canvas), (int(gcx), int(gcy - canvas * 0.06)),
+             int(canvas * 0.22), (255, 255, 255), 70))
+    db_glyph(ImageDraw.Draw(inner), gcx, gcy, gw, gh, base=(255, 255, 255))
+    inner.alpha_composite(brackets((canvas, canvas), gcx, gcy, gw, gh,
+                                   (233, 241, 255, 235)))
+
     tile_img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
     tile_img.paste(g, (0, 0), mask)
-    d = ImageDraw.Draw(tile_img)
-    db_glyph(d, canvas * 0.5, canvas * 0.43, canvas * 0.46, canvas * 0.46,
-             (255, 255, 255), ring=(228, 238, 255))
-    # prompt accent
-    pf = font("consolab.ttf", side * 0.16)
-    txt = ">_"
-    tw = d.textlength(txt, font=pf)
-    d.text((canvas * 0.5 - tw / 2, canvas * 0.7), txt, font=pf,
-           fill=(255, 255, 255))
+    # clip the glyph layer to the rounded tile, then composite
+    clipped = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+    clipped.paste(inner, (0, 0), mask)
+    tile_img.alpha_composite(clipped)
     return tile_img, mask
 
 
@@ -163,7 +190,7 @@ def make_hero():
 
     # tag chips (drawn on their own layer for correct translucency)
     cf = font("consola.ttf", 21)
-    chips = ["nasm -f bin", "no linker", "no CRT", "WAL", "~10 KB"]
+    chips = ["nasm -f bin", "no linker", "no CRT", "WAL", "~14 KB"]
     chip_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     cd = ImageDraw.Draw(chip_layer)
     cx = px(356)

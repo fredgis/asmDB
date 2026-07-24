@@ -18,8 +18,8 @@
 %define ST_DELETED  2
 
 ; ---- Hash table (v1: fixed power-of-two capacity) ----
-%define CAPACITY   4096
-%define CAP_SHIFT  52        ; 64 - log2(CAPACITY) = 64 - 12
+%define CAPACITY   65536
+%define CAP_SHIFT  48        ; 64 - log2(CAPACITY) = 64 - 16
 %define GOLDEN     0x9E3779B97F4A7C15
 
 ; ---- Buffers ----
