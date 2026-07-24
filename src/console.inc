@@ -495,6 +495,22 @@ console_fill:
     jz   .eof
     mov  [rel g_readlen], rax
     mov  qword [rel g_readpos], 0
+    ; One-time: skip a leading UTF-8 BOM (EF BB BF) at the very start of the
+    ; stream. Some shells (e.g. PowerShell piping to a native command) prepend
+    ; one, which would otherwise turn the first command into an unknown token.
+    cmp  qword [rel g_bom_seen], 0
+    jne  .done
+    mov  qword [rel g_bom_seen], 1
+    cmp  rax, 3
+    jb   .done
+    mov  rcx, [rel g_readbuf]
+    cmp  byte [rcx], 0xEF
+    jne  .done
+    cmp  byte [rcx+1], 0xBB
+    jne  .done
+    cmp  byte [rcx+2], 0xBF
+    jne  .done
+    mov  qword [rel g_readpos], 3
     jmp  .done
 .eof:
     mov  qword [rel g_readlen], 0
@@ -516,11 +532,10 @@ console_getc:
     call console_fill
     test rax, rax
     jz   .eof
-    xor  rax, rax                    ; pos = 0 after fill
 .have:
-    mov  rcx, [rel g_readbuf]
-    movzx eax, byte [rcx+rax]
     mov  rdx, [rel g_readpos]
+    mov  rcx, [rel g_readbuf]
+    movzx eax, byte [rcx+rdx]
     inc  rdx
     mov  [rel g_readpos], rdx
     jmp  .done

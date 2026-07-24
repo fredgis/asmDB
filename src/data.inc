@@ -9,6 +9,7 @@ g_stdin:       dq 0
 g_readbuf:     dq 0
 g_readlen:     dq 0
 g_readpos:     dq 0
+g_bom_seen:    dq 0
 g_linebuf:     dq 0
 g_table:       dq 0
 g_count:       dq 0
