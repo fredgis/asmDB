@@ -1,8 +1,10 @@
 # asmdb — Engine Specification
 
 > The precise technical reference for **asmdb**: a minimalist, transactional
-> database written in **x86-64 assembly** (NASM, `-f bin`), with **no linker**,
-> **no C runtime**, raw **Win32** calls, WAL-durable transactions, an ASCII-art
+> database written in **x86-64 assembly** (NASM, `-f bin`), with **no linker**
+> and **no C runtime**. One engine source builds two native binaries — a
+> **Windows PE64** (raw Win32) and a **Linux ELF64** (raw `syscall`s) — behind a
+> thin `os_*` platform layer. It provides WAL-durable transactions, an ASCII-art
 > REPL, and a **Model Context Protocol** server that exposes it as a generic
 > CRUD store (durable **memory for AI agents** being one example use case).
 >
@@ -15,7 +17,7 @@
 ## Table of contents
 
 1. [Design goals & constraints](#1-design-goals--constraints)
-2. [Build toolchain & PE64 layout](#2-build-toolchain--pe64-layout)
+2. [Build toolchain & executable layout (PE64 + ELF64)](#2-build-toolchain--executable-layout-pe64--elf64)
 3. [Calling convention & register discipline](#3-calling-convention--register-discipline)
 4. [Record layout (256-byte record)](#4-record-layout-256-byte-record)
 5. [Hash table — the store *is* the index](#5-hash-table--the-store-is-the-index)
@@ -36,8 +38,9 @@
 |------|----------|
 | Architecture | x86-64 (AMD64) |
 | Assembler | **NASM**, Intel syntax |
-| Linking | **None** — `nasm -f bin` emits the PE64 directly |
-| Runtime | **No CRT** — raw **Win32** (`kernel32.dll`) only |
+| Linking | **None** — `nasm -f bin` emits the PE64 / ELF64 directly |
+| Runtime | **No CRT** — raw **Win32** (`kernel32.dll`) on Windows, raw **syscalls** on Linux |
+| Portability | One source; a thin **`os_*`** layer is the only per-OS code (§2.4) |
 | Data model | **Fixed-size** records, 256 B (four cache lines) |
 | Index | **Open-addressing** hash table (the store IS the index) |
 | Transactions | **WAL** (write-ahead log) → atomicity, durability, recovery |
@@ -64,27 +67,33 @@ implemented** and is labelled as such throughout.
 
 ---
 
-## 2. Build toolchain & PE64 layout
+## 2. Build toolchain & executable layout (PE64 + ELF64)
 
 ```
-nasm -f bin -i src\ src\main.asm -o build\asmdb.exe
+nasm -f bin -i src\ src\main.asm       -o build\asmdb.exe   ; Windows PE64
+nasm -f bin -dLINUX src\main.asm       -o build\asmdb       ; Linux   ELF64
 ```
 
-- **`-f bin`** emits a flat binary. asmdb hand-writes the entire PE image: the
-  DOS stub, `IMAGE_FILE_HEADER`, `IMAGE_OPTIONAL_HEADER64`, the section table,
-  and the import table. There is no linker and no import library.
+`-f bin` emits a **flat binary**; asmdb hand-writes the *entire* executable
+image for each OS — there is no linker and no import library on either platform.
+A compile-time switch (`-dLINUX`) selects the platform header (`elf.inc`) and
+backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
+`os_win.inc`. The ~2,000 lines of engine logic are compiled verbatim for both.
+
+### 2.1 Windows PE64
+
+- asmdb hand-writes the DOS stub, `IMAGE_FILE_HEADER`, `IMAGE_OPTIONAL_HEADER64`,
+  the section table, and the import table.
 - **RVA == file offset.** `SectionAlignment == FileAlignment == 0x200` (see
-  `ALIGN` in `asmdb.inc`), so a symbol's virtual address equals its file
-  offset. This is what makes a hand-written import table tractable — every
-  thunk references its target by RVA, which is just its offset.
+  `ALIGN` in `asmdb.inc`), so a symbol's virtual address equals its file offset.
+  This is what makes a hand-written import table tractable — every thunk
+  references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- Build/run helpers live in `build.ps1` (`-Run` launches the REPL).
+- The result is a single self-contained **~21 KB PE64** whose only dependency is
+  `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the exe —
+  it is obtained from `VirtualAlloc` at startup.
 
-The resulting binary is a **single self-contained ~20 KB PE64** with no external
-dependency besides `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the
-exe — it is obtained from `VirtualAlloc` at startup.
-
-### kernel32 imports
+#### kernel32 imports
 
 The centralized import table in `data.inc` binds these functions (all called
 via `[rel iat_*]` thunks):
@@ -103,6 +112,86 @@ GetCommandLineA  GetLastError  DeviceIoControl
 enumerates `*.dat` for the `DATABASES` command; `GetConsoleMode/SetConsoleMode`
 enable ANSI colour when stdout is a real console.
 
+### 2.2 Linux ELF64
+
+The ELF binary is just as hand-built — there is **no libc, no dynamic loader, no
+imports at all**. `elf.inc` emits a 64-byte ELF header followed by a single
+program header describing one `PT_LOAD` segment that is mapped **RWX** at
+`0x400000`:
+
+```asm
+; elf.inc — hand-written ELF64 header (excerpt); ORG 0x400000
+ehdr:
+    db  0x7F, 'E', 'L', 'F'          ; EI_MAG
+    db  2, 1, 1, 0                   ; ELFCLASS64, LSB, EV_CURRENT, System V
+    dq  0                            ; EI_ABIVERSION + 7 pad
+    dw  2                            ; e_type      = ET_EXEC
+    dw  0x3E                         ; e_machine   = x86-64
+    dd  1                            ; e_version
+    dq  entry                        ; e_entry     (absolute vaddr)
+    dq  phdr - ehdr                  ; e_phoff
+    ...
+phdr:
+    dd  1                            ; p_type   = PT_LOAD
+    dd  7                            ; p_flags  = R | W | X
+    dq  0                            ; p_offset (map from start of file)
+    dq  ehdr                         ; p_vaddr  (= 0x400000)
+    dq  ehdr                         ; p_paddr
+    dq  sec_end - ehdr               ; p_filesz (whole image)
+    dq  sec_end - ehdr               ; p_memsz  (no BSS: memsz == filesz)
+    dq  0x1000                       ; p_align  (page)
+```
+
+Because `p_filesz == p_memsz`, every buffer is **file-initialised** (there is no
+separate `.bss`), which keeps the loader trivial and the ELF fully static. The
+1 GiB record region comes from an `mmap` syscall at startup. `tests/validate_elf.py`
+asserts these invariants in CI, and the smoke suite runs the ELF **natively on
+Ubuntu**.
+
+### 2.3 The `os_*` platform layer
+
+Everything above the OS — the REPL, parser, hash store, transactions and WAL — is
+platform-agnostic and compiled identically for both targets. All OS divergence is
+funnelled through a small set of `os_*` primitives, implemented once in
+`os_win.inc` and once in `os_linux.inc`:
+
+```
+os_init_std      open stdin/stdout, detect a TTY (colour gate)
+os_open          open/create a file            (CreateFileA  / openat)
+os_read/os_write sequential console + file I/O (ReadFile     / read,  WriteFile / write)
+os_pread/os_pwrite  positioned slot I/O        (SetFilePointerEx+ReadFile / pread64, pwrite64)
+os_alloc         reserve the 1 GiB region      (VirtualAlloc / mmap)
+os_flush         force durability              (FlushFileBuffers / fsync)
+os_truncate      shrink a file (WAL checkpoint)(SetEndOfFile / ftruncate)
+os_now_ms        wall-clock epoch ms           (GetSystemTimeAsFileTime / clock_gettime)
+os_exit          terminate                     (ExitProcess / exit_group)
+```
+
+Both backends present the **same contract**: arguments in the Win64 order
+(`rcx, rdx, r8, r9`), result in `rax`, and callee-saved `rbx/rsi/rdi/r12`
+preserved. The Linux backend translates that contract into the SysV syscall ABI
+(`rdi, rsi, rdx, r10, r8, r9`, number in `rax`, `syscall`) inside each wrapper, so
+callers never see the difference.
+
+### 2.4 Windows ↔ Linux syscall mapping
+
+| `os_*` primitive | Windows (`kernel32`) | Linux (syscall #) |
+|---|---|---|
+| `os_open` | `CreateFileA` | `open` (2) |
+| `os_read` | `ReadFile` | `read` (0) |
+| `os_write` | `WriteFile` | `write` (1) |
+| `os_pread` | `SetFilePointerEx` + `ReadFile` | `pread64` (17) |
+| `os_pwrite` | `SetFilePointerEx` + `WriteFile` | `pwrite64` (18) |
+| `os_alloc` | `VirtualAlloc` | `mmap` (9) |
+| `os_flush` | `FlushFileBuffers` | `fsync` (74) |
+| `os_truncate` | `SetEndOfFile` | `ftruncate` (77) |
+| `os_now_ms` | `GetSystemTimeAsFileTime` | `clock_gettime` (228) |
+| `os_isatty` | `GetConsoleMode` | `ioctl(TCGETS)` (16) |
+| `os_exit` | `ExitProcess` | `exit_group` (231) |
+
+Build/run helpers live in `build.ps1` (`-Run` launches the REPL; `-Linux`
+cross-emits the ELF) and `build.sh` (native Linux build).
+
 ---
 
 ## 3. Calling convention & register discipline
@@ -112,14 +201,31 @@ enable ANSI colour when stdout is a real console.
   16-byte stack alignment at the call site. Every function establishes a
   `push rbp / mov rbp, rsp / sub rsp, N` frame that reserves shadow space for
   its callees.
+- **The `os_*` layer keeps this contract on both platforms.** Callers always pass
+  `rcx, rdx, r8, r9` → `rax`, even on Linux; the Linux wrapper shuffles those into
+  the SysV syscall registers (`rdi, rsi, rdx, r10, r8, r9`, number in `rax`) and
+  preserves the Win64 callee-saved set the engine relies on:
+
+  ```asm
+  ; os_linux.inc — os_write(rcx=fd, rdx=buf, r8=len) -> rax=bytes written
+  os_write:
+      mov  rax, SYS_write            ; 1
+      mov  rdi, rcx                  ; fd   (Win64 rcx -> SysV rdi)
+      mov  rsi, rdx                  ; buf  (Win64 rdx -> SysV rsi)
+      mov  rdx, r8                   ; len  (Win64 r8  -> SysV rdx)
+      syscall                        ; result already in rax
+      ret
+  ```
+
 - **Internal helpers** follow a lightweight private convention: arguments in
   `rcx, rdx, r8, r9` (documented per function), result in `rax`. During command
   dispatch and handlers, **`rsi` is the line cursor** — it walks the input line
   and is preserved across tokenizer calls.
 - Callee-saved registers (`rbx, rsi, rdi, r12-r15`) are spilled to the local
-  frame when a helper needs them, and restored on exit.
-- `now_ms` and other Win32-calling helpers bump their frame to include the
-  32-byte shadow area before the call.
+  frame when a helper needs them, and restored on exit — on **both** platforms,
+  because the engine assumes the Win64 saved-register set everywhere.
+- `os_now_ms` and other OS-calling helpers bump their frame to include the
+  32-byte shadow area before a Windows call.
 
 ---
 
@@ -156,19 +262,55 @@ The `SCHEMA` command prints this exact table at runtime.
 ## 5. Hash table — the store *is* the index
 
 - The store is a single array of **`CAPACITY = 4194304`** slots (`2^22`),
-  `256 B` each → a **1 GiB** contiguous region from `VirtualAlloc`. The backing
-  `.dat` file is created **sparse** (see §6.1), so unused slots cost no disk.
-- **Hash function** (Fibonacci / multiplicative):
+  `256 B` each → a **1 GiB** contiguous region from `VirtualAlloc` / `mmap`. The
+  backing `.dat` file is created **sparse** (see §6.1), so unused slots cost no
+  disk.
 
-  ```
-  h = (id * 0x9E3779B97F4A7C15) >> CAP_SHIFT        ; CAP_SHIFT = 64 - 18 = 46
+- **Hash function — Fibonacci (multiplicative) hashing.** Multiply the key by the
+  64-bit golden-ratio constant `⌊2^64 / φ⌋` and keep the **top** `log2(CAPACITY)`
+  bits. The top bits mix in the most entropy from the multiply, so even dense,
+  sequential ids scatter uniformly across the table with a single `imul`:
+
+  ```asm
+  ; src/store.inc — store_hash(rcx = id) -> rax = slot in [0, CAPACITY)
+  store_hash:
+      mov  rax, rcx
+      mov  rdx, GOLDEN          ; 0x9E3779B97F4A7C15  = floor(2^64 / phi)
+      imul rax, rdx             ; low 64 bits of id * golden ratio
+      shr  rax, CAP_SHIFT       ; CAP_SHIFT = 64 - log2(CAPACITY) = 64 - 22 = 42
+      ret                       ; -> keep the top 22 bits
   ```
 
-  A single `imul` gives a well-spread bucket in `[0, CAPACITY)`.
-- **Collision resolution:** linear probing, `(h + i) mod CAPACITY`, which is
-  cache-optimal because probes walk contiguous slots.
+- **Collision resolution — linear probing.** Walk contiguous slots
+  `(h + i) mod CAPACITY` until the key, an empty slot, or a reusable tombstone is
+  found. Contiguous probing is cache-optimal (each step is the next cache line),
+  and the first tombstone seen is remembered as the insertion point so space is
+  reclaimed. `CAPACITY` is a power of two, so the modulo is a single `AND`:
+
+  ```asm
+  ; src/store.inc — store_locate probe loop (simplified)
+  .probe:
+      mov  rax, rsi
+      shl  rax, REC_SHIFT       ; slot index * 256  (REC_SHIFT = 8)
+      add  rax, rdi             ; rax = &table[slot]
+      mov  cl, [rax+REC_STATUS]
+      cmp  cl, ST_EMPTY         ; 0 -> key absent, insert here
+      je   .empty
+      cmp  cl, ST_DELETED       ; 2 -> tombstone, remember as candidate
+      je   .deleted
+      mov  rdx, [rax+REC_ID]    ; 1 -> occupied, compare the key
+      cmp  rdx, rbx
+      je   .found
+  .cont:
+      inc  rsi
+      and  rsi, CAPACITY-1      ; wrap: power-of-two modulo is one AND
+      inc  r8
+      cmp  r8, CAPACITY
+      jb   .probe               ; bounded: never loops forever
+  ```
+
 - **Deletion:** tombstone (`status = 2`) so probe chains stay intact; a later
-  INSERT may reuse a tombstoned slot.
+  INSERT may reuse a tombstoned slot (the `.deleted` branch above).
 - **Load factor** is intended to stay `< 0.75`; INSERT into a full table returns
   an explicit error (resizing is [future work](#12-roadmap)).
 - `SELECT <id>`, `UPDATE`, `DELETE` are all O(1) average (hash + short probe).
@@ -260,6 +402,28 @@ If the process dies before step 3 completes, the WAL has no valid marker and the
 transaction never happened. If it dies between steps 3 and 5, the marked WAL is
 replayed on next startup.
 
+The *order* of the two flushes is the entire correctness argument — the marker is
+written and flushed **only after** the data is already durable in the log:
+
+```asm
+; src/wal.inc — cmd_commit two-phase flush (order is the invariant)
+    call wal_write            ; 1. header + N after-images -> <db>.wal
+    call wal_flush            ; 2. fsync: data is now safe in the log
+    mov  rax, [rel wal_commit]
+    mov  [rsi], rax           ; 3. append the 'COMMIT01' marker ...
+    ...
+    call wal_write
+    call wal_flush            ;    ... and fsync AGAIN -> transaction committed
+    ; --- past this line the commit survives any crash ---
+.apply:                       ; 4. redo after-images into <db>.dat
+    ...
+    call write_at
+    ...
+    call db_write_header
+    call db_flush
+    call wal_truncate         ; 5. checkpoint: empty the WAL
+```
+
 ### 7.3 Crash recovery
 
 `wal_recover` runs in `db_open`, after both files are open and *before* the
@@ -288,14 +452,17 @@ disk.
 ## 8. Timestamps
 
 `created` and `updated` are set automatically by the engine, never by the
-caller. `now_ms` computes unix epoch milliseconds:
+caller. `os_now_ms` returns unix epoch milliseconds, computed differently per
+platform but presented identically:
 
 ```
-GetSystemTimeAsFileTime(&ft)            ; 100-ns ticks since 1601-01-01
-ms = ft / 10000 - 11644473600000        ; → unix epoch ms
+Windows:  GetSystemTimeAsFileTime(&ft)        ; 100-ns ticks since 1601-01-01
+          ms = ft / 10000 - 11644473600000    ; -> unix epoch ms
+Linux:    clock_gettime(CLOCK_REALTIME, &ts)  ; {tv_sec, tv_nsec} since 1970
+          ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000
 ```
 
-`INSERT` sets both `created` and `updated` to `now_ms()`; `UPDATE` sets
+`INSERT` sets both `created` and `updated` to `os_now_ms()`; `UPDATE` sets
 `updated` only and preserves `created`. The detail view (`SELECT <id>`) prints
 both as raw millisecond integers.
 
@@ -314,6 +481,7 @@ allowed).
 | `SELECT *` | Read all → 4-column ASCII table (`id \| tag \| value \| content`) |
 | `UPDATE <id> <value> <tag> <content...>` | **U**pdate a record (bumps `updated`) |
 | `DELETE <id>` | **D**elete a record (tombstone) |
+| `TRUNCATE` | Remove **every** row (transaction-aware; tombstones + one header write) |
 | `FIND <substr>` | Case-insensitive substring scan over `tag` + `content` |
 | `RANGE <lo> <hi>` | List rows whose `value` is within `[lo, hi]` (inclusive) |
 | `COUNT` | Number of live records |
@@ -449,6 +617,7 @@ recall. This is one workload the record shape suits — not the only one.
 | 15 | `BACKUP`/`RESTORE` snapshot commands | ✅ done |
 | 16 | Exclusive single-writer lock (concurrent open refused) | ✅ done |
 | 17 | 1 GiB capacity (`2^22` slots) on **sparse** `.dat`; 2M-row benchmark vs SQLite | ✅ done |
+| 18 | **Linux ELF64 port**: hand-built ELF header + raw-`syscall` backend behind the `os_*` layer; `TRUNCATE` command; CI runs the ELF natively on Ubuntu | ✅ done |
 
 Everything below is **future work** — listed to set direction honestly, not to
 imply it exists. The current engine is a single-table row store with one hash
@@ -500,7 +669,7 @@ The theme is "more cores, more machines, more OSes — still assembly."
 | **Parallel scans** | one worker thread per partition (`CreateThread`), fan-in results | analytical Read, bulk ops |
 | **MVCC + snapshot isolation** | versioned rows so readers never block writers; a lock-free ring for versions | concurrent workloads |
 | **Overlapped / async I/O** | Windows IOCP for checkpoint writes off the commit path | durable throughput |
-| **Linux/macOS port** | a thin syscall layer (`syscall` on Linux, `svc`/BSD on macOS) behind the same core; ELF/Mach-O emitters | portability |
+| **macOS port** | extend the `os_*` layer with a BSD `syscall`/`svc` backend and a Mach-O emitter (the **Linux ELF64 port is already shipped** — see Delivered #18) | portability |
 | **Binary wire protocol** | a length-prefixed request/response codec in assembly, replacing line parsing — the substrate the [SaaS](SAAS.md) data plane speaks | networked access |
 
 > **Honest benchmark note.** Durable *bulk* insert currently checkpoints by
@@ -540,20 +709,24 @@ in-engine backup/restore (9). Only **security & observability** (10) — and the
 
 ## 13. Source map
 
-The binary is monolithic: `main.asm` carries the PE header + centralized import
-table and `%include`s the modules; code and data are concatenated into `.text`.
+The binary is monolithic: `main.asm` carries the platform header (PE import
+table, or the ELF header via `elf.inc` under `-dLINUX`) and `%include`s the
+modules; code and data are concatenated into a single section.
 
 ```
 src/
-  asmdb.inc     ; shared constants, 256-byte record layout, Win32 values
-  main.asm      ; PE header, IAT, init, REPL loop, shutdown, %includes
-  console.inc   ; puts, put_u64/i64, buffered read_line, put_field, ASCII art
-  parse.inc     ; tokenizer, atoi/itoa, now_ms, dispatch + all command handlers
+  asmdb.inc     ; shared constants, 256-byte record layout, capacity, hash consts
+  main.asm      ; PE/ELF header, init, REPL loop, shutdown, %includes
+  elf.inc       ; hand-built ELF64 header (Linux, -dLINUX only)
+  os_win.inc    ; Windows backend for the os_* layer (kernel32 thunks, Win64 ABI)
+  os_linux.inc  ; Linux backend for the os_* layer (raw syscalls, SysV -> Win64)
+  console.inc   ; puts, put_u64/i64, buffered read_line (BOM-tolerant), ASCII art
+  parse.inc     ; tokenizer, atoi/itoa, dispatch + all command handlers
   store.inc     ; hash-table CRUD (hash, find, insert, update, delete)
   db.inc        ; file open/create, 512-byte header, load/persist
   wal.inc       ; WAL staging, two-phase commit, checkpoint, crash recovery
-  data.inc      ; strings, globals, buffers, kernel32 import table
+  data.inc      ; strings, globals, buffers, kernel32 import table (Windows)
 ```
 
-The store itself is **not** in the exe — it is the 1 GiB `VirtualAlloc` region
-loaded from `<db>.dat` at startup.
+The store itself is **not** in the exe — it is the 1 GiB `VirtualAlloc` / `mmap`
+region loaded from `<db>.dat` at startup.

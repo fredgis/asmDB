@@ -93,6 +93,14 @@ instances can be **hibernated** (container paused or stopped, files at rest in
 object storage) and **resumed on first request** in milliseconds, so we bill
 compute only while an instance is actually serving.
 
+> **Why the Linux build is the natural container image.** The engine ships a
+> native **ELF64 binary** (~30 KB) that depends on nothing but the kernel — no
+> libc, no runtime, no shared objects. It runs on a **`FROM scratch`** image
+> that contains literally two files (the engine + the sidecar), so a per-instance
+> container is a few tens of kilobytes, cold-starts in milliseconds, and has a
+> near-zero attack surface. The identical source also builds a Windows PE for
+> local development; production containers standardise on the Linux ELF.
+
 ---
 
 ## 3. Target users & example workloads
@@ -166,10 +174,11 @@ flowchart TB
   destroys instances and maps `instance_id → endpoint`), and the **usage
   pipeline** (collects metering events for billing). Metadata (instances, keys,
   placement) lives in a managed store (e.g. Postgres).
-- **Data plane**: one **micro-container per database instance**. Inside each
-  container, a small **sidecar** (Rust/Go) supervises the `asmdb.exe` process,
-  speaks the engine's protocol on one side and HTTP/gRPC/MCP on the other, ships
-  WAL/snapshots to object storage, and emits per-op usage events.
+- **Data plane**: one **micro-container per database instance**. The image is a
+  `FROM scratch` bundle of the **Linux ELF64 engine** (~30 KB, zero shared-library
+  dependencies) plus a small **sidecar** (Rust/Go) that supervises the `asmdb`
+  process, speaks the engine's protocol on one side and HTTP/gRPC/MCP on the
+  other, ships WAL/snapshots to object storage, and emits per-op usage events.
 - **Object storage** (S3 / Azure Blob / GCS): per-instance durability beyond the
   node — WAL segments + periodic snapshots, and the resting place for hibernated
   instances.

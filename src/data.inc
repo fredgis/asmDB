@@ -248,7 +248,7 @@ bnr3:  db '   / __ `/ ___/ __ `__ \/ __  / __ \', 0
 bnr4:  db '  / /_/ (__  ) / / / / / /_/ / /_/ /', 0
 bnr5:  db '  \__,_/____/_/ /_/ /_/\__,_/_.___/ ', 0
 s_tagline:  db '  a minimalist transactional database engine, in x86-64 assembly', 0
-s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL durability  .  ~20 KB', 0
+s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL-durable  .  Windows + Linux', 0
 s_hint_a:   db '  type ', 0
 s_hint_hi1: db 'HELP', 0
 s_hint_b:   db ' for commands, or ', 0

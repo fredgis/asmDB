@@ -6,7 +6,8 @@
   <p>
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
-    No linker. No C runtime. No dependencies. ~20 KB. And it is genuinely fast.
+    No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
+    <strong>and</strong> Linux (ELF64). ~21 KB. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -15,8 +16,8 @@
     <a href="#"><img src="https://img.shields.io/badge/assembler-NASM%203.x-6E4AA0" alt="assembler"></a>
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
-    <a href="#"><img src="https://img.shields.io/badge/runtime-Win32%20%2F%20no%20CRT-bf8700" alt="runtime"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-~18%20KB-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-~21%20KB%20PE%20%2F%20~30%20KB%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -25,11 +26,14 @@
 ---
 
 **asmdb** is a tiny, transactional database engine written from scratch in
-x86-64 assembly. NASM emits the Windows PE executable directly (`nasm -f bin`) —
-there is **no linker, no C runtime, no libraries** — and the program talks to
-`kernel32.dll` through a hand-built import table. Yet it is a real database:
-every statement is flushed to disk, `BEGIN`/`COMMIT`/`ROLLBACK` are real
-transactions, and a write-ahead log makes crash recovery atomic.
+x86-64 assembly. NASM emits the final executable **directly** (`nasm -f bin`) —
+there is **no linker, no C runtime, no libraries**. The same engine source builds
+two native binaries: a **Windows PE64** that calls `kernel32.dll` through a
+hand-built import table, and a **Linux ELF64** (a hand-assembled ELF header) that
+talks to the kernel through raw `syscall`s — selected by a thin `os_*` platform
+layer. Yet it is a real database: every statement is flushed to disk,
+`BEGIN`/`COMMIT`/`ROLLBACK` are real transactions, and a write-ahead log makes
+crash recovery atomic.
 
 You drive it two ways: an **ASCII-art CLI** over stdin/stdout, and a bundled
 **[MCP server](mcp/)** that exposes the engine to any Model Context Protocol
@@ -61,7 +65,8 @@ That is the whole point of writing a database in assembly.
 
 - [Why it's interesting](#why-its-interesting)
 - [Quickstart](#quickstart)
-- [Commands](#commands)
+- [Runs on Windows & Linux](#runs-on-windows--linux) — one engine, two native binaries
+- [Commands](#commands) — summary; full [command dictionary](docs/COMMANDS.md)
 - [Data model & supported types](#data-model--supported-types)
 - [MCP server & the CRUD interface](#mcp-server--the-crud-interface)
 - [How asmdb works](#how-asmdb-works) — the 60-second version, then a deep dive
@@ -76,7 +81,10 @@ That is the whole point of writing a database in assembly.
 
 ## Why it's interesting
 
-- **Zero dependencies** — assembled by NASM alone. No linker, no CRT, no DLL but `kernel32`.
+- **Zero dependencies** — assembled by NASM alone. No linker, no CRT: on Windows the
+  only import is `kernel32`; on Linux there are no libraries at all, just `syscall`.
+- **One engine, two native binaries** — a thin `os_*` layer lets the *same* assembly
+  build a Windows **PE64** and a Linux **ELF64**, both hand-emitted by `nasm -f bin`.
 - **Four cache lines per row** — fixed 256-byte records in an open-addressing hash
   table; the record array *is* the index. Lookups are Fibonacci hash + linear probe.
 - **Real transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` backed by an undo log.
@@ -92,7 +100,7 @@ That is the whole point of writing a database in assembly.
 
 ## Quickstart
 
-Requires Windows x64 and NASM 3.x (`winget install --id NASM.NASM -e`).
+**Windows** — requires x64 + NASM 3.x (`winget install --id NASM.NASM -e`):
 
 ```powershell
 .\build.ps1                 # -> build\asmdb.exe
@@ -109,31 +117,80 @@ Load the bundled sample — ten rows in one atomic transaction:
 .\examples\seed-salesdb.ps1 -Fresh
 ```
 
+<div align="center">
+  <img src="docs/assets/asmdb-screenshot.png" alt="asmdb CLI session: colored banner, INSERT, SELECT * table, FIND" width="90%">
+  <br><sub>The ASCII-art REPL — colored banner, boxed result tables, sectioned <code>HELP</code>.</sub>
+</div>
+
+## Runs on Windows & Linux
+
+There is **one engine source**. A thin platform layer (`os_*`) is the only part
+that differs per OS — everything above it (REPL, parser, hash store, transactions,
+WAL) is shared, byte-for-byte. NASM emits each OS's native executable **directly**,
+with no linker and no runtime:
+
+```mermaid
+flowchart TD
+    SRC["one engine source<br/>REPL · parser · hash store · txns · WAL"]:::core
+
+    SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
+    SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
+
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~21 KB</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~30 KB</b>"]:::lin
+
+    PE --> WOS(["Windows x64"]):::winb
+    ELF --> LOS(["Linux x86-64"]):::linb
+
+    classDef core fill:#6e4aa0,stroke:#3b1e75,color:#fff
+    classDef win  fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef lin  fill:#1a7f37,stroke:#0b4a20,color:#fff
+    classDef winb fill:#0b3d91,stroke:#0b3d91,color:#fff
+    classDef linb fill:#0b4a20,stroke:#0b4a20,color:#fff
+```
+
+The `os_*` layer wraps just a handful of primitives — open/read/write/pread/pwrite,
+allocate, flush (`FlushFileBuffers` ↔ `fsync`), current time, standard I/O and a
+TTY check — so a `CreateFileW` on Windows and an `openat` syscall on Linux are the
+*only* places the platforms diverge.
+
+**Linux** — requires NASM + a GNU toolchain (`sudo apt-get install nasm`), then:
+
+```bash
+./build.sh                        # -> build/asmdb   (hand-built ELF64)
+./build/asmdb SalesDB SalesTransactions
+```
+
+`build.ps1 -Linux` produces the same ELF from Windows for cross-building. The ELF
+is validated in CI (`tests/validate_elf.py`) and its smoke suite runs **natively
+on Ubuntu** — see [ENGINE.md §11](docs/ENGINE.md) for the ELF layout and the full
+Windows↔Linux syscall mapping.
+
 ## Commands
+
+asmdb speaks a small, line-oriented grammar — full CRUD over a fixed-schema table,
+real transactions, a catalog, and backup/restore. The essentials:
 
 | Command | Description |
 |---|---|
 | `INSERT <id> <value> <tag> <content...>` | add a new row (auto `created`/`updated`; `id ≥ 1`) |
-| `SELECT <id>` | show one row as a detail block (full content + timestamps) |
-| `SELECT *` | list all rows as a 4-column table |
-| `UPDATE <id> <value> <tag> <content...>` | modify an existing row (bumps `updated`) |
-| `DELETE <id>` | remove a row by key |
-| `FIND <substr>` | case-insensitive substring search over `tag` + `content` |
-| `RANGE <lo> <hi>` | list rows whose `value` is within `[lo, hi]` (inclusive) |
-| `COUNT` | number of live rows |
+| `SELECT <id>` / `SELECT *` | one row as a detail block / all rows as a table |
+| `UPDATE <id> <value> <tag> <content...>` | overwrite an existing row (bumps `updated`) |
+| `DELETE <id>` | remove one row by key |
+| `TRUNCATE` | remove **every** row (transaction-aware) |
+| `FIND <substr>` · `RANGE <lo> <hi>` · `COUNT` | search · value-range scan · live count |
 | `BEGIN` · `COMMIT` · `ROLLBACK` | transaction control |
-| `BENCH <n>` | insert *n* synthetic rows and report engine rows/sec |
-| `BACKUP <file>` | snapshot this database to `<file>` |
-| `RESTORE <file>` | reload this database from a `BACKUP` snapshot |
-| `TABLES` | the table held in this database |
-| `DATABASES` | list `*.dat` databases in the current folder |
-| `SCHEMA` | show the record layout |
-| `TYPES` | supported column types |
-| `HELP` | command reference |
-| `EXIT` · `QUIT` | leave asmdb |
+| `BACKUP <file>` · `RESTORE <file>` | snapshot / reload the database |
+| `TABLES` · `DATABASES` · `SCHEMA` · `TYPES` · `BENCH <n>` | catalog & benchmark |
+| `HELP` · `EXIT` / `QUIT` | reference · leave |
 
-Here `tag` is a single token; `content` is the rest of the line (spaces allowed).
-`INSERT`/`UPDATE` enforce an `id ≥ 1` **CHECK** constraint (id `0` is reserved);
+📖 **The full [command dictionary](docs/COMMANDS.md)** documents every command with
+syntax, constraints and worked examples — including why a fixed-schema engine has
+**no `CREATE TABLE` / `DROP` / `ALTER`** (`CREATE TABLE` is implicit; empty a table
+with `TRUNCATE`; "drop" is deleting the `.dat` file).
+
+Notes: `tag` is a single token, `content` is the rest of the line (spaces allowed);
+`INSERT`/`UPDATE` enforce an `id ≥ 1` **CHECK** (id `0` is reserved);
 `BACKUP`/`RESTORE` are refused inside a transaction; and opening a database that
 another engine already holds is refused (exclusive **single-writer** lock).
 
@@ -253,17 +310,20 @@ flowchart LR
 
 ### The deep dive
 
-How ~20 KB of assembly becomes a durable database.
+How ~21 KB of assembly becomes a durable database.
 
 #### The executable — no linker, no CRT
 
-NASM emits the Windows PE directly (`nasm -f bin`); there is no linker step. The
-trick is alignment: with `SectionAlignment == FileAlignment == 0x200`, every RVA
-equals its offset in the file, so the import table can be laid out by hand — a
-small array of thunks pointing at hint/name entries that Windows binds to
-`kernel32.dll` at load time. Code, data and imports share a single section; the
-1 GiB record store is `VirtualAlloc`'d at runtime, which is why the binary stays
-~20 KB on disk.
+NASM emits each native binary **directly** (`nasm -f bin`); there is no linker
+step on either platform. On **Windows** the trick is alignment: with
+`SectionAlignment == FileAlignment == 0x200`, every RVA equals its offset in the
+file, so the import table can be laid out by hand — a small array of thunks
+pointing at hint/name entries that Windows binds to `kernel32.dll` at load time.
+On **Linux** there is no import table at all: a hand-assembled ELF64 header maps a
+single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
+depends on nothing but the kernel. Code, data and imports share a single section;
+the 1 GiB record store is `VirtualAlloc`'d / `mmap`'d at runtime, which is why the
+binaries stay ~21 KB (PE) / ~30 KB (ELF) on disk.
 
 #### The record store — four cache lines per row
 
@@ -543,7 +603,8 @@ Two documents, deliberately kept in separate lanes:
   stays **100% x86-64 assembly**: hardening (CRC32 WAL, incremental checkpoint,
   group commit, dynamic resize), fast reads (secondary/bitmap indexes, AVX2/512
   scans, range queries), columnar storage + compression, then concurrency,
-  partitioning, an in-asm binary wire protocol, and a Linux syscall port. See
+  partitioning, and an in-asm binary wire protocol. The **Linux ELF64 port is
+  already shipped** (native `syscall` backend). See
   [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 - **[`docs/SAAS.md`](docs/SAAS.md) — the productization plan.** How the assembly
   engine becomes **asmdb Cloud**: a hosted, pay-as-you-go database service where
@@ -560,13 +621,15 @@ Two documents, deliberately kept in separate lanes:
 ```
 asmdb/
   src/          main.asm + .inc modules (console, parse, store, db, wal, data)
+                + os_win.inc / os_linux.inc / elf.inc (platform backends)
   mcp/          Model Context Protocol server (generic CRUD tools) + tests
   clients/      stdio client examples: Python, C#, C
   examples/     seed-salesdb.ps1 sample loader, bench.ps1 + bench_sqlite.py
-  tests/        smoke.ps1 + make_wal.py crash-recovery fixture
-  docs/         ENGINE.md spec, SAAS.md plan, assets/ (logo, banner, generator)
+  tests/        smoke.ps1 / smoke.sh, validate_elf.py, make_wal.py fixture
+  docs/         ENGINE.md spec, SAAS.md plan, COMMANDS.md dictionary, assets/
   poc/          minimal 752-byte PE64 proof-of-concept
-  build.ps1     locates NASM and assembles from src\
+  build.ps1     locates NASM, assembles the PE64 (or the ELF64 with -Linux)
+  build.sh      assembles the Linux ELF64 natively
 ```
 
 See [`docs/ENGINE.md`](docs/ENGINE.md) for the full engine specification and
