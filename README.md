@@ -140,7 +140,7 @@ On startup the WAL is inspected before the table is loaded. Recovery is
 flowchart TD
     S[startup: db_open] --> R[read WAL]
     R --> M{magic ASMWAL01?}
-    M -- no --> X[discard &amp; truncate]
+    M -- no --> X[discard and truncate]
     M -- yes --> K{commit marker present?}
     K -- no --> X
     K -- yes --> P[replay after-images<br/>into asmdb.dat]
@@ -170,7 +170,7 @@ flowchart LR
     P -- DELETED --> REU[remember reusable slot,<br/>keep probing]
     P -- OCCUPIED --> EQ{id matches?}
     EQ -- yes --> HIT[found]
-    EQ -- no --> NX["slot = &#40;slot+1&#41; &amp; mask"]
+    EQ -- no --> NX["next = (slot + 1) mod CAPACITY"]
     NX --> P
     REU --> NX
 
