@@ -52,7 +52,7 @@ compute time. Idle instances **scale to zero** and cost almost nothing.
 
 Why this can win:
 
-- **The engine is tiny and starts instantly.** `asmdb.exe` is ~18 KB, has no
+- **The engine is tiny and starts instantly.** `asmdb.exe` is ~20 KB, has no
   runtime to warm up, and maps a single 64 MiB region on boot. That makes
   **per-instance micro-containers** and **scale-to-zero** economically viable in
   a way a heavyweight DB image (hundreds of MB, slow warmup) is not — cold start

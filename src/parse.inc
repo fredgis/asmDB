@@ -402,6 +402,8 @@ cmd_insert:
     test rdx, rdx
     jz   .syntax
     mov  [rbp-32], rax               ; id
+    test rax, rax
+    jz   .badid
     call skip_spaces_rsi
     call parse_i64
     test rdx, rdx
@@ -464,6 +466,10 @@ cmd_insert:
     lea  rcx, [rel s_err_dup]
     call puts
     jmp  .done
+.badid:
+    lea  rcx, [rel s_err_check]
+    call puts
+    jmp  .done
 .full:
     lea  rcx, [rel s_err_full]
     call puts
@@ -492,6 +498,8 @@ cmd_update:
     test rdx, rdx
     jz   .syntax
     mov  [rbp-32], rax
+    test rax, rax
+    jz   .badid
     call skip_spaces_rsi
     call parse_i64
     test rdx, rdx
@@ -544,6 +552,10 @@ cmd_update:
     jmp  .done
 .notfound:
     lea  rcx, [rel s_err_nf]
+    call puts
+    jmp  .done
+.badid:
+    lea  rcx, [rel s_err_check]
     call puts
     jmp  .done
 .syntax:
@@ -800,6 +812,236 @@ cmd_find:
     pop  rbp
     ret
 
+; cmd_range() - RANGE <lo> <hi> : list rows whose value is within [lo,hi]
+; (a secondary access path over the value column; linear scan today).
+cmd_range:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x70
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    mov  [rbp-32], r12
+    call skip_spaces_rsi
+    call parse_i64
+    test rdx, rdx
+    jz   .syntax
+    mov  [rbp-48], rax               ; lo
+    call skip_spaces_rsi
+    call parse_i64
+    test rdx, rdx
+    jz   .syntax
+    mov  [rbp-56], rax               ; hi
+    xor  r12, r12                    ; match count
+    xor  rbx, rbx                    ; slot index
+.scan:
+    cmp  rbx, CAPACITY
+    jae  .done_scan
+    mov  rax, rbx
+    shl  rax, REC_SHIFT
+    add  rax, [rel g_table]
+    cmp  byte [rax+REC_STATUS], ST_OCCUPIED
+    jne  .next
+    mov  rcx, [rax+REC_VALUE]        ; i64 value
+    cmp  rcx, [rbp-48]
+    jl   .next                       ; value < lo (signed)
+    cmp  rcx, [rbp-56]
+    jg   .next                       ; value > hi (signed)
+    mov  [rbp-64], rax               ; slot ptr (survives tbl_* / print_row)
+    test r12, r12
+    jnz  .have_hdr
+    call tbl_sep
+    call tbl_head
+    call tbl_sep
+.have_hdr:
+    mov  rcx, [rbp-64]
+    call print_row
+    inc  r12
+.next:
+    inc  rbx
+    jmp  .scan
+.done_scan:
+    test r12, r12
+    jz   .none
+    call tbl_sep
+    jmp  .done
+.none:
+    lea  rcx, [rel s_range_none]
+    call puts
+    jmp  .done
+.syntax:
+    lea  rcx, [rel s_err_syntax]
+    call puts
+.done:
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_backup() - BACKUP <file> : snapshot the current database (header + full
+; slot region) to <file>. Rejected while a transaction is open. Reuses the
+; durable-write path by temporarily retargeting g_dat_handle at the backup file.
+cmd_backup:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x60
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    cmp  qword [rel g_in_txn], 0
+    jne  .busy
+    call skip_spaces_rsi
+    mov  al, [rsi]
+    test al, al
+    je   .syntax
+    lea  rdi, [rel g_bakname]
+    mov  rdx, 200
+    call parse_tok
+    lea  rcx, [rel g_bakname]
+    mov  rdx, GENERIC_READ | GENERIC_WRITE
+    xor  r8, r8
+    xor  r9, r9
+    mov  dword [rsp+0x20], CREATE_ALWAYS
+    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
+    mov  qword [rsp+0x30], 0
+    call [rel iat_CreateFileA]
+    cmp  rax, INVALID_HANDLE
+    je   .openfail
+    mov  rbx, rax                    ; backup handle
+    mov  rax, [rel g_dat_handle]
+    mov  [rbp-32], rax               ; saved live handle
+    mov  [rel g_dat_handle], rbx
+    call db_write_header             ; 512-byte header at offset 0
+    mov  rcx, HDR_SIZE
+    mov  rdx, [rel g_table]
+    mov  r8, CAPACITY*REC_SIZE
+    call write_at                    ; full slot region
+    call db_flush
+    mov  rax, [rbp-32]
+    mov  [rel g_dat_handle], rax     ; restore live handle
+    mov  rcx, rbx
+    call [rel iat_CloseHandle]
+    lea  rcx, [rel s_ok_backup]
+    call puts
+    jmp  .done
+.openfail:
+    lea  rcx, [rel s_err_bak_open]
+    call puts
+    jmp  .done
+.busy:
+    lea  rcx, [rel s_err_txn_busy]
+    call puts
+    jmp  .done
+.syntax:
+    lea  rcx, [rel s_err_syntax]
+    call puts
+.done:
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_restore() - RESTORE <file> : reload the database (header + slot region)
+; from a backup written by BACKUP, then persist it to the live .dat. Rejected
+; while a transaction is open.
+cmd_restore:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x60
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    cmp  qword [rel g_in_txn], 0
+    jne  .busy
+    call skip_spaces_rsi
+    mov  al, [rsi]
+    test al, al
+    je   .syntax
+    lea  rdi, [rel g_bakname]
+    mov  rdx, 200
+    call parse_tok
+    lea  rcx, [rel g_bakname]
+    mov  rdx, GENERIC_READ
+    mov  r8d, 1                      ; FILE_SHARE_READ
+    xor  r9, r9
+    mov  dword [rsp+0x20], OPEN_EXISTING
+    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
+    mov  qword [rsp+0x30], 0
+    call [rel iat_CreateFileA]
+    cmp  rax, INVALID_HANDLE
+    je   .openfail
+    mov  rbx, rax                    ; backup handle
+    mov  rax, [rel g_dat_handle]
+    mov  [rbp-32], rax               ; saved live handle
+    mov  [rel g_dat_handle], rbx     ; read from the backup
+    xor  rcx, rcx
+    lea  rdx, [rel g_hdr_read]
+    mov  r8, HDR_SIZE
+    call read_at
+    cmp  rax, HDR_SIZE
+    jb   .badmagic
+    lea  rsi, [rel g_hdr_read]
+    lea  rdi, [rel s_magic]
+    mov  rcx, 5
+.magic:
+    mov  al, [rsi]
+    cmp  al, [rdi]
+    jne  .badmagic
+    inc  rsi
+    inc  rdi
+    dec  rcx
+    jnz  .magic
+    mov  rcx, HDR_SIZE
+    mov  rdx, [rel g_table]
+    mov  r8, CAPACITY*REC_SIZE
+    call read_at                     ; load slots into the live table
+    mov  rax, [rel g_hdr_read+24]
+    mov  [rel g_count], rax           ; adopt restored live count
+    mov  rax, [rbp-32]
+    mov  [rel g_dat_handle], rax     ; restore live handle
+    mov  rcx, rbx
+    call [rel iat_CloseHandle]
+    call db_write_header             ; persist restored image to the live .dat
+    mov  rcx, HDR_SIZE
+    mov  rdx, [rel g_table]
+    mov  r8, CAPACITY*REC_SIZE
+    call write_at
+    call db_flush
+    lea  rcx, [rel s_ok_restore]
+    call puts
+    jmp  .done
+.badmagic:
+    mov  rax, [rbp-32]
+    mov  [rel g_dat_handle], rax     ; restore live handle before erroring
+    mov  rcx, rbx
+    call [rel iat_CloseHandle]
+    lea  rcx, [rel s_err_bak_magic]
+    call puts
+    jmp  .done
+.openfail:
+    lea  rcx, [rel s_err_bak_open]
+    call puts
+    jmp  .done
+.busy:
+    lea  rcx, [rel s_err_txn_busy]
+    call puts
+    jmp  .done
+.syntax:
+    lea  rcx, [rel s_err_syntax]
+    call puts
+.done:
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; cmd_bench() - BENCH <n> : reset the table, insert n synthetic rows (timed in
 ; RAM), then checkpoint the whole table to disk + fsync (timed). This overwrites
 ; the current database with synthetic data - run it against a scratch db.
@@ -967,6 +1209,9 @@ cmd_help:
     lea  rcx, [rel hc_find]
     lea  rdx, [rel hd_find]
     call help_row
+    lea  rcx, [rel hc_range]
+    lea  rdx, [rel hd_range]
+    call help_row
     lea  rcx, [rel hc_delete]
     lea  rdx, [rel hd_delete]
     call help_row
@@ -1006,6 +1251,17 @@ cmd_help:
     call help_row
     lea  rcx, [rel hc_bench]
     lea  rdx, [rel hd_bench]
+    call help_row
+    call crlf
+    lea  rcx, [rel h_g_bak]
+    lea  rdx, [rel c_yellow]
+    call puts_col
+    call crlf
+    lea  rcx, [rel hc_backup]
+    lea  rdx, [rel hd_backup]
+    call help_row
+    lea  rcx, [rel hc_restore]
+    lea  rdx, [rel hd_restore]
     call help_row
     call crlf
     lea  rcx, [rel h_g_sess]
@@ -1268,6 +1524,18 @@ dispatch:
     call token_eq
     test rax, rax
     jnz  .find
+    lea  rdi, [rel kw_range]
+    call token_eq
+    test rax, rax
+    jnz  .range
+    lea  rdi, [rel kw_backup]
+    call token_eq
+    test rax, rax
+    jnz  .backup
+    lea  rdi, [rel kw_restore]
+    call token_eq
+    test rax, rax
+    jnz  .restore
     lea  rcx, [rel s_unknown]
     call puts
     jmp  .ok0
@@ -1321,6 +1589,18 @@ dispatch:
 .find:
     call advance_token
     call cmd_find
+    jmp  .ok0
+.range:
+    call advance_token
+    call cmd_range
+    jmp  .ok0
+.backup:
+    call advance_token
+    call cmd_backup
+    jmp  .ok0
+.restore:
+    call advance_token
+    call cmd_restore
     jmp  .ok0
 .exit:
     mov  rax, CMD_EXIT

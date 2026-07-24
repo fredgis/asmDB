@@ -5,6 +5,7 @@ build/*.obj
 # Runtime data files
 *.dat
 *.wal
+*.bak
 
 # Editor / OS
 *.swp

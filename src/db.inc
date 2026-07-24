@@ -273,7 +273,7 @@ db_open:
     sub  rsp, 0x50
     lea  rcx, [rel g_datname]
     mov  rdx, GENERIC_READ | GENERIC_WRITE
-    mov  r8d, 1                      ; FILE_SHARE_READ
+    xor  r8, r8                      ; exclusive - no sharing (single-writer)
     xor  r9, r9
     mov  dword [rsp+0x20], OPEN_ALWAYS
     mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
@@ -355,6 +355,14 @@ db_open:
     pop  rbp
     ret
 .openfail:
+    call [rel iat_GetLastError]      ; read before any call clobbers it
+    cmp  eax, ERROR_SHARING_VIOLATION
+    jne  .openfail_generic
+    lea  rcx, [rel s_err_lock]
+    call puts
+    mov  ecx, 1
+    call [rel iat_ExitProcess]
+.openfail_generic:
     lea  rcx, [rel s_err_open]
     call puts
     mov  ecx, 1

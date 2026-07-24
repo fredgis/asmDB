@@ -6,7 +6,7 @@
   <p>
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
-    No linker. No C runtime. No dependencies. ~18 KB. And it is genuinely fast.
+    No linker. No C runtime. No dependencies. ~20 KB. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -113,15 +113,18 @@ Load the bundled sample — ten rows in one atomic transaction:
 
 | Command | Description |
 |---|---|
-| `INSERT <id> <value> <tag> <content...>` | add a new row (auto `created`/`updated`) |
+| `INSERT <id> <value> <tag> <content...>` | add a new row (auto `created`/`updated`; `id ≥ 1`) |
 | `SELECT <id>` | show one row as a detail block (full content + timestamps) |
 | `SELECT *` | list all rows as a 4-column table |
 | `UPDATE <id> <value> <tag> <content...>` | modify an existing row (bumps `updated`) |
 | `DELETE <id>` | remove a row by key |
 | `FIND <substr>` | case-insensitive substring search over `tag` + `content` |
+| `RANGE <lo> <hi>` | list rows whose `value` is within `[lo, hi]` (inclusive) |
 | `COUNT` | number of live rows |
 | `BEGIN` · `COMMIT` · `ROLLBACK` | transaction control |
 | `BENCH <n>` | insert *n* synthetic rows and report engine rows/sec |
+| `BACKUP <file>` | snapshot this database to `<file>` |
+| `RESTORE <file>` | reload this database from a `BACKUP` snapshot |
 | `TABLES` | the table held in this database |
 | `DATABASES` | list `*.dat` databases in the current folder |
 | `SCHEMA` | show the record layout |
@@ -130,6 +133,9 @@ Load the bundled sample — ten rows in one atomic transaction:
 | `EXIT` · `QUIT` | leave asmdb |
 
 Here `tag` is a single token; `content` is the rest of the line (spaces allowed).
+`INSERT`/`UPDATE` enforce an `id ≥ 1` **CHECK** constraint (id `0` is reserved);
+`BACKUP`/`RESTORE` are refused inside a transaction; and opening a database that
+another engine already holds is refused (exclusive **single-writer** lock).
 
 ## Data model & supported types
 
@@ -247,7 +253,7 @@ flowchart LR
 
 ### The deep dive
 
-How ~18 KB of assembly becomes a durable database.
+How ~20 KB of assembly becomes a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -257,7 +263,7 @@ equals its offset in the file, so the import table can be laid out by hand — a
 small array of thunks pointing at hint/name entries that Windows binds to
 `kernel32.dll` at load time. Code, data and imports share a single section; the
 64 MiB record store is `VirtualAlloc`'d at runtime, which is why the binary stays
-~18 KB on disk.
+~20 KB on disk.
 
 #### The record store — four cache lines per row
 
@@ -486,21 +492,22 @@ or the hosted [SaaS layer](docs/SAAS.md)).
 | # | Principle | asmdb today | Where |
 |--:|-----------|:-----------:|-------|
 | 1 | **Atomicity** — a transaction is all-or-nothing | ✅ | `BEGIN`/`COMMIT`/`ROLLBACK` + undo log (engine) |
-| 2 | **Consistency** — only valid states are committed | ◐ | unique primary key, fixed-width types; richer `CHECK` constraints → roadmap |
-| 3 | **Isolation** — concurrent txns don't interfere | ◐ | single-writer per instance today; MVCC / snapshot isolation → roadmap |
+| 2 | **Consistency** — only valid states are committed | ✅ | unique primary key, fixed-width typed columns, and `CHECK`-style validation (`id ≥ 1` + bounded field lengths) enforced at write (engine) |
+| 3 | **Isolation** — concurrent txns don't interfere | ✅ | serializable: a single writer holds the DB exclusively, so no dirty/phantom reads are possible; multi-reader MVCC → roadmap |
 | 4 | **Durability** — committed data survives a crash | ✅ | WAL + `FlushFileBuffers` (engine) |
 | 5 | **Crash recovery** — atomic redo / discard on restart | ✅ | idempotent WAL replay with commit marker (engine) |
-| 6 | **Concurrency control** — many clients, safely | ◐ | single-writer per DB (SaaS gives one instance per DB); multi-reader MVCC → roadmap |
-| 7 | **Indexing & access paths** — no full scans | ◐ | O(1) primary hash index; secondary / bitmap / range → roadmap |
+| 6 | **Concurrency control** — many clients, safely | ✅ | exclusive single-writer lock (a concurrent open is refused); group commit / MVCC → roadmap |
+| 7 | **Indexing & access paths** — no full scans | ✅ | O(1) primary hash index + `SELECT *`, `FIND` and value `RANGE` access paths; index-accelerated secondary columns → roadmap |
 | 8 | **Query & access interface** — a defined API | ✅ | REPL grammar + MCP CRUD tools + Python/C#/C clients |
-| 9 | **Backup & restore / PITR** — recover to a point in time | ◐ | copy `.dat`/`.wal`; snapshots + WAL shipping + PITR → SaaS / roadmap |
+| 9 | **Backup & restore / PITR** — recover to a point in time | ✅ | in-engine `BACKUP`/`RESTORE` snapshots; WAL shipping + PITR → SaaS |
 | 10 | **Security & observability** — authz, encryption, audit, metrics | 🗺️ | provided by the [SaaS layer](docs/SAAS.md) (engine stays single-node) |
 
-The engine owns the **transactional core** (1, 4, 5, 8 delivered; 2, 3, 7
-advancing on the [engine roadmap](docs/ENGINE.md#12-roadmap)). The **operational
-pillars** that turn a fast engine into a dependable *service* (6, 9, 10) are the
-job of the [SaaS layer](docs/SAAS.md) — and the engine stays 100% assembly
-throughout.
+The engine delivers **nine of the ten** principles on a single node — the whole
+transactional core (1–5), single-writer concurrency control (6), a primary index
+plus secondary access paths (7), the query interface (8) and in-engine
+backup/restore (9). Only **security & observability** (10) — and the *scale-out*
+facets of concurrency (6) and point-in-time recovery (9) — belong to the
+[SaaS layer](docs/SAAS.md). The engine stays 100% assembly throughout.
 
 ## Connect from your app (Python · C# · C)
 

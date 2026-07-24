@@ -56,6 +56,24 @@ try {
     Check 'persistence: bob/222'       ($r2 -match 'bob\s+\|\s+222')
     Check 'persistence: 2 rows'        ($r2 -match '\[ OK \] 2 row\(s\)')
     Check 'rolled-back carol absent'   (-not ($r2 -match 'carol'))
+
+    # Run 3: CHECK constraint, RANGE access path, BACKUP/RESTORE (fresh db 'r7')
+    $r3 = (@(
+        'INSERT 10 100 xx aaa', 'INSERT 20 250 yy bbb', 'INSERT 30 500 zz ccc',
+        'INSERT 0 1 bad reserved-key',
+        'RANGE 100 300',
+        'BACKUP snap.bak',
+        'DELETE 10', 'DELETE 20', 'DELETE 30', 'COUNT',
+        'RESTORE snap.bak', 'COUNT', 'EXIT'
+    ) -join "`n") | .\asmdb.exe r7
+    $r3 = $r3 -join "`n"
+    Check 'CHECK rejects id 0'          ($r3 -match 'id must be >= 1')
+    Check 'RANGE includes in-range row' ($r3 -match 'yy\s+\|\s+250')
+    Check 'RANGE excludes out-of-range' (-not ($r3 -match 'zz\s+\|\s+500'))
+    Check 'BACKUP acknowledged'         ($r3 -match 'backup written')
+    Check 'emptied before restore'      ($r3 -match '\[ OK \] 0 row\(s\)')
+    Check 'RESTORE acknowledged'        ($r3 -match 'database restored')
+    Check 'RESTORE recovers 3 rows'     ($r3 -match '\[ OK \] 3 row\(s\)')
 }
 finally {
     Pop-Location

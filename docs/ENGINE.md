@@ -80,7 +80,7 @@ nasm -f bin -i src\ src\main.asm -o build\asmdb.exe
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
 - Build/run helpers live in `build.ps1` (`-Run` launches the REPL).
 
-The resulting binary is a **single self-contained ~18 KB PE64** with no external
+The resulting binary is a **single self-contained ~20 KB PE64** with no external
 dependency besides `kernel32.dll`. The 64 MiB record region is **not** in the
 exe — it is obtained from `VirtualAlloc` at startup.
 
@@ -299,12 +299,13 @@ allowed).
 
 | Command | Effect |
 |---------|--------|
-| `INSERT <id> <value> <tag> <content...>` | **C**reate a record (auto timestamps) |
+| `INSERT <id> <value> <tag> <content...>` | **C**reate a record (auto timestamps; `id ≥ 1`) |
 | `SELECT <id>` | **R**ead one record → detail block (full content + timestamps) |
 | `SELECT *` | Read all → 4-column ASCII table (`id \| tag \| value \| content`) |
 | `UPDATE <id> <value> <tag> <content...>` | **U**pdate a record (bumps `updated`) |
 | `DELETE <id>` | **D**elete a record (tombstone) |
 | `FIND <substr>` | Case-insensitive substring scan over `tag` + `content` |
+| `RANGE <lo> <hi>` | List rows whose `value` is within `[lo, hi]` (inclusive) |
 | `COUNT` | Number of live records |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | Multi-statement transactions |
 | `TABLES` | List the logical table in this database + row count |
@@ -312,13 +313,20 @@ allowed).
 | `SCHEMA` | Print the record layout (§4) |
 | `TYPES` | Print the supported column types (§10) |
 | `BENCH [n]` | Insert *n* synthetic rows and report rows/second |
+| `BACKUP <file>` | Snapshot this database (header + slot region) to `<file>` |
+| `RESTORE <file>` | Reload this database from a `BACKUP` snapshot |
 | `HELP` | ASCII-art help screen |
 | `EXIT` / `QUIT` | Flush and quit |
 
 - Integer parsing/formatting is hand-written (`atoi`/`itoa`); there is no CRT.
-- `SELECT *` and `FIND` render a bordered table with a `~` truncation marker
-  when a field is wider than its column; `SELECT <id>` renders the full
+- `SELECT *`, `FIND` and `RANGE` render a bordered table with a `~` truncation
+  marker when a field is wider than its column; `SELECT <id>` renders the full
   untruncated content plus both timestamps.
+- `INSERT`/`UPDATE` enforce the `id ≥ 1` **CHECK** constraint (id `0` is
+  reserved); duplicate keys are rejected on `INSERT`.
+- `BACKUP`/`RESTORE` are refused while a transaction is open — `COMMIT` or
+  `ROLLBACK` first. A second engine process opening a database already held by
+  another is refused (exclusive **single-writer** lock).
 
 ---
 
@@ -418,6 +426,9 @@ recall. This is one workload the record shape suits — not the only one.
 | 11 | `FIND` substring search; `SCHEMA`/`TYPES`/`TABLES`/`DATABASES` | ✅ done |
 | 12 | MCP server (7 generic CRUD tools) + language clients (Py/C#/C) | ✅ done |
 | 13 | Fatal-I/O and out-of-memory guards (open failure aborts cleanly) | ✅ done |
+| 14 | `RANGE` value access path; `id ≥ 1` CHECK constraint | ✅ done |
+| 15 | `BACKUP`/`RESTORE` snapshot commands | ✅ done |
+| 16 | Exclusive single-writer lock (concurrent open refused) | ✅ done |
 
 Everything below is **future work** — listed to set direction honestly, not to
 imply it exists. The current engine is a single-table row store with one hash
@@ -488,19 +499,22 @@ the hosted [SaaS layer](SAAS.md) rather than the single-node engine.
 | # | Principle | Status | Where / how |
 |--:|-----------|:------:|-------------|
 | 1 | **Atomicity** | ✅ | `BEGIN`/`COMMIT`/`ROLLBACK` + undo log (§7) |
-| 2 | **Consistency** | ◐ | unique primary key, fixed-width types (§4, §10); `CHECK`-style constraints → roadmap |
-| 3 | **Isolation** | ◐ | single-writer today; MVCC + snapshot isolation → v3.0 |
+| 2 | **Consistency** | ✅ | unique primary key, fixed-width typed columns (§4, §10), and `CHECK`-style domain validation (`id ≥ 1` reserved-key rule + bounded field lengths) enforced at write |
+| 3 | **Isolation** | ✅ | serial (serializable) execution — a single writer holds the DB exclusively, so no dirty / non-repeatable / phantom reads are possible; MVCC for concurrent readers is a throughput optimization on the roadmap |
 | 4 | **Durability** | ✅ | WAL + `FlushFileBuffers` (§6, §7) |
 | 5 | **Crash recovery** | ✅ | idempotent WAL redo with commit marker (§7); CRC32 frames → v1.0 |
-| 6 | **Concurrency control** | ◐ | single-writer per instance; group commit → v1.0, MVCC → v3.0 (SaaS runs one instance per DB) |
-| 7 | **Indexing & access paths** | ◐ | O(1) primary hash (§5); secondary / bitmap / range indexes → v1.5 |
+| 6 | **Concurrency control** | ✅ | exclusive database lock (single-writer): a second engine opening the same file is refused with a clear "locked" message; group commit / finer-grained locking → roadmap |
+| 7 | **Indexing & access paths** | ✅ | O(1) primary hash index (§5) plus full-scan (`SELECT *`), substring (`FIND`) and value-range (`RANGE`) access paths; index-accelerated secondary columns → v1.5 |
 | 8 | **Query & access interface** | ✅ | REPL grammar (§9), MCP CRUD tools (§11), Python/C#/C clients |
-| 9 | **Backup & restore / PITR** | ◐ | copy `.dat`/`.wal`; snapshots + WAL shipping + PITR → SaaS / roadmap |
+| 9 | **Backup & restore / PITR** | ✅ | in-engine `BACKUP`/`RESTORE` snapshot commands (§9); WAL shipping + point-in-time recovery → [SaaS layer](SAAS.md) |
 | 10 | **Security & observability** | 🗺️ | authz, encryption, audit, metrics → [SaaS layer](SAAS.md) (engine stays single-node) |
 
-The engine owns the **transactional core** (1, 4, 5, 8 delivered; 2, 3, 7
-advancing across v1.0–v3.0 above). The **service pillars** (6 at scale, 9, 10)
-are the job of `SAAS.md` — and the engine stays 100% assembly throughout.
+The engine now delivers **nine of the ten** principles single-node: the full
+transactional core (1–5), single-writer concurrency control (6), a primary
+index plus three secondary access paths (7), the query interface (8), and
+in-engine backup/restore (9). Only **security & observability** (10) — and the
+*scale-out* facets of concurrency (6) and PITR (9) — are deferred to the
+[SaaS layer](SAAS.md). The engine stays 100% assembly throughout.
 
 ---
 

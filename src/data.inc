@@ -40,6 +40,7 @@ g_ft:          dq 0
 g_base:        times 216 db 0
 g_datname:     times 224 db 0
 g_walname:     times 224 db 0
+g_bakname:     times 224 db 0
 g_tablename:   times 64 db 0
 g_argtable:    times 64 db 0
 g_finddata:    times FIND_STRUCT db 0
@@ -88,10 +89,18 @@ s_err_nf:      db '[ERR] key not found', 13, 10, 0
 s_err_full:    db '[ERR] table full', 13, 10, 0
 s_err_syntax:  db '[ERR] syntax error - type HELP', 13, 10, 0
 s_err_open:    db '[ERR] cannot open database file', 13, 10, 0
+s_err_lock:    db '[ERR] database is locked by another process (single-writer)', 13, 10, 0
+s_err_check:   db '[ERR] constraint: id must be >= 1 (0 is reserved)', 13, 10, 0
 s_err_mem:     db '[ERR] out of memory', 13, 10, 0
 s_count_pre:   db '[ OK ] ', 0
 s_count_post:  db ' row(s)', 13, 10, 0
 s_find_none:   db '[ OK ] no matching rows', 13, 10, 0
+s_range_none:  db '[ OK ] no rows in range', 13, 10, 0
+s_ok_backup:   db '[ OK ] backup written', 13, 10, 0
+s_ok_restore:  db '[ OK ] database restored from backup', 13, 10, 0
+s_err_bak_open: db '[ERR] cannot open backup file', 13, 10, 0
+s_err_bak_magic:db '[ERR] not an asmdb backup (bad magic)', 13, 10, 0
+s_err_txn_busy: db '[ERR] finish the transaction first (COMMIT or ROLLBACK)', 13, 10, 0
 s_det_id:      db '  id       : ', 0
 s_det_value:   db '  value    : ', 0
 s_det_tag:     db '  tag      : ', 0
@@ -131,10 +140,11 @@ h_title:    db '  asmdb command reference', 0
 h_g_data:   db '  Data', 0
 h_g_txn:    db '  Transactions', 0
 h_g_cat:    db '  Catalog', 0
+h_g_bak:    db '  Backup', 0
 h_g_sess:   db '  Session', 0
 
 hc_insert:  db 'INSERT <id> <val> <tag> <text>', 0
-hd_insert:  db 'insert a row', 0
+hd_insert:  db 'insert a row (id must be >= 1)', 0
 hc_sel1:    db 'SELECT <id>', 0
 hd_sel1:    db 'show one row (full detail)', 0
 hc_selall:  db 'SELECT *', 0
@@ -143,6 +153,8 @@ hc_update:  db 'UPDATE <id> <val> <tag> <text>', 0
 hd_update:  db 'overwrite an existing row', 0
 hc_find:    db 'FIND <substr>', 0
 hd_find:    db 'search tag + text (substring)', 0
+hc_range:   db 'RANGE <lo> <hi>', 0
+hd_range:   db 'list rows with value in [lo,hi]', 0
 hc_delete:  db 'DELETE <id>', 0
 hd_delete:  db 'remove a row by key', 0
 hc_count:   db 'COUNT', 0
@@ -165,6 +177,11 @@ hc_types:   db 'TYPES', 0
 hd_types:   db 'supported column types', 0
 hc_bench:   db 'BENCH <n>', 0
 hd_bench:   db 'insert n synthetic rows, report rows/sec', 0
+
+hc_backup:  db 'BACKUP <file>', 0
+hd_backup:  db 'snapshot this database to <file>', 0
+hc_restore: db 'RESTORE <file>', 0
+hd_restore: db 'reload this database from <file>', 0
 
 hc_help:    db 'HELP', 0
 hd_help:    db 'show this reference', 0
@@ -230,7 +247,7 @@ bnr3:  db '   / __ `/ ___/ __ `__ \/ __  / __ \', 0
 bnr4:  db '  / /_/ (__  ) / / / / / /_/ / /_/ /', 0
 bnr5:  db '  \__,_/____/_/ /_/ /_/\__,_/_.___/ ', 0
 s_tagline:  db '  a minimalist transactional database engine, in x86-64 assembly', 0
-s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL durability  .  ~18 KB', 0
+s_meta:     db '  nasm -f bin  .  no linker  .  no CRT  .  WAL durability  .  ~20 KB', 0
 s_hint_a:   db '  type ', 0
 s_hint_hi1: db 'HELP', 0
 s_hint_b:   db ' for commands, or ', 0
@@ -255,6 +272,9 @@ kw_schema:     db 'SCHEMA', 0
 kw_types:      db 'TYPES', 0
 kw_bench:      db 'BENCH', 0
 kw_find:       db 'FIND', 0
+kw_range:      db 'RANGE', 0
+kw_backup:     db 'BACKUP', 0
+kw_restore:    db 'RESTORE', 0
 
 ; ----------------------------- import table ---------------------------------
                 align 4
@@ -288,6 +308,7 @@ iat_ExitProcess:       dq RVA(h_ExitProcess)
 iat_QueryPerformanceCounter:   dq RVA(h_QueryPerformanceCounter)
 iat_QueryPerformanceFrequency: dq RVA(h_QueryPerformanceFrequency)
 iat_GetSystemTimeAsFileTime:   dq RVA(h_GetSystemTimeAsFileTime)
+iat_GetLastError:      dq RVA(h_GetLastError)
                        dq 0
 
 dll_name: db 'kernel32.dll', 0
@@ -349,3 +370,6 @@ h_QueryPerformanceFrequency: dw 0
                 align 2
 h_GetSystemTimeAsFileTime: dw 0
     db 'GetSystemTimeAsFileTime', 0
+                align 2
+h_GetLastError:      dw 0
+    db 'GetLastError', 0

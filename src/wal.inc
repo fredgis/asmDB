@@ -23,7 +23,7 @@ wal_open:
     sub  rsp, 0x50
     lea  rcx, [rel g_walname]
     mov  rdx, GENERIC_READ | GENERIC_WRITE
-    mov  r8d, 1                      ; FILE_SHARE_READ
+    xor  r8, r8                      ; exclusive - no sharing (single-writer)
     xor  r9, r9
     mov  dword [rsp+0x20], OPEN_ALWAYS
     mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL

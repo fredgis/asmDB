@@ -60,10 +60,13 @@
 %define GENERIC_READ       0x80000000
 %define GENERIC_WRITE      0x40000000
 %define OPEN_ALWAYS        4
+%define OPEN_EXISTING      3
+%define CREATE_ALWAYS      2
 %define FILE_ATTRIBUTE_NORMAL 0x80
 %define FILE_BEGIN         0
 %define ENABLE_VT          0x0004    ; ENABLE_VIRTUAL_TERMINAL_PROCESSING
 %define INVALID_HANDLE     -1
+%define ERROR_SHARING_VIOLATION 32
 
 ; ---- WIN32_FIND_DATAA field offsets ----
 %define FIND_SIZELOW  32
