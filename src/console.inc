@@ -526,12 +526,16 @@ console_getc:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
+.retry:
     mov  rax, [rel g_readpos]
     cmp  rax, [rel g_readlen]
     jb   .have
     call console_fill
     test rax, rax
     jz   .eof
+    jmp  .retry                      ; a BOM skip may have consumed the whole
+                                     ; buffer (first pipe write = the 3-byte BOM
+                                     ; only) - re-check before indexing
 .have:
     mov  rdx, [rel g_readpos]
     mov  rcx, [rel g_readbuf]
