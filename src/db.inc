@@ -191,6 +191,12 @@ db_write_header:
     mov  [rbp-16], rdi
     mov  rax, [rel g_count]
     mov  [rel g_hdr+24], rax
+    mov  rax, [rel g_seq]
+    mov  [rel g_hdr+HDR_SEQ], rax    ; CDC watermark
+    mov  rax, [rel g_reset_pend]
+    mov  [rel g_hdr+HDR_RESETP], rax
+    mov  rax, [rel g_reset_seq]
+    mov  [rel g_hdr+HDR_RESETS], rax
     lea  rdi, [rel g_hdr+HDR_TABLE]
     lea  rsi, [rel g_tablename]
     mov  rcx, TABLE_MAX
@@ -384,6 +390,11 @@ db_init_names:
     call strcpy_z
     lea  rsi, [rel s_dotwal]
     call strcpy_z
+    lea  rdi, [rel g_cdcname]
+    lea  rsi, [rel g_base]
+    call strcpy_z
+    lea  rsi, [rel s_dotcdc]
+    call strcpy_z
     mov  rdi, [rbp-24]
     mov  rsi, [rbp-16]
     mov  rsp, rbp
@@ -440,6 +451,13 @@ db_open:
     cmp  rax, rdx
     ja   .corrupt
     mov  [rel g_count], rax
+    ; CDC metadata (zero on a v1 file that --upgrade has not touched yet)
+    mov  rax, [rel g_hdr_read+HDR_SEQ]
+    mov  [rel g_seq], rax
+    mov  rax, [rel g_hdr_read+HDR_RESETP]
+    mov  [rel g_reset_pend], rax
+    mov  rax, [rel g_hdr_read+HDR_RESETS]
+    mov  [rel g_reset_seq], rax
     ; remember which engine last wrote this file (0 = predates the stamp)
     mov  eax, [rel g_hdr_read+HDR_ENGINE]
     mov  [rel g_writer_ver], rax
@@ -464,9 +482,12 @@ db_open:
     call db_write_header
     call db_flush
 .name_done:
-    ; header is trustworthy: now replay a committed WAL, then load the slots
+    ; header is trustworthy: open the change log, then replay a committed WAL
+    ; (which may still owe the log a frame), then load the slots
+    call cdc_open
     call wal_open
     call wal_recover
+    call cdc_recover_reset           ; finish a RESET a crash cut short
     jmp  .load
 .newfile:
     ; brand-new file: mark it sparse so unwritten slots cost no disk, then set
@@ -493,8 +514,10 @@ db_open:
     test rax, rax
     jnz  io_fatal
     call db_flush
+    call cdc_open
     call wal_open
     call wal_recover                 ; a committed WAL may predate this file
+    call cdc_recover_reset
 .load:
     ; Map the slot region COPY-ON-WRITE instead of committing 1 GiB and reading
     ; it. Reads fault in on demand (a sparse file's holes cost nothing), writes
@@ -670,12 +693,21 @@ db_upgrade:
     call puts
     ; ---- classify ----
     cmp  dword [rel g_hdr_read+8], DB_VERSION
-    jne  .cant
+    ja   .cant                       ; written by a NEWER build - never guess
     cmp  dword [rel g_hdr_read+12], REC_SIZE
-    jne  .cant
+    jne  .cant                       ; a different record layout has no path
     mov  rax, CAPACITY
     cmp  [rel g_hdr_read+16], rax
-    je   .already
+    jne  .migrate
+    cmp  dword [rel g_hdr_read+8], DB_VERSION
+    je   .already                    ; same format and same capacity
+.migrate:
+    ; The CDC metadata is deliberately reset to zero: the migrated file is a new
+    ; lineage, and any consumer of the old change log has to re-snapshot from it
+    ; anyway.
+    mov  qword [rel g_seq], 0
+    mov  qword [rel g_reset_pend], 0
+    mov  qword [rel g_reset_seq], 0
     mov  r13, [rel g_hdr_read+16]    ; old capacity
     ; ---- create the destination ----
     lea  rdi, [rel g_bakname]

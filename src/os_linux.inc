@@ -212,6 +212,31 @@ os_read:
 
 ; ------------------------------- file I/O -----------------------------------
 
+; os_open_shared(rcx = name) -> rax = fd, or -1
+;   Like os_open but WITHOUT the exclusive advisory lock, so a reader process
+;   can follow the file while we append to it. Single-writer is still enforced
+;   by the lock the .dat holds.
+os_open_shared:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
+    mov  rdi, rcx
+    mov  esi, O_RDWR | O_CREAT
+    mov  edx, MODE_0644
+    mov  eax, SYS_open
+    syscall
+    test rax, rax
+    jns  .done
+    mov  rax, -1
+.done:
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; os_open(rcx = name) -> rax = fd, or -1 (sets g_open_locked on lock conflict)
 ;   read/write, create if absent, then an exclusive advisory lock (single writer)
 os_open:

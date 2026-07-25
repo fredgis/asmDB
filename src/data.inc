@@ -19,6 +19,16 @@ g_in_txn:      dq 0
 g_auto_txn:    dq 0                  ; 1 = the open transaction is implicit
 g_writer_ver:  dq 0                  ; engine version that last wrote the open db
 g_upgrade:     dq 0                  ; 1 = --upgrade was passed on the command line
+; ---- change data capture ----
+g_cdc_handle:  dq 0
+g_cdcname:     times 224 db 0
+g_cdcbuf:      dq 0                  ; staging buffer for one frame
+g_cdc_end:     dq 0                  ; append offset = validated length of .cdc
+g_cdc_lastseq: dq 0                  ; highest commit_seq present in .cdc
+g_seq:         dq 0                  ; last_commit_seq published (header +88)
+g_reset_pend:  dq 0                  ; header +96
+g_reset_seq:   dq 0                  ; header +104
+g_txn_reset:   dq 0                  ; this transaction replaced the whole table
 g_undo:        dq 0
 g_undo_n:      dq 0
 g_count_snap:  dq 0
@@ -61,7 +71,11 @@ g_hdr:
     dq 0                             ; +24 live count (rewritten at runtime)
     times HDR_ENGINE-32 db 0         ; +32 table name (rewritten at runtime)
     dd ENGINE_VERSION                ; +80 engine that last wrote this file
-    times HDR_SIZE-(HDR_ENGINE+4) db 0   ; pad to 512
+    dd 0                             ; +84 reserved
+    dq 0                             ; +88 last_commit_seq  (CDC watermark)
+    dq 0                             ; +96 reset_pending
+    dq 0                             ; +104 reset_pending_seq
+    times HDR_SIZE-112 db 0          ; pad to 512
 
 ; ------------------------------- strings ------------------------------------
 ; ANSI SGR colors (emitted only when stdout is a real console).
@@ -84,8 +98,11 @@ s_pat_dat:     db '*.dat', 0
 s_dotwal:      db '.wal', 0
                 align 8
 wal_magic:     db 'ASMWAL01'         ; legacy frame (no checksum) - still replayed
-wal_magic2:    db 'ASMWAL02'         ; current frame: commit marker + CRC32
+wal_magic2:    db 'ASMWAL02'         ; adds the commit marker checksum
+wal_magic3:    db 'ASMWAL03'         ; adds commit_seq + flags for change capture
 wal_commit:    db 'COMMIT01'
+cdc_magic:     db 'ASMCDC01'
+cdc_trailer:   db 'CDCEND01'
 
 s_prompt:      db 'asmdb> ', 0
 s_unknown:     db '[ERR] unknown command - type HELP', 13, 10, 0
@@ -129,7 +146,7 @@ s_fmt_hint:     db '      Written by a different build of asmdb. Open another da
                 db '      (asmdb <name>), or move/remove the file if you no longer need it.', 13, 10, 0
 s_nl:           db 13, 10, 0
 s_ver_pre:      db '  asmdb ', 0
-s_ver_pre10:    db '   (pre-1.0: the on-disk format may still change)', 13, 10, 0
+s_ver_pre10:    db '   (stable: the on-disk format is versioned and migratable)', 13, 10, 0
 s_ver_fmt:      db '  storage format : ', 0
 s_ver_rec:      db '  record size    : ', 0
 s_ver_recb:     db ' bytes', 13, 10, 0
@@ -163,6 +180,16 @@ s_upg_rows:     db ' row(s)', 13, 10, 0
 s_upg_swap:     db '  The original was NOT modified. Check the new file, then swap them:', 13, 10
                 db '    rename <db>.dat to <db>.dat.old, then <db>.upgraded.dat to <db>.dat', 13, 10, 0
 s_err_walcrc:   db '[ERR] write-ahead log is corrupt (checksum mismatch) - refusing to open ', 0
+s_err_walbad:   db '[ERR] write-ahead log holds a committed transaction this build cannot apply - refusing to open ', 0
+s_err_cdc_open: db '[ERR] cannot open the change log (.cdc)', 13, 10, 0
+s_err_cdc_crc:  db '[ERR] change log frame fails its checksum - refusing to open ', 0
+s_err_cdc_seq:  db '[ERR] change log sequence is not strictly increasing - refusing to open ', 0
+s_err_cdc_frame:db '[ERR] change log holds an unreadable frame - refusing to open ', 0
+s_cdc_hint:     db '      The log was NOT modified. Inspect it with tests/cdc_dump.py, or move it', 13, 10
+                db '      aside and re-snapshot the consumer from a fresh BACKUP.', 13, 10, 0
+                align 8
+g_cdc_hdrbuf:   times CDC_HDR_SIZE db 0
+s_dotcdc:       db '.cdc', 0
 s_walcrc_hint:  db '      A committed transaction cannot be replayed safely from a damaged log.', 13, 10
                 db '      Restore from a backup, or delete the .wal file to discard that', 13, 10
                 db '      transaction and open the database as it was at the last checkpoint.', 13, 10, 0

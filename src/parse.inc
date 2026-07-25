@@ -625,12 +625,14 @@ cmd_truncate:
     mov  [rbp-16], rsi
     mov  [rbp-24], rdi
     cmp  qword [rel g_in_txn], 0
-    je   .go
+    je   .autoreset
     ; pass 1 - capture every live row before touching any of them
+    mov  rax, [rel g_undo_n]
+    mov  [rbp-40], rax               ; undo watermark, to unwind a refusal
     xor  rbx, rbx
 .cap:
     cmp  rbx, CAPACITY
-    jae  .go
+    jae  .marked
     mov  rax, rbx
     shl  rax, REC_SHIFT
     add  rax, [rel g_table]
@@ -639,10 +641,21 @@ cmd_truncate:
     mov  rcx, rax
     call txn_capture
     test rax, rax
-    jz   .toobig                     ; nothing cleared yet - safe to abort
+    jz   .unwind                     ; nothing cleared yet - safe to abort
 .capnext:
     inc  rbx
     jmp  .cap
+.marked:
+    ; Inside a transaction the reset is only *declared*; COMMIT turns it into a
+    ; single RESET frame, so a ROLLBACK emits nothing at all.
+    mov  qword [rel g_txn_reset], 1
+    jmp  .go
+.autoreset:
+    ; Outside a transaction this is a durable boundary of its own: announce it
+    ; in the header BEFORE touching the table, so a crash halfway still yields
+    ; exactly one RESET on the next open.
+    call cdc_mark_reset
+    mov  [rbp-48], rax               ; the sequence the RESET will carry
 .go:
     xor  rbx, rbx                    ; index
     mov  qword [rbp-32], 0           ; removed count
@@ -670,9 +683,13 @@ cmd_truncate:
     mov  [rel g_count], rax
     cmp  qword [rel g_in_txn], 0
     jne  .deferred
-    ; autocommit: refresh header row-count and fsync once
+    ; autocommit: refresh header row-count and fsync once, then publish the
+    ; RESET and clear the pending flag - in that order, so the frame is durable
+    ; before we stop advertising that one is owed
     call db_write_header
     call db_flush
+    mov  rcx, [rbp-48]
+    call cdc_finish_reset
 .deferred:
     lea  rcx, [rel s_ok_trunc]
     call puts
@@ -682,6 +699,16 @@ cmd_truncate:
     call puts
     jmp  .tdone
 .toobig:
+    lea  rcx, [rel s_txn_toobig]
+    call puts
+    jmp  .tdone
+.unwind:
+    ; The command changed nothing, so the transaction must look untouched too.
+    ; Leaving the partial captures behind would keep the undo log artificially
+    ; full, make COMMIT stage thousands of unchanged after-images, and (with
+    ; change capture) invent events for rows that never moved.
+    mov  rax, [rbp-40]
+    mov  [rel g_undo_n], rax
     lea  rcx, [rel s_txn_toobig]
     call puts
 .tdone:
@@ -987,9 +1014,15 @@ cmd_backup:
     mov  rax, [rel g_dat_handle]
     mov  [rbp-32], rax               ; saved live handle
     mov  [rel g_dat_handle], rbx
-    ; build the header image exactly as db_write_header would
+    ; build the header image exactly as db_write_header would, so the snapshot
+    ; carries the CDC watermark: a consumer bootstraps by loading a backup and
+    ; then replaying every frame whose commit_seq is greater than this
     mov  rax, [rel g_count]
     mov  [rel g_hdr+24], rax
+    mov  rax, [rel g_seq]
+    mov  [rel g_hdr+HDR_SEQ], rax
+    mov  qword [rel g_hdr+HDR_RESETP], 0
+    mov  qword [rel g_hdr+HDR_RESETS], 0
     lea  rdi, [rel g_hdr+HDR_TABLE]
     lea  rsi, [rel g_tablename]
     mov  rcx, TABLE_MAX
@@ -1106,7 +1139,14 @@ cmd_restore:
     call os_pread
     cmp  rax, 1
     jne  .badtrunc                   ; truncated (or unreadable) backup
-    ; validated - now it is safe to overwrite the live table
+    ; validated - now it is safe to overwrite the live table. Announce the reset
+    ; first (a whole-table replacement is one CDC boundary, not N events), which
+    ; must be written through the LIVE handle, not the read-only backup.
+    mov  rax, [rbp-32]
+    mov  [rel g_dat_handle], rax
+    call cdc_mark_reset
+    mov  [rbp-48], rax
+    mov  [rel g_dat_handle], rbx     ; back to the backup to read the region
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
     mov  r8, CAPACITY*REC_SIZE
@@ -1129,6 +1169,8 @@ cmd_restore:
     cmp  rax, rdx
     jne  io_fatal
     call db_flush
+    mov  rcx, [rbp-48]
+    call cdc_finish_reset
     lea  rcx, [rel s_ok_restore]
     call puts
     jmp  .done
@@ -1201,7 +1243,10 @@ cmd_bench:
 .ncap:
     mov  r12, rax                    ; r12 = n
     mov  [rbp-64], rax               ; n_local
-    ; reset the table: clear every slot, count = 0
+    ; reset the table: clear every slot, count = 0. A synthetic reload replaces
+    ; the whole table, so it is one RESET for change consumers.
+    call cdc_mark_reset
+    mov  [rbp-104], rax
     mov  qword [rel g_count], 0
     mov  rdi, [rel g_table]
     mov  rcx, CAPACITY*REC_SIZE
@@ -1263,6 +1308,8 @@ cmd_bench:
     jne  io_fatal
     call db_write_header
     call db_flush
+    mov  rcx, [rbp-104]
+    call cdc_finish_reset
     call os_perf_counter
     mov  [rel g_qpc2], rax
     ; ram_ticks = qpc1 - qpc0 (floor at 1 to avoid divide-by-zero)
@@ -1462,13 +1509,8 @@ cmd_version:
     call puts
     mov  ecx, ENGINE_VERSION
     call put_ver
-%if ENGINE_MAJOR == 0
     lea  rcx, [rel s_ver_pre10]
     call puts
-%else
-    lea  rcx, [rel s_nl]
-    call puts
-%endif
     lea  rcx, [rel s_ver_fmt]
     call puts
     mov  ecx, DB_VERSION

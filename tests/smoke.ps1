@@ -190,8 +190,9 @@ try {
         Check 'WAL replay into a new .dat: count'  ($r9d -match '\[ OK \] 1 row\(s\)')
         Check 'WAL replay into a new .dat: in RAM' ($r9d -match 'content\s+:\s+recovered-into-memory')
 
-        # a WAL entry addressing a slot outside the table must be rejected
-        # wholesale rather than written at an arbitrary file offset
+        # a WAL entry addressing a slot outside the table carries a valid marker
+        # and checksum, so it IS an acknowledged commit - it must be refused and
+        # KEPT, never silently thrown away
         $bad = [Collections.Generic.List[byte]]::new()
         $bad.AddRange([Text.Encoding]::ASCII.GetBytes('ASMWAL01'))
         $bad.AddRange([BitConverter]::GetBytes([uint64]1))          # N = 1
@@ -200,9 +201,11 @@ try {
         $bad.AddRange((New-Object byte[] 256))                      # after-image
         $bad.AddRange([Text.Encoding]::ASCII.GetBytes('COMMIT01'))
         [IO.File]::WriteAllBytes((Join-Path $work 'ft.wal'), $bad.ToArray())
-        $r9e = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe ft
+        $ftSize = (Get-Item (Join-Path $work 'ft.wal')).Length
+        $r9e = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe ft 2>&1
         $code9e = $LASTEXITCODE
-        Check 'out-of-range WAL index discarded' ($code9e -eq 0 -and (($r9e -join "`n") -match '\[ OK \] 0 row\(s\)'))
+        Check 'out-of-range WAL index refused'  ($code9e -ne 0 -and (($r9e -join "`n") -match 'cannot apply'))
+        Check 'out-of-range WAL is kept'        ((Get-Item (Join-Path $work 'ft.wal')).Length -eq $ftSize)
         Check 'out-of-range WAL did not grow .dat' ((Get-Item (Join-Path $work 'ft.dat')).Length -eq (512 + 4194304 * 256))
 
         # Run 10: WAL frame checksums.
@@ -298,7 +301,7 @@ try {
     $r13 = (@('INSERT 1 1 a x', 'VERSION', 'EXIT') -join "`n") | .\asmdb.exe verdb
     $r13 = $r13 -join "`n"
     Check 'VERSION reports the engine'   ($r13 -match 'asmdb\s+\d+\.\d+\.\d+')
-    Check 'VERSION reports the format'   ($r13 -match 'storage format\s+:\s+1')
+    Check 'VERSION reports the format'   ($r13 -match 'storage format\s+:\s+2')
     Check 'VERSION stamps the writer'    ($r13 -match 'written by\s+:\s+engine\s+\d+\.\d+\.\d+')
     Check 'banner shows the version'     ($r13 -match 'v\d+\.\d+\.\d+')
     $r13b = (@('VERSION', 'EXIT') -join "`n") | .\asmdb.exe verdb
@@ -346,6 +349,129 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
         Check 'upgrade no-ops when current' ($noop -match 'already in the current format')
     } else {
         Write-Host "  [SKIP] upgrade checks (python not found)" -ForegroundColor Yellow
+    }
+
+    # ---------------------------------------------------------------------
+    # Run 15: change data capture
+    # ---------------------------------------------------------------------
+    $dump = Join-Path $root 'tests\cdc_dump.py'
+    if ($py) {
+        function CdcJson($base) {
+            $out = & python $dump (Join-Path $work "$base.cdc") --json 2>&1
+            if ($LASTEXITCODE -ne 0) { return $null }
+            return ($out -join "`n") | ConvertFrom-Json
+        }
+
+        # 15a the shape of the log: one event per row per transaction, carrying
+        #     the FINAL image; a rollback contributes nothing
+        (@(
+            'INSERT 1 100 alpha premiere', 'INSERT 2 200 beta deuxieme',
+            'UPDATE 1 111 alpha modifiee', 'DELETE 2',
+            'BEGIN', 'INSERT 3 300 gamma dans txn', 'UPDATE 3 333 gamma encore', 'COMMIT',
+            'BEGIN', 'INSERT 4 400 delta annulee', 'ROLLBACK',
+            'EXIT') -join "`n") | .\asmdb.exe cdc1 | Out-Null
+        $j = CdcJson 'cdc1'
+        Check 'CDC log validates'            ($null -ne $j)
+        if ($j) {
+            Check 'CDC one frame per commit'  ($j.frames.Count -eq 5)
+            Check 'CDC sequence is monotonic' (@($j.frames.seq) -join ',') -eq '1,2,3,4,5'
+            Check 'CDC update -> single UPSERT with final image' (
+                $j.frames[2].ops.Count -eq 1 -and $j.frames[2].ops[0].op -eq 'UPSERT' -and $j.frames[2].ops[0].value -eq 111)
+            Check 'CDC delete -> DELETE event' (
+                $j.frames[3].ops[0].op -eq 'DELETE' -and $j.frames[3].ops[0].id -eq 2)
+            Check 'CDC txn collapses to one final UPSERT' (
+                $j.frames[4].ops.Count -eq 1 -and $j.frames[4].ops[0].value -eq 333)
+            Check 'CDC rollback emits nothing'  ($j.last_seq -eq 5)
+        }
+
+        # 15b a transaction that ends where it started produces no frame and
+        #     consumes no sequence
+        (@('BEGIN', 'INSERT 9 900 x ephemere', 'DELETE 9', 'COMMIT', 'EXIT') -join "`n") | .\asmdb.exe cdc1 | Out-Null
+        $j2 = CdcJson 'cdc1'
+        Check 'CDC insert+delete in one txn is a no-op' ($j2.last_seq -eq 5 -and $j2.frames.Count -eq 5)
+
+        # 15c sequence keeps climbing across restarts
+        (@('INSERT 10 10 z apres redemarrage', 'EXIT') -join "`n") | .\asmdb.exe cdc1 | Out-Null
+        $j3 = CdcJson 'cdc1'
+        Check 'CDC sequence survives a restart' ($j3.last_seq -eq 6)
+
+        # 15d the three whole-table operations are ONE reset each, never N events
+        (@('INSERT 1 1 a un', 'INSERT 2 2 b deux', 'BACKUP snap2.bak',
+           'TRUNCATE', 'RESTORE snap2.bak', 'BENCH 1000', 'EXIT') -join "`n") | .\asmdb.exe cdc2 | Out-Null
+        $j4 = CdcJson 'cdc2'
+        Check 'CDC RESET log validates'  ($null -ne $j4)
+        if ($j4) {
+            $resets = @($j4.frames | Where-Object { $_.reset })
+            Check 'CDC three global ops -> three RESETs' ($resets.Count -eq 3)
+            Check 'CDC BENCH is one frame, not 1000'     ($j4.frames.Count -eq 5)
+            Check 'CDC RESET carries no operations'      (($resets | ForEach-Object { $_.ops.Count } | Sort-Object -Unique) -eq 0)
+        }
+
+        # 15e a torn trailing frame is trimmed on open; a COMPLETE frame with a
+        #     bad checksum is corruption and must be refused, log kept
+        $cdcPath = Join-Path $work 'cdc1.cdc'
+        $bytes = [IO.File]::ReadAllBytes($cdcPath)
+        [IO.File]::WriteAllBytes($cdcPath, $bytes + (New-Object byte[] 40))   # torn tail
+        $r15 = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cdc1 2>&1
+        Check 'CDC torn tail is trimmed' ($LASTEXITCODE -eq 0 -and (Get-Item $cdcPath).Length -eq $bytes.Length)
+        $b2 = [IO.File]::ReadAllBytes($cdcPath)
+        $b2[60] = $b2[60] -bxor 0xFF                                          # corrupt frame 1's payload
+        [IO.File]::WriteAllBytes($cdcPath, $b2)
+        $sizeBad = (Get-Item $cdcPath).Length
+        $r15b = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cdc1 2>&1
+        Check 'CDC bad checksum refused'  ($LASTEXITCODE -ne 0 -and ($r15b -join "`n") -match 'checksum')
+        Check 'CDC bad checksum kept log' ((Get-Item $cdcPath).Length -eq $sizeBad)
+
+        # 15f snapshot + watermark: a consumer loads a BACKUP, reads its
+        #     last_commit_seq, and resumes from the frames after it
+        (@('INSERT 1 1 a un', 'INSERT 2 2 b deux', 'BACKUP wm.bak',
+           'INSERT 3 3 c trois', 'INSERT 4 4 d quatre', 'EXIT') -join "`n") | .\asmdb.exe cdc3 | Out-Null
+        $bak = [IO.File]::ReadAllBytes((Join-Path $work 'wm.bak'))[0..127]
+        $watermark = [BitConverter]::ToUInt64($bak, 88)
+        Check 'BACKUP carries the CDC watermark' ($watermark -eq 2)
+        $tail = & python $dump (Join-Path $work 'cdc3.cdc') --json --from-seq $watermark 2>&1
+        $tj = ($tail -join "`n") | ConvertFrom-Json
+        Check 'resume from watermark yields exactly the new rows' ($tj.frames.Count -eq 2)
+
+        # 15g crash between the WAL commit and the change frame: the commit is
+        #     acknowledged, so recovery owes the log a frame - exactly one
+        if ($nasm) {
+            $nocdc = Join-Path $work 'nocdc.exe'
+            Push-Location (Join-Path $root 'src')
+            & $nasm -f bin '-dFAULT_CDC' main.asm -o $nocdc 2>&1 | Out-Null
+            Pop-Location
+            (@('INSERT 1 100 a premiere', 'EXIT') -join "`n") | .\asmdb.exe crash1 | Out-Null
+            (@('INSERT 2 200 b deuxieme', 'EXIT') -join "`n") | & $nocdc crash1 2>&1 | Out-Null
+            $jc = CdcJson 'crash1'
+            Check 'crash before the frame leaves it missing' ($jc.frames.Count -eq 1)
+            (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe crash1 | Out-Null
+            $jc2 = CdcJson 'crash1'
+            Check 'recovery publishes the missing frame' ($jc2.frames.Count -eq 2 -and $jc2.last_seq -eq 2)
+            (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe crash1 | Out-Null
+            $jc3 = CdcJson 'crash1'
+            Check 'recovery never duplicates a frame' ($jc3.frames.Count -eq 2)
+
+            # 15h crash in the middle of a RESET: reset_pending survives, and the
+            #     next open publishes exactly one RESET however often it reopens
+            foreach ($n in 2, 3, 4) {
+                $fj = Join-Path $work "fj$n.exe"
+                Push-Location (Join-Path $root 'src')
+                & $nasm -f bin "-dFAULT_INJECT=$n" main.asm -o $fj 2>&1 | Out-Null
+                Pop-Location
+                $db = "rst$n"
+                (@('INSERT 1 1 a un', 'INSERT 2 2 b deux', 'EXIT') -join "`n") | .\asmdb.exe $db | Out-Null
+                (@('TRUNCATE', 'EXIT') -join "`n") | & $fj $db 2>&1 | Out-Null
+                (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe $db | Out-Null
+                (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe $db | Out-Null
+                $jr = CdcJson $db
+                $nres = @($jr.frames | Where-Object { $_.reset }).Count
+                Check "RESET survives a crash at write #$n (exactly one, got $nres)" ($nres -eq 1)
+            }
+        } else {
+            Write-Host "  [SKIP] CDC crash checks (nasm not found)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  [SKIP] CDC checks (python not found)" -ForegroundColor Yellow
     }
 }
 finally {

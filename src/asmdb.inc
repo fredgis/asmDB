@@ -94,19 +94,49 @@
 ; The engine version that last wrote a file is stamped into the header at
 ; HDR_ENGINE purely for diagnostics: it tells you which build touched a
 ; database, without ever affecting whether it can be opened.
-%define ENGINE_MAJOR 0
-%define ENGINE_MINOR 9
+%define ENGINE_MAJOR 1
+%define ENGINE_MINOR 0
 %define ENGINE_PATCH 0
 %define ENGINE_VERSION ((ENGINE_MAJOR << 16) | (ENGINE_MINOR << 8) | ENGINE_PATCH)
 
 ; ---- On-disk ----
 %define HDR_SIZE   512
-%define DB_VERSION 1
+%define DB_VERSION 2          ; v2 adds the CDC metadata below
 %define HDR_TABLE  32         ; table-name field offset in the header
 %define TABLE_MAX  48         ; max table-name length
 %define HDR_ENGINE 80         ; u32: engine version that last wrote this file
+%define HDR_SEQ    88         ; u64: last_commit_seq published to the CDC log
+%define HDR_RESETP 96         ; u64: 1 = a global RESET is mid-flight
+%define HDR_RESETS 104        ; u64: the sequence that RESET will carry
+
+; ---- Change data capture (<db>.cdc) ----
+; Append-only log, one frame per committed transaction that changed something.
+;   +0    8   magic 'ASMCDC01'
+;   +8    8   frame_size (whole frame, magic..trailer)
+;   +16   8   commit_seq (strictly increasing, starts at 1)
+;   +24   8   op_count
+;   +32   8   flags (bit 0 = RESET)
+;   +40   op_count * CDC_OP_SIZE
+;   +X    8   crc32 of [0, X), zero-extended
+;   +X+8  8   trailer 'CDCEND01'
+; Operations are fixed-size so a reader never has to guess:
+;   +0    8   op_type (1 = UPSERT, 2 = DELETE)
+;   +8    8   id
+;   +16 256   record image (all zero for DELETE)
+%define CDC_HDR_SIZE   40
+%define CDC_TAIL_SIZE  16
+%define CDC_OP_SIZE    (16 + REC_SIZE)
+%define CDC_OP_UPSERT  1
+%define CDC_OP_DELETE  2
+%define CDC_FLAG_RESET 1
 
 ; ---- WAL record tags ----
 %define WAL_BEGIN  1
 %define WAL_WRITE  2
 %define WAL_COMMIT 3
+
+; ---- WAL frame header sizes ----
+; v01/v02: magic, N, count.  v03 adds the CDC commit sequence and frame flags,
+; so recovery can republish a change frame that a crash lost.
+%define WAL_HDR_V2 24
+%define WAL_HDR_V3 40

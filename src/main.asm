@@ -110,6 +110,9 @@ entry:
     mov  rcx, WAL_BUF_SIZE
     call valloc_req
     mov  [rel g_walbuf], rax
+    mov  rcx, WAL_BUF_SIZE
+    call valloc_req
+    mov  [rel g_cdcbuf], rax         ; one CDC frame at a time
 
     mov  qword [rel g_readpos], 0
     mov  qword [rel g_readlen], 0
@@ -166,6 +169,7 @@ repl_loop:
 %include "store.inc"
 %include "db.inc"
 %include "wal.inc"
+%include "cdc.inc"
 %ifdef LINUX
 %include "os_linux.inc"
 %else

@@ -7,7 +7,7 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). ~27 KB. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). ~30 KB. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -17,7 +17,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-~27%20KB%20PE%20%2F%20~36%20KB%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-~30%20KB%20PE%20%2F%20~39%20KB%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -70,6 +70,7 @@ writing a database in assembly.
 - [Commands](#commands) — summary; full [command dictionary](docs/COMMANDS.md)
 - [Data model & supported types](#data-model--supported-types)
 - [MCP server & the CRUD interface](#mcp-server--the-crud-interface)
+- [Change data capture](#change-data-capture) — a durable log of every change
 - [How asmdb works](#how-asmdb-works) — the 60-second version, then a deep dive
 - [On-disk format: `.dat` and `.wal`](#on-disk-format-dat-and-wal)
 - [Performance](#performance) — benchmarks vs SQLite
@@ -139,8 +140,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~27 KB</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~36 KB</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~30 KB</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~39 KB</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -272,8 +273,44 @@ cd mcp && npm install && npm test      # end-to-end test against a scratch DB
 See [`mcp/README.md`](mcp/README.md) for client registration (Claude / VS Code /
 Copilot) and configuration.
 
-## How asmdb works
+## Change data capture
 
+Every committed transaction that changes something appends **one frame** to a
+durable, append-only **`<db>.cdc`** log. Another process can follow it to mirror
+the table, feed a queue, or drive a materialised view — no network protocol, no
+library to link against, no daemon.
+
+```text
+> python tests/cdc_dump.py sales.cdc
+Frame seq=1 op_count=1 flags=0 size=328 offset=0
+  UPSERT id=1 value=100 tag=alpha content=premiere
+Frame seq=2 op_count=1 flags=0 size=328 offset=328
+  UPSERT id=1 value=111 tag=alpha content=modifiee
+Frame seq=3 op_count=1 flags=0 size=328 offset=656
+  DELETE id=2
+Frame seq=4 op_count=0 flags=RESET size=56 offset=984
+```
+
+What the log is careful about:
+
+- **Nothing is lost.** The frame is durable *before* the change reaches
+  `<db>.dat`, so recovery can only ever owe the log a frame — never the reverse.
+  Crash in that exact window and the next open publishes it, exactly once.
+- **One event per row per transaction, carrying the final image.** Three updates
+  to a row in one transaction produce one `UPSERT` with the last value.
+  Inserting then deleting it produces **nothing**, and burns no sequence number.
+- **`RESET`, not a flood.** `TRUNCATE`, `RESTORE` and `BENCH` replace the whole
+  table, so each emits a single `RESET` telling the consumer to re-snapshot —
+  `BENCH 1000` is one frame, not a thousand.
+- **Bootstrap without a gap.** `BACKUP` carries `last_commit_seq`, so a consumer
+  loads a snapshot, reads its watermark, and resumes from the frames after it.
+- **Torn vs corrupt.** A trailing frame cut short by a crash is trimmed; a
+  *complete* frame that fails its checksum refuses the open and is kept.
+
+Full byte layout and recovery protocol: **[`docs/CDC.md`](docs/CDC.md)**.
+`tests/cdc_dump.py` is a dependency-free reference reader.
+
+## How asmdb works
 ### The 60-second version
 
 Picture a huge coat-check with **4,194,304 numbered hooks**. To store a row, asmdb
@@ -313,7 +350,7 @@ flowchart LR
 
 ### The deep dive
 
-How ~27 KB of assembly becomes a durable database.
+How ~30 KB of assembly becomes a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -326,7 +363,7 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the binaries stay ~27 KB (PE) / ~36 KB (ELF) on disk — and why a
+which is why the binaries stay ~30 KB (PE) / ~39 KB (ELF) on disk — and why a
 million-row database needs only a few MB of RAM.
 
 #### The record store — four cache lines per row
@@ -665,23 +702,74 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 
 ## Changelog
 
-Versions follow `MAJOR.MINOR.PATCH`. **While `MAJOR` is `0` the engine is
-pre-1.0**: `MINOR` marks a milestone or a behaviour change, `PATCH` marks fixes,
-performance and docs. 1.0 is declared deliberately, not reached automatically —
-until then the on-disk format may still change.
+<details>
+<summary><b>Release history</b> — 1.0.0 · 0.9.0 · 0.8.0 · … (click to expand)</summary>
+
+Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
+format does**, so a major bump is the signal that `--upgrade` has work to do.
+`MINOR` marks a feature or a behaviour change, `PATCH` marks fixes,
+performance and docs.
 
 Two numbers are tracked separately and should not be confused:
 
 | | What it is | How often it moves | Effect |
 |---|---|---|---|
-| **Engine version** | the software (`0.9.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
-| **Storage format** | the byte layout of `<db>.dat` (`1`) | almost never | decides whether a file can be opened at all, and what `--upgrade` has to migrate |
+| **Engine version** | the software (`1.0.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
+| **Storage format** | the byte layout of `<db>.dat` (`2`) | rarely | decides whether a file can be opened, and what `--upgrade` migrates |
 
 Run `VERSION` inside the REPL to see both, plus which engine last wrote the open
 database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
-Newest first. Every entry is collapsed — click one to expand it.
+Newest first — click a version to expand it.
+
+<details>
+<summary><b>1.0.0</b> — change data capture, and the format that makes it stable</summary>
+
+**Change data capture.** Every committed transaction that changes something
+appends one frame to a durable, append-only **`<db>.cdc`** log. An external
+process can follow it without touching the engine — see
+[`docs/CDC.md`](docs/CDC.md) for the byte layout and the recovery protocol, and
+`tests/cdc_dump.py` for a reference reader.
+
+What the log guarantees:
+
+- **Total order.** `commit_seq` is strictly increasing and survives restarts.
+- **Nothing is lost.** The frame is durable *before* the change reaches
+  `<db>.dat`, so recovery can only ever owe the log a frame, never the reverse.
+  Verified by crashing in that exact window: the next open publishes the missing
+  frame, and reopening again does not duplicate it.
+- **One event per row per transaction, carrying the final image.** Updating a
+  row three times in one transaction yields one `UPSERT` with the last value;
+  inserting then deleting it in the same transaction yields *nothing at all* and
+  consumes no sequence, because the comparison is logical rather than byte-wise.
+- **`RESET` instead of a flood.** `TRUNCATE`, `RESTORE` and `BENCH` replace the
+  whole table, so each emits a single `RESET` telling the consumer to
+  re-snapshot — `BENCH 1000` is one frame, not a thousand. A reset is announced
+  in the header before the table is touched and cleared only once its frame is
+  durable, so a crash halfway still yields exactly one.
+- **Bootstrap from a snapshot.** `BACKUP` now carries `last_commit_seq`, so a
+  consumer loads a backup, reads its watermark, and resumes from the frames
+  after it.
+
+Opening the log validates it: a torn trailing frame (a crash mid-append) is
+trimmed, but a **complete** frame with a bad checksum, or a sequence that does
+not strictly increase, refuses the open and keeps the file.
+
+**Storage format 2** adds `last_commit_seq` and the reset state to the header.
+`--upgrade` migrates a format-1 database and resets the change metadata, since a
+migrated file starts a new lineage.
+
+**Two audit fixes that landed first.** A refused `TRUNCATE` inside a transaction
+left its partial captures in the undo log, which would have invented events for
+rows that never moved — it now unwinds to the watermark. And a committed WAL
+frame whose *contents* were impossible (a slot outside the table) was still
+being discarded; once the marker and checksum validate, the transaction is
+acknowledged, so the engine now refuses to open and **keeps** the log rather
+than erasing a commit.
+
+Tests: 78 → 102 checks per platform.
+</details>
 
 <details>
 <summary><b>0.9.0</b> — crash-atomic autocommit, WAL read safety, versioning &amp; <code>--upgrade</code></summary>
@@ -887,6 +975,8 @@ store over fixed 256-byte records, disk persistence, a write-ahead log with
 `BEGIN`/`COMMIT`/`ROLLBACK`, and idempotent crash recovery at startup.
 </details>
 
+</details>
+
 ## Upgrading a database
 
 asmdb refuses to open a `.dat` it does not fully understand rather than
@@ -933,12 +1023,12 @@ Rules:
 
 ```
 asmdb/
-  src/          main.asm + .inc modules (console, parse, store, db, wal, data)
+  src/          main.asm + .inc modules (console, parse, store, db, wal, cdc, data)
                 + os_win.inc / os_linux.inc / elf.inc (platform backends)
   mcp/          Model Context Protocol server (generic CRUD tools) + tests
   clients/      stdio client examples: Python, C#, C
   examples/     seed-salesdb.ps1 sample loader, bench.ps1 + bench_sqlite.py
-  tests/        smoke.ps1 / smoke.sh, validate_elf.py, make_wal.py fixture
+  tests/        smoke.ps1 / smoke.sh, validate_elf.py, make_wal.py, cdc_dump.py
   docs/         ENGINE.md spec, SAAS.md plan, COMMANDS.md dictionary, assets/
   poc/          minimal 752-byte PE64 proof-of-concept
   build.ps1     locates NASM, assembles the PE64 (or the ELF64 with -Linux)

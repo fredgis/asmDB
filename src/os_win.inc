@@ -150,6 +150,25 @@ os_open:
     mov  qword [rel g_open_locked], 1
     jmp  .ret
 
+; os_open_shared(rcx = name) -> rax = handle, or -1
+;   Like os_open, but lets other processes READ the file while we hold it open
+;   for writing. Used for <db>.cdc so a change consumer can follow the log
+;   live; there is still only ever one writer, since the .dat lock is exclusive.
+os_open_shared:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50
+    mov  rdx, GENERIC_READ | GENERIC_WRITE
+    mov  r8d, 1                      ; FILE_SHARE_READ
+    xor  r9, r9
+    mov  dword [rsp+0x20], OPEN_ALWAYS
+    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
+    mov  qword [rsp+0x30], 0
+    call [rel iat_CreateFileA]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; os_create(rcx = name) -> rax = handle, or -1  (create/truncate, read/write)
 os_create:
     push rbp

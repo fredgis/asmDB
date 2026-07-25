@@ -176,9 +176,15 @@ buf += bytes(256)                    # after-image
 buf += b'COMMIT01'
 open('ft.wal', 'wb').write(buf)
 PY
-    r9e="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb ft)"; code9e=$?
-    check 'out-of-range WAL index discarded' '\[ OK \] 0 row\(s\)'         "$r9e"
-    if [[ $code9e -eq 0 && "$(stat -c%s ft.dat)" == "$((512 + 4194304 * 256))" ]]; then
+    r9e="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb ft 2>&1)"; code9e=$?
+    ft_size="$(stat -c%s ft.wal)"
+    check 'out-of-range WAL index refused' 'cannot apply'                  "$r9e"
+    if [[ $code9e -ne 0 && "$(stat -c%s ft.wal)" == "$ft_size" ]]; then
+        echo "  [PASS] out-of-range WAL is kept"
+    else
+        echo "  [FAIL] out-of-range WAL is kept"; fail=$((fail+1))
+    fi
+    if [[ "$(stat -c%s ft.dat)" == "$((512 + 4194304 * 256))" ]]; then
         echo "  [PASS] out-of-range WAL did not grow .dat"
     else
         echo "  [FAIL] out-of-range WAL did not grow .dat"; fail=$((fail+1))
@@ -254,7 +260,7 @@ fi
 # Run 13: engine version is reported, and stamped into the database
 r13="$(printf '%s\n' 'INSERT 1 1 a x' 'VERSION' 'EXIT' | ./asmdb verdb)"
 check 'VERSION reports the engine' 'asmdb[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+'          "$r13"
-check 'VERSION reports the format' 'storage format[[:space:]]+:[[:space:]]+1'         "$r13"
+check 'VERSION reports the format' 'storage format[[:space:]]+:[[:space:]]+2'         "$r13"
 check 'VERSION stamps the writer'  'written by[[:space:]]+:[[:space:]]+engine[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' "$r13"
 check 'banner shows the version'   'v[0-9]+\.[0-9]+\.[0-9]+'                          "$r13"
 r13b="$(printf '%s\n' 'VERSION' 'EXIT' | ./asmdb verdb)"

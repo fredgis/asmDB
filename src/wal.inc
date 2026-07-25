@@ -172,7 +172,13 @@ wal_recover:
     cmp  r12, 24
     jb   .clear
     mov  rbx, [rel g_walbuf]
-    mov  qword [rbp-40], 0           ; 1 -> v02 frame, checksum to verify
+    mov  qword [rbp-40], 0           ; 1 -> checksum present (v02/v03)
+    mov  qword [rbp-48], WAL_HDR_V2  ; entry base
+    mov  qword [rbp-56], 0           ; commit_seq (v03 only)
+    mov  qword [rbp-64], 0           ; flags (v03 only)
+    mov  rax, [rel wal_magic3]
+    cmp  rax, [rbx]
+    je   .v3
     mov  rax, [rel wal_magic2]
     cmp  rax, [rbx]
     je   .v2
@@ -180,16 +186,24 @@ wal_recover:
     cmp  rax, [rbx]
     jne  .clear
     jmp  .magic_ok
+.v3:
+    mov  qword [rbp-40], 1
+    mov  qword [rbp-48], WAL_HDR_V3
+    mov  rax, [rbx+24]
+    mov  [rbp-56], rax               ; commit_seq
+    mov  rax, [rbx+32]
+    mov  [rbp-64], rax               ; flags
+    jmp  .magic_ok
 .v2:
     mov  qword [rbp-40], 1
 .magic_ok:
     mov  rsi, [rbx+8]                ; N
     cmp  rsi, UNDO_MAX
     ja   .clear
-    ; marker offset = 24 + N*72
+    ; marker offset = entry base + N * UNDO_ENTRY
     mov  rax, rsi
     imul rax, rax, UNDO_ENTRY
-    add  rax, 24                     ; rax = marker offset
+    add  rax, [rbp-48]               ; rax = marker offset
     mov  rdi, rax                    ; save marker offset
     add  rax, 8
     cmp  r12, rax                    ; need marker fully present
@@ -214,22 +228,26 @@ wal_recover:
     cmp  rax, [rdx+8]
     jne  .crcbad
 .crc_ok:
-    ; every slot index must address a real slot. A corrupt frame could otherwise
-    ; make the redo below write REC_SIZE bytes at an arbitrary file offset,
-    ; growing the .dat past its region (and the redo aborts the process on the
-    ; failures that produces). Validate the whole frame before touching disk.
+    ; From here the frame carries a valid marker AND a valid checksum, so the
+    ; transaction WAS committed and acknowledged. Anything wrong with its
+    ; contents from now on is a refusal to open, never a discard: dropping the
+    ; log would silently erase an acknowledged commit.
+    ;
+    ; Every slot index must address a real slot - otherwise the redo below would
+    ; write REC_SIZE bytes at an arbitrary file offset, growing the .dat past
+    ; its region.
     xor  r12, r12
 .chk:
     cmp  r12, rsi
     jae  .chk_done
     mov  rax, r12
     imul rax, rax, UNDO_ENTRY
-    add  rax, 24
+    add  rax, [rbp-48]
     add  rax, rbx                    ; entry ptr
     mov  rdx, [rax]                  ; slot index
     mov  rcx, CAPACITY
     cmp  rdx, rcx
-    jae  .clear                      ; out of range -> discard the whole frame
+    jae  .impossible                 ; committed but unusable -> stop, keep log
     inc  r12
     jmp  .chk
 .chk_done:
@@ -237,7 +255,19 @@ wal_recover:
     mov  rax, [rbx+16]
     mov  rcx, CAPACITY
     cmp  rax, rcx
-    ja   .clear
+    ja   .impossible
+    ; The frame is committed and applicable. Publish it to the change log first
+    ; if the crash happened before that step - cdc_emit_from_wal is a no-op when
+    ; the sequence is already there, so replaying is safe any number of times.
+    cmp  qword [rbp-56], 0
+    je   .apply_start                ; pre-v03 frame: nothing to publish
+    mov  rcx, rbx
+    add  rcx, [rbp-48]               ; entries
+    mov  rdx, rsi                    ; N
+    mov  r8, [rbp-56]                ; commit_seq
+    mov  r9, [rbp-64]                ; flags
+    call cdc_emit_from_wal
+.apply_start:
     ; committed: apply after-images to asmdb.dat
     xor  r12, r12                    ; i
 .apply:
@@ -245,7 +275,7 @@ wal_recover:
     jae  .apply_done
     mov  rax, r12
     imul rax, rax, UNDO_ENTRY
-    add  rax, 24
+    add  rax, [rbp-48]
     add  rax, rbx                    ; entry ptr
     mov  rdi, [rax]                  ; index
     lea  rdx, [rax+8]                ; image ptr
@@ -261,6 +291,11 @@ wal_recover:
 .apply_done:
     mov  rax, [rbx+16]               ; new live count
     mov  [rel g_count], rax
+    mov  rax, [rbp-56]
+    test rax, rax
+    jz   .nowm
+    mov  [rel g_seq], rax            ; publish the recovered watermark
+.nowm:
     call db_write_header
     call db_flush
 .clear:
@@ -278,6 +313,21 @@ wal_recover:
     ; it would write corrupt records; discarding it would silently lose an
     ; acknowledged transaction. Neither is acceptable, so stop and say so.
     lea  rcx, [rel s_err_walcrc]
+    call puts
+    lea  rcx, [rel g_walname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_walcrc_hint]
+    call puts
+    mov  ecx, 1
+    call os_exit
+.impossible:
+    ; Committed and intact, but describing something this build cannot apply -
+    ; a slot outside the table, or a row count larger than the table. Keep the
+    ; log and stop, exactly as for a checksum failure: the one thing we must
+    ; never do with an acknowledged commit is throw it away.
+    lea  rcx, [rel s_err_walbad]
     call puts
     lea  rcx, [rel g_walname]
     call puts
@@ -386,31 +436,39 @@ cmd_begin:
     pop  rbp
     ret
 
-; txn_flush() - make the open transaction durable and checkpoint it into the
-;   .dat: stage after-images into the WAL, flush, write the commit marker plus
-;   its checksum, flush again (the transaction is committed at that instant),
-;   then apply the images, publish the count and truncate the log.
-;   Shared by the explicit COMMIT and by autocommit, so a single-statement
-;   mutation gets exactly the same crash guarantees as a multi-statement one.
-;   Clears g_in_txn / g_undo_n. Prints nothing.
+; txn_flush() - make the open transaction durable, publish it to the change log,
+;   then checkpoint it into the .dat.
+;
+;   The order is what buys the CDC guarantees:
+;     1. stage only the slots that ACTUALLY changed, with their final image;
+;     2. write the WAL frame (carrying commit_seq and flags) and flush;
+;     3. write the commit marker + checksum and flush - committed at this point;
+;     4. append the change frame and flush - so an acknowledged commit is in the
+;        log BEFORE it is in the data file, and recovery can only ever have to
+;        add a frame, never remove one;
+;     5. apply the images to the .dat;
+;     6. publish last_commit_seq in the header and flush;
+;     7. truncate the WAL.
+;
+;   Staging only real changes is what makes step 4 exact: the after-image's
+;   status says UPSERT or DELETE, so the commit path and the recovery path build
+;   byte-identical frames. A transaction that changed nothing produces no frame
+;   and consumes no sequence.
+;   Shared by explicit COMMIT and by autocommit. Clears the transaction state.
 txn_flush:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x60
+    sub  rsp, 0x70
     mov  [rbp-8], rbx
     mov  [rbp-16], rsi
     mov  [rbp-24], rdi
     mov  [rbp-32], r12
+    mov  [rbp-40], r13
     mov  rbx, [rel g_walbuf]
-    mov  rax, [rel wal_magic2]
-    mov  [rbx], rax                  ; +0 magic
-    mov  rax, [rel g_undo_n]
-    mov  [rbx+8], rax                ; +8 N
-    mov  rax, [rel g_count]
-    mov  [rbx+16], rax               ; +16 new count
-    ; stage after-images from the live table
-    xor  r12, r12                    ; i
-    lea  rdi, [rbx+24]               ; dest entry ptr
+    ; ---- stage the changed slots ----
+    xor  r12, r12                    ; source undo index
+    xor  r13, r13                    ; staged count
+    lea  rdi, [rbx+WAL_HDR_V3]
 .stage:
     cmp  r12, [rel g_undo_n]
     jae  .staged
@@ -418,61 +476,98 @@ txn_flush:
     imul rax, rax, UNDO_ENTRY
     add  rax, [rel g_undo]           ; undo entry i
     mov  rcx, [rax]                  ; slot index
-    mov  [rdi], rcx                  ; dest index
-    mov  rsi, rcx
-    shl  rsi, REC_SHIFT
-    add  rsi, [rel g_table]          ; live slot ptr
-    lea  rdx, [rdi+8]                ; dest image
-    mov  rcx, REC_SIZE
-.sc:
-    mov  al, [rsi]
-    mov  [rdx], al
-    inc  rsi
-    inc  rdx
-    dec  rcx
-    jnz  .sc
+    lea  rsi, [rax+8]                ; before-image
+    mov  [rbp-48], rcx
+    mov  rdx, rcx
+    shl  rdx, REC_SHIFT
+    add  rdx, [rel g_table]          ; live slot ptr (after-image)
+    mov  [rbp-56], rdx
+    ; skip rows whose final state matches the state we captured
+    mov  rcx, rsi
+    call slot_changed                ; rcx = before, rdx = after
+    test rax, rax
+    jz   .skip
+    mov  rax, [rbp-48]
+    mov  [rdi], rax                  ; slot index
+    mov  rcx, [rbp-56]
+    lea  rdx, [rdi+8]
+    mov  r8, REC_SIZE
+    call mem_copy                    ; final image
     add  rdi, UNDO_ENTRY
+    inc  r13
+.skip:
     inc  r12
     jmp  .stage
 .staged:
-    ; rdi points at the marker slot; data length = rdi - g_walbuf
-    mov  rsi, rdi                    ; marker offset ptr
-    sub  rdi, rbx                    ; data length (also marker offset)
+    ; nothing actually changed -> no frame, no sequence, no log entry
+    test r13, r13
+    jnz  .havechanges
+    cmp  qword [rel g_txn_reset], 0
+    jne  .havechanges                ; a RESET is a change even with no rows
+    call wal_truncate
+    jmp  .finish
+.havechanges:
+    ; ---- frame header ----
+    mov  rax, [rel wal_magic3]
+    mov  [rbx], rax                  ; +0  magic
+    mov  [rbx+8], r13                ; +8  N (staged, not captured)
+    mov  rax, [rel g_count]
+    mov  [rbx+16], rax               ; +16 new live count
+    mov  rax, [rel g_seq]
+    inc  rax
+    mov  [rbp-64], rax               ; commit_seq
+    mov  [rbx+24], rax               ; +24 commit_seq
+    xor  rax, rax
+    cmp  qword [rel g_txn_reset], 0
+    je   .noreset
+    mov  rax, CDC_FLAG_RESET
+.noreset:
+    mov  [rbx+32], rax               ; +32 flags
+    ; ---- write and flush the frame ----
+    mov  rsi, rdi                    ; marker slot
+    sub  rdi, rbx                    ; marker offset = data length
     xor  rcx, rcx
     mov  rdx, rbx
     mov  r8, rdi
-    call wal_write                   ; write header + entries
-    call wal_flush
-    ; Commit record = 'COMMIT01' + CRC32 of everything before it. Both go out in
-    ; ONE write+flush, so the checksum is as durable as the commit decision it
-    ; describes: a frame can never be "committed but unchecksummed".
-    mov  rax, [rel wal_commit]
-    mov  [rsi], rax                  ; place marker in buffer
-    mov  rcx, rbx                    ; buffer start
-    mov  rdx, rdi                    ; length = marker offset
-    call crc32
-    mov  [rsi+8], rax                ; checksum, zero-extended to 8 bytes
-    mov  rcx, rdi                    ; marker offset
-    mov  rdx, rsi                    ; &marker
-    mov  r8, 16                      ; marker + checksum
     call wal_write
-    call wal_flush                   ; marker now durable -> committed
-    ; apply after-images to asmdb.dat
+    call wal_flush
+    ; Commit record = 'COMMIT01' + CRC32 of everything before it, in ONE
+    ; write+flush, so a frame can never be committed without its checksum.
+    mov  rax, [rel wal_commit]
+    mov  [rsi], rax
+    mov  rcx, rbx
+    mov  rdx, rdi
+    call crc32
+    mov  [rsi+8], rax
+    mov  rcx, rdi
+    mov  rdx, rsi
+    mov  r8, 16
+    call wal_write
+    call wal_flush                   ; committed
+    ; ---- publish to the change log BEFORE touching the data file ----
+    lea  rcx, [rbx+WAL_HDR_V3]
+    mov  rdx, r13
+    mov  r8, [rbp-64]
+    xor  r9, r9
+    cmp  qword [rel g_txn_reset], 0
+    je   .cdcgo
+    mov  r9, CDC_FLAG_RESET
+.cdcgo:
+    call cdc_emit_from_wal
+    ; ---- apply the staged images to the .dat ----
     xor  r12, r12
 .apply:
-    cmp  r12, [rel g_undo_n]
+    cmp  r12, r13
     jae  .applied
     mov  rax, r12
     imul rax, rax, UNDO_ENTRY
-    add  rax, [rel g_undo]
-    mov  rdi, [rax]                  ; index
-    mov  rsi, rdi
-    shl  rsi, REC_SHIFT
-    add  rsi, [rel g_table]          ; slot ptr (buffer)
+    add  rax, rbx
+    add  rax, WAL_HDR_V3             ; staged entry i
+    mov  rdi, [rax]                  ; slot index
+    lea  rdx, [rax+8]                ; image
     mov  rcx, rdi
     shl  rcx, REC_SHIFT
     add  rcx, HDR_SIZE               ; file offset
-    mov  rdx, rsi
     mov  r8, REC_SIZE
     call write_at
     cmp  rax, REC_SIZE
@@ -481,11 +576,16 @@ txn_flush:
     inc  r12
     jmp  .apply
 .applied:
+    mov  rax, [rbp-64]
+    mov  [rel g_seq], rax            ; publish the watermark
     call db_write_header
     call db_flush
     call wal_truncate                ; checkpoint complete
+.finish:
     mov  qword [rel g_in_txn], 0
     mov  qword [rel g_undo_n], 0
+    mov  qword [rel g_txn_reset], 0
+    mov  r13, [rbp-40]
     mov  r12, [rbp-32]
     mov  rdi, [rbp-24]
     mov  rsi, [rbp-16]

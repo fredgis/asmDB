@@ -6,6 +6,7 @@ build/asmdb
 # Runtime data files
 *.dat
 *.wal
+*.cdc
 *.bak
 
 # Editor / OS
@@ -15,3 +16,7 @@ Thumbs.db
 # Node (MCP server)
 node_modules/
 npm-debug.log*
+
+# Python bytecode
+__pycache__/
+*.pyc

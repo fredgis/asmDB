@@ -89,7 +89,7 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **~27 KB PE64** whose only dependency is
+- The result is a single self-contained **~30 KB PE64** whose only dependency is
   `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the exe —
   it is obtained from `VirtualAlloc` at startup.
 
@@ -324,7 +324,9 @@ The `SCHEMA` command prints this exact table at runtime.
 
 ## 6. On-disk formats
 
-Two files per database, named from the DB base name: `<db>.dat` and `<db>.wal`.
+Three files per database, named from the DB base name: `<db>.dat`, `<db>.wal`,
+and `<db>.cdc` — the append-only change log, specified separately in
+[`CDC.md`](CDC.md).
 
 ### 6.1 `<db>.dat` — data file
 
