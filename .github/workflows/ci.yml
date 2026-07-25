@@ -1,81 +1,74 @@
 name: CI
 
+# One Linux job, and only when the engine actually changes.
+#
+# Deployment is never done from here — it runs from a workstation, see
+# saas/infra/deploy.ps1. CI exists for the one thing a Windows workstation
+# cannot do for itself: build the ELF64 binary and run it on a real kernel.
+# The Windows PE64 build and its 151 checks run locally on every change, so
+# paying a runner (billed at twice the Linux rate) to repeat them is waste.
+
 on:
   push:
     branches: [ main ]
+    paths: &engine
+      - 'src/**'
+      - 'tests/**'
+      - 'mcp/**'
+      - 'build.sh'
+      - 'build.ps1'
+      - '.github/workflows/ci.yml'
   pull_request:
+    paths: *engine
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
-    name: Linux (ELF64, native run)
+    name: Linux (ELF64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
       - name: Install NASM
         run: sudo apt-get update && sudo apt-get install -y nasm
+
       - name: Build ELF64
         run: bash ./build.sh
+
       - name: Validate ELF header
         run: python3 tests/validate_elf.py build/asmdb
+
       - name: Smoke test (CRUD + txn + persistence)
         run: bash ./tests/smoke.sh --no-build
+
       - name: Benchmark (100k rows)
         run: printf 'BENCH 100000\nEXIT\n' | ./build/asmdb bench
 
-  fuzz:
-    name: Fuzz on-disk formats (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install NASM
-        run: sudo apt-get update && sudo apt-get install -y nasm
-      - name: Build ELF64
-        run: bash ./build.sh
+      # Was a second job: a second runner, a second apt install and a second
+      # build of the same commit. It reuses this one's binary instead.
       - name: Corrupt .dat/.wal/.cdc and verify refusal
         run: python3 tests/fuzz/corrupt_formats.py --iterations 50 --seed 12648430
 
-  windows:
-    name: Windows (PE64)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install NASM
-        run: choco install nasm -y --no-progress
-      - name: Add NASM to PATH
-        shell: pwsh
-        run: Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
-      - name: Build PE64
-        run: powershell -ExecutionPolicy Bypass -File .\build.ps1
-      - name: Smoke test (CRUD + txn + persistence)
-        run: powershell -ExecutionPolicy Bypass -File .\tests\smoke.ps1 -NoBuild
-
-  mcp:
-    name: MCP server smoke (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: mcp/package-lock.json
-      - name: Install NASM
-        run: sudo apt-get update && sudo apt-get install -y nasm
-      - name: Build ELF64
-        run: bash ./build.sh
-      - name: Prepare engine path for MCP smoke test
+
+      - name: Prepare engine path for the MCP smoke test
         run: cp build/asmdb build/asmdb.exe && chmod +x build/asmdb.exe
-      - name: Audit MCP dependencies
-        working-directory: mcp
-        run: npm audit --audit-level=high
-        continue-on-error: true
+
       - name: Install MCP dependencies
         working-directory: mcp
         run: npm ci
+
       - name: Smoke test MCP server
         working-directory: mcp
         run: node test/smoke.js
