@@ -89,7 +89,7 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **~22 KB PE64** whose only dependency is
+- The result is a single self-contained **~24 KB PE64** whose only dependency is
   `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the exe —
   it is obtained from `VirtualAlloc` at startup.
 
@@ -375,11 +375,12 @@ The WAL is a **single staging frame** that mirrors the in-memory buffer
 (`g_walbuf`) to disk:
 
 ```
-+0    8              magic  'ASMWAL01'
++0    8              magic  'ASMWAL02'
 +8    8              N      entry count
 +16   8              count  live-row count to publish into the header on apply
 +24   N * (8 + 256)  entries: { u64 slot index ; 256-byte after-image }
-+..   8              marker 'COMMIT01'   (written and flushed LAST)
++M    8              marker 'COMMIT01'   ┐ written and flushed LAST,
++M+8  8              crc32  of [0, M)    ┘ together, in one write
 ```
 
 - Each entry is `UNDO_ENTRY = 8 + 256 = 264` bytes: a slot index followed by the
@@ -388,6 +389,14 @@ The WAL is a **single staging frame** that mirrors the in-memory buffer
   a slot whose `status = 2`).
 - The `'COMMIT01'` marker is the atomicity point: it is written and flushed only
   after the entries are durable.
+- The **CRC-32** (IEEE, reflected, poly `0xEDB88320`) covers the header and all
+  entries. It ships in the *same* write and flush as the marker, so a frame can
+  never be "committed but unchecksummed". A table-driven implementation
+  (`crc32_init` builds 256 dwords once at startup) keeps the cost proportional
+  to the bytes actually staged, not to the 2 MiB buffer.
+- Frames carrying the older `'ASMWAL01'` magic have no checksum and are still
+  replayed, so upgrading the binary never discards a transaction that was
+  already acknowledged.
 
 ---
 
@@ -489,7 +498,18 @@ table is read into RAM:
    index must be `< CAPACITY` and the stored `count` must be `<= CAPACITY`.
    Otherwise redo would write a 256-byte record at an arbitrary file offset and
    grow the `.dat` past its region, so the whole frame is discarded instead.
-3. Otherwise the frame is committed: **redo** every after-image into
+3. Verify the **CRC-32** stored next to the marker (`'ASMWAL02'` frames). Three
+   outcomes, and the distinction matters:
+   - *checksum absent because the frame is short* → the final 16-byte write was
+     torn, so the commit never completed → **discard**;
+   - *checksum present and matching* → replay;
+   - *checksum present and mismatching* → the transaction **was** committed and
+     acknowledged, but its bytes are damaged. Replaying would write corrupt
+     records; discarding would silently lose an acknowledged transaction.
+     Neither is acceptable, so the engine **refuses to open** and says so,
+     leaving the `.wal` in place. The operator can restore from a backup, or
+     delete the `.wal` to reopen at the last checkpoint.
+4. Otherwise the frame is committed: **redo** every after-image into
    `<db>.dat`, publish the stored `count` into the header, flush, and truncate
    the WAL. Every redo write is checked; a failure aborts (§7.5) rather than
    leaving the checkpoint half-applied.
@@ -533,6 +553,18 @@ and exits with status 1. This is deliberate: once a durable write has failed,
 RAM and disk may disagree, and continuing to serve `[ OK ]` replies over a
 database we can no longer vouch for is worse than stopping. The engine **never
 prints `[ OK ] ` after a failed write.**
+
+A failed **read** goes to `io_fatal_read` instead — nothing durable is at risk,
+but the in-memory image would be incomplete, so the engine stops rather than
+serve rows it only partially loaded.
+
+> **How the abort path is tested.** Since a real `ENOSPC` is hard to stage,
+> the suites assemble a throwaway binary with `-dFAULT_INJECT=<n>`, which makes
+> the *n*-th `write_at` fail. The tests assert that the engine aborts, explains
+> why, does **not** print `transaction committed`, and leaves a committed WAL
+> that a normal binary then replays — which also proves the assembly CRC-32 the
+> writer produced is the one the reader expects. The `%ifdef` contributes zero
+> bytes to the shipping binary.
 
 `BACKUP` is the one exception that reports without aborting — it writes to a
 *separate* file and leaves the live database untouched, so a failure there is
@@ -724,11 +756,11 @@ The theme is "never lie about durability, never corrupt on crash."
 
 | Item | What it adds | CRUD path helped |
 |------|--------------|------------------|
-| **CRC32 on WAL frames** | detect torn/garbled logs on recovery (SSE4.2 `crc32` instruction) | durable C/U/D |
+| ~~**CRC32 on WAL frames**~~ | ✅ **done** — table-driven CRC-32 written and flushed with the commit marker; a damaged committed frame is refused instead of replayed (§6.2, §7.3) | durable C/U/D |
 | **Incremental checkpoint** | a dirty-slot bitmap so `COMMIT` flushes only touched pages, not the whole 1 GiB region — the fix for the bulk-durable benchmark | durable bulk write |
 | **Group commit** | coalesce concurrent `COMMIT`s into one `fsync` | high-rate durable writes |
 | **Dynamic resize / rehash** | grow the table past load factor 0.75 instead of erroring; power-of-two doubling + incremental re-probe | all CRUD at scale |
-| **Short-write / error propagation** | check every `WriteFile`/`ReadFile` return, surface `[ERR] io` instead of silently continuing | all persistence |
+| ~~**Short-write / error propagation**~~ | ✅ **done** — every read/write/flush return is checked; a failed durable write aborts instead of acknowledging (§7.5) | all persistence |
 
 ### v1.5 — Make reads fast at scale (indexing & scans)
 
@@ -789,7 +821,7 @@ the hosted [SaaS layer](SAAS.md) rather than the single-node engine.
 | 2 | **Consistency** | ✅ | unique primary key, fixed-width typed columns (§4, §10), and `CHECK`-style domain validation (`id ≥ 1` reserved-key rule + bounded field lengths) enforced at write |
 | 3 | **Isolation** | ✅ | serial (serializable) execution — a single writer holds the DB exclusively, so no dirty / non-repeatable / phantom reads are possible; MVCC for concurrent readers is a throughput optimization on the roadmap |
 | 4 | **Durability** | ✅ | WAL + `FlushFileBuffers` (§6, §7); every durable write and flush is checked, and a failure aborts instead of acknowledging (§7.5) |
-| 5 | **Crash recovery** | ✅ | idempotent WAL redo with commit marker (§7); open-time header validation refuses a truncated/foreign/incompatible `.dat` instead of silently recreating it (§6.1); CRC32 frames → v1.0 |
+| 5 | **Crash recovery** | ✅ | idempotent WAL redo with commit marker **and CRC-32 per frame** (§6.2, §7.3); open-time header validation refuses a truncated/foreign/incompatible `.dat` instead of silently recreating it (§6.1) |
 | 6 | **Concurrency control** | ✅ | exclusive database lock (single-writer): a second engine opening the same file is refused with a clear "locked" message; group commit / finer-grained locking → roadmap |
 | 7 | **Indexing & access paths** | ✅ | O(1) primary hash index (§5) plus full-scan (`SELECT *`), substring (`FIND`) and value-range (`RANGE`) access paths; index-accelerated secondary columns → v1.5 |
 | 8 | **Query & access interface** | ✅ | REPL grammar (§9), MCP CRUD tools (§11), Python/C#/C clients |

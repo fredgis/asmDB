@@ -99,6 +99,18 @@ write_at:
     mov  [rbp-16], rsi               ; current file offset
     mov  [rbp-24], rdi               ; current buffer pointer
     mov  [rbp-32], r12               ; bytes remaining
+%ifdef FAULT_INJECT
+    ; Test-only: fail the FAULT_INJECT'th call, simulating ENOSPC / a dying
+    ; disk so the io_fatal path can actually be exercised. Assembled ONLY with
+    ; -dFAULT_INJECT=<n>; the shipping binary contains none of this.
+    cmp  qword [rel g_fail_after], 0
+    jle  .inject_skip
+    dec  qword [rel g_fail_after]
+    jnz  .inject_skip
+    mov  rbx, -1
+    jmp  .done
+.inject_skip:
+%endif
     xor  rbx, rbx
     mov  rsi, rcx                    ; offset
     mov  rdi, rdx                    ; buf
@@ -142,6 +154,17 @@ io_fatal:
     and  rsp, -16
     sub  rsp, 0x20
     lea  rcx, [rel s_err_io]
+    call puts
+    mov  ecx, 1
+    call os_exit
+
+; io_fatal_read() - same, for a failed READ. Nothing durable is at risk here,
+;   but the in-memory image would be incomplete, so we stop instead of serving
+;   rows we only partially loaded. Never returns.
+io_fatal_read:
+    and  rsp, -16
+    sub  rsp, 0x20
+    lea  rcx, [rel s_err_ioread]
     call puts
     mov  ecx, 1
     call os_exit
@@ -359,7 +382,7 @@ db_open:
     mov  r8, HDR_SIZE
     call read_at
     test rax, rax
-    js   io_fatal                    ; hard I/O error
+    js   io_fatal_read               ; hard I/O error
     jz   .newfile                    ; empty file -> a genuinely new database
     cmp  rax, HDR_SIZE
     jb   .corrupt                    ; non-empty but incomplete header
@@ -442,7 +465,7 @@ db_open:
     mov  r8, CAPACITY*REC_SIZE
     call read_at
     test rax, rax
-    js   io_fatal
+    js   io_fatal_read
     mov  rdx, CAPACITY*REC_SIZE
     cmp  rax, rdx
     jb   .corrupt                    ; data region truncated
@@ -453,10 +476,52 @@ db_open:
 .corrupt:
     lea  rcx, [rel s_err_corrupt]
     call puts
+    lea  rcx, [rel g_datname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_corrupt_hint]
+    call puts
     mov  ecx, 1
     call os_exit
 .format:
+    ; Say exactly what mismatched: a bare "incompatible format" leaves the user
+    ; with no way to tell which build wrote the file, or what to do about it.
     lea  rcx, [rel s_err_format]
+    call puts
+    lea  rcx, [rel g_datname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_fmt_build]
+    call puts
+    mov  ecx, DB_VERSION
+    call put_u64
+    lea  rcx, [rel s_fmt_rec]
+    call puts
+    mov  ecx, REC_SIZE
+    call put_u64
+    lea  rcx, [rel s_fmt_cap]
+    call puts
+    mov  ecx, CAPACITY
+    call put_u64
+    lea  rcx, [rel s_fmt_slots]
+    call puts
+    lea  rcx, [rel s_fmt_file]
+    call puts
+    mov  ecx, [rel g_hdr_read+8]     ; version   (u32, zero-extended)
+    call put_u64
+    lea  rcx, [rel s_fmt_rec]
+    call puts
+    mov  ecx, [rel g_hdr_read+12]    ; rec_size  (u32)
+    call put_u64
+    lea  rcx, [rel s_fmt_cap]
+    call puts
+    mov  rcx, [rel g_hdr_read+16]    ; capacity  (u64)
+    call put_u64
+    lea  rcx, [rel s_fmt_slots]
+    call puts
+    lea  rcx, [rel s_fmt_hint]
     call puts
     mov  ecx, 1
     call os_exit

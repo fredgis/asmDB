@@ -118,6 +118,8 @@ entry:
     mov  qword [rel g_in_txn], 0
     mov  qword [rel g_undo_n], 0
 
+    call crc32_init                  ; WAL frame checksums
+
     call db_init_names
     call db_open
 

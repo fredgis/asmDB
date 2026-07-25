@@ -42,6 +42,11 @@ g_tablename:   times 64 db 0
 g_argtable:    times 64 db 0
 g_finddata:    times FIND_STRUCT db 0
 g_hdr_read:    times HDR_SIZE db 0
+                align 8
+g_crctab:      times 256 dd 0        ; reflected CRC-32 (IEEE) table, built at startup
+%ifdef FAULT_INJECT
+g_fail_after:  dq FAULT_INJECT       ; test-only: fail the Nth write_at (see db.inc)
+%endif
 
 ; --------------------------- on-disk header ---------------------------------
                 align 8
@@ -73,7 +78,8 @@ s_dotdat:      db '.dat', 0
 s_pat_dat:     db '*.dat', 0
 s_dotwal:      db '.wal', 0
                 align 8
-wal_magic:     db 'ASMWAL01'
+wal_magic:     db 'ASMWAL01'         ; legacy frame (no checksum) - still replayed
+wal_magic2:    db 'ASMWAL02'         ; current frame: commit marker + CRC32
 wal_commit:    db 'COMMIT01'
 
 s_prompt:      db 'asmdb> ', 0
@@ -103,8 +109,23 @@ s_err_bak_trunc:db '[ERR] backup is truncated or incompatible - nothing restored
 s_err_bak_write:db '[ERR] backup failed - write error, file is incomplete', 13, 10, 0
 s_err_txn_busy: db '[ERR] finish the transaction first (COMMIT or ROLLBACK)', 13, 10, 0
 s_err_io:       db '[ERR] I/O failure on a durable write - aborting to avoid an inconsistent database', 13, 10, 0
-s_err_corrupt:  db '[ERR] database file is incomplete or corrupt - refusing to open (it was NOT reinitialized)', 13, 10, 0
-s_err_format:   db '[ERR] incompatible database format (version / record size / capacity)', 13, 10, 0
+s_err_ioread:   db '[ERR] I/O failure while reading - aborting rather than serving partial data', 13, 10, 0
+s_err_corrupt:  db '[ERR] database file is incomplete or corrupt - refusing to open ', 0
+s_corrupt_hint: db '      The file was NOT modified. Move or remove it, or open another', 13, 10
+                db '      database name: asmdb <name>', 13, 10, 0
+s_err_format:   db '[ERR] incompatible database format - refusing to open ', 0
+s_fmt_build:    db '      this build : version ', 0
+s_fmt_file:     db '      that file  : version ', 0
+s_fmt_rec:      db ', record ', 0
+s_fmt_cap:      db ' B, capacity ', 0
+s_fmt_slots:    db ' slots', 13, 10, 0
+s_fmt_hint:     db '      Written by a different build of asmdb. Open another database name', 13, 10
+                db '      (asmdb <name>), or move/remove the file if you no longer need it.', 13, 10, 0
+s_nl:           db 13, 10, 0
+s_err_walcrc:   db '[ERR] write-ahead log is corrupt (checksum mismatch) - refusing to open ', 0
+s_walcrc_hint:  db '      A committed transaction cannot be replayed safely from a damaged log.', 13, 10
+                db '      Restore from a backup, or delete the .wal file to discard that', 13, 10
+                db '      transaction and open the database as it was at the last checkpoint.', 13, 10, 0
 s_det_id:      db '  id       : ', 0
 s_det_value:   db '  value    : ', 0
 s_det_tag:     db '  tag      : ', 0

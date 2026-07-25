@@ -183,6 +183,49 @@ PY
     else
         echo "  [FAIL] out-of-range WAL did not grow .dat"; fail=$((fail+1))
     fi
+
+    # Run 10: WAL frame checksums
+    printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb cv > /dev/null
+    python3 "$root/tests/make_wal.py" cv.wal 7 777 crc 'checksummed frame' 2 > /dev/null
+    r10="$(printf '%s\n' 'COUNT' 'SELECT 7' 'EXIT' | ./asmdb cv)"
+    check 'v02 frame replays'        'content[[:space:]]+:[[:space:]]+checksummed frame' "$r10"
+    # a byte flipped inside a committed frame is detected, and the log is kept
+    printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb cb > /dev/null
+    python3 "$root/tests/make_wal.py" cb.wal 7 777 crc 'corrupted frame' 2 --badcrc > /dev/null
+    r10b="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb cb 2>&1)"; code10b=$?
+    check 'bad WAL checksum refused'  'checksum mismatch'                  "$r10b"
+    if [[ $code10b -ne 0 && -s cb.wal ]]; then echo "  [PASS] bad WAL checksum kept log"; \
+        else echo "  [FAIL] bad WAL checksum kept log"; fail=$((fail+1)); fi
+    rm -f cb.wal                                   # the documented remedy
+    r10c="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb cb)"
+    check 'db opens after removing the log' '\[ OK \] 1 row\(s\)'          "$r10c"
+    # a legacy (pre-checksum) frame still replays, so upgrading a binary never
+    # drops an already-acknowledged transaction
+    printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb lg > /dev/null
+    python3 "$root/tests/make_wal.py" lg.wal 9 999 old 'legacy frame' 2 --legacy > /dev/null
+    r10d="$(printf '%s\n' 'SELECT 9' 'EXIT' | ./asmdb lg)"
+    check 'legacy v01 frame still replays' 'content[[:space:]]+:[[:space:]]+legacy frame' "$r10d"
+
+    # Run 11: fault injection - a failing durable write (ENOSPC-style) must abort
+    # cleanly instead of acknowledging, and the committed WAL it leaves behind
+    # must replay on the next open. Builds a throwaway binary with
+    # -dFAULT_INJECT=<n>; the shipping binary contains none of that code.
+    if command -v nasm >/dev/null 2>&1; then
+        ( cd "$root/src" && nasm -f bin -dLINUX -dFAULT_INJECT=4 main.asm -o "$work/faulty" )
+        chmod +x "$work/faulty"
+        r11="$(printf '%s\n' 'INSERT 1 100 base first row' 'BEGIN' \
+            'INSERT 2 200 txn committed but not checkpointed' 'COMMIT' 'COUNT' 'EXIT' \
+            | ./faulty fi 2>&1)"; code11=$?
+        check 'failed durable write says why' 'I/O failure on a durable write' "$r11"
+        check 'no [ OK ] after the failure'   '!transaction committed'         "$r11"
+        if [[ $code11 -ne 0 && -s fi.wal ]]; then echo "  [PASS] failed durable write aborts, WAL kept"; \
+            else echo "  [FAIL] failed durable write aborts, WAL kept"; fail=$((fail+1)); fi
+        r11b="$(printf '%s\n' 'COUNT' 'SELECT 2' 'EXIT' | ./asmdb fi)"
+        check 'engine-written WAL replays' 'content[[:space:]]+:[[:space:]]+committed but not checkpointed' "$r11b"
+        check 'recovered count is right'   '\[ OK \] 2 row\(s\)'               "$r11b"
+    else
+        echo "  [SKIP] fault-injection checks (nasm not found)"
+    fi
 else
     echo "  [SKIP] WAL recovery checks (python3 not found)"
 fi

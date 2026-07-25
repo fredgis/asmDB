@@ -619,10 +619,13 @@ cmd_delete:
 ;   checkpoint (single fsync), and reports how many rows were removed.
 ;   In a transaction: each live row's before-image is captured in the undo log
 ;   so ROLLBACK restores the whole table; the change is applied to disk by
-;   COMMIT. Rejected up front if that would exceed the per-txn undo capacity.
+;   COMMIT.
 ;   Inside a transaction the capture runs as a SEPARATE first pass: if the undo
 ;   log cannot hold every live row, the command fails having modified nothing,
-;   instead of leaving the table half-cleared with a stale row count.
+;   instead of leaving the table half-cleared with a stale row count. That pass
+;   is the only admission check needed - a `count + undo_n > UNDO_MAX` estimate
+;   would double-count rows this transaction has already captured (captures are
+;   de-duplicated per slot) and refuse truncates that actually fit.
 cmd_truncate:
     push rbp
     mov  rbp, rsp
@@ -632,10 +635,6 @@ cmd_truncate:
     mov  [rbp-24], rdi
     cmp  qword [rel g_in_txn], 0
     je   .go
-    mov  rax, [rel g_count]
-    add  rax, [rel g_undo_n]         ; existing undo + rows still to capture
-    cmp  rax, UNDO_MAX
-    ja   .toobig
     ; pass 1 - capture every live row before touching any of them
     xor  rbx, rbx
 .cap:
@@ -1123,7 +1122,7 @@ cmd_restore:
     call read_at
     mov  rdx, CAPACITY*REC_SIZE
     cmp  rax, rdx
-    jne  io_fatal                    ; the table is half-loaded; do not go on
+    jne  io_fatal_read               ; the table is half-loaded; do not go on
     mov  rax, [rbp-40]
     mov  [rel g_count], rax          ; adopt restored live count
     mov  rax, [rbp-32]

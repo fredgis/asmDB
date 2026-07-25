@@ -558,15 +558,17 @@ engine never prints `[ OK ]` after a failed write.
 | `table full` | no free slot remains at the current capacity |
 | `no active transaction` | [`COMMIT`](#commit) / [`ROLLBACK`](#rollback) outside a transaction |
 | `transaction already active` | nested [`BEGIN`](#begin) |
-| `transaction too large - COMMIT or ROLLBACK` | more than 4096 **distinct rows** touched in one transaction |
+| `transaction too large - COMMIT or ROLLBACK` | more than 4096 **distinct rows** touched in one transaction (for `TRUNCATE`, the whole live table must fit — it fails having changed nothing) |
 | `finish the transaction first (COMMIT or ROLLBACK)` | [`BACKUP`](#backup), [`RESTORE`](#restore) or [`BENCH`](#bench) attempted inside a transaction |
 | `cannot open database file` | the `.dat`/`.wal` could not be opened |
 | `database is locked by another process (single-writer)` | another asmdb instance already holds the file |
-| `database file is incomplete or corrupt - refusing to open (it was NOT reinitialized)` | the `.dat` is non-empty but not a valid, complete asmdb file — it is **never** silently recreated |
-| `incompatible database format (version / record size / capacity)` | the `.dat` was written by a build with a different on-disk layout |
+| `database file is incomplete or corrupt - refusing to open <file>` | the `.dat` is non-empty but not a valid, complete asmdb file — it is **never** silently recreated. The message names the file and how to proceed |
+| `incompatible database format - refusing to open <file>` | the `.dat` was written by a build with a different on-disk layout. The message prints this build's version/record size/capacity next to the file's, so you can see exactly what differs |
+| `write-ahead log is corrupt (checksum mismatch) - refusing to open <file>` | a committed WAL frame no longer matches its CRC-32. Replaying it would write corrupt rows and discarding it would lose an acknowledged transaction, so the engine stops and keeps the log. Restore from a backup, or delete the `.wal` to reopen at the last checkpoint |
 | `cannot open backup file` | the [`BACKUP`](#backup)/[`RESTORE`](#restore) path could not be opened |
 | `not an asmdb backup (bad magic)` | the file given to [`RESTORE`](#restore) is not an asmdb snapshot |
 | `backup is truncated or incompatible - nothing restored` | the snapshot is short or from another layout; the live database is untouched |
 | `backup failed - write error, file is incomplete` | a [`BACKUP`](#backup) transfer or flush failed; the partial file is not a usable snapshot |
 | `I/O failure on a durable write - aborting to avoid an inconsistent database` | a durable write or `fsync` failed. asmdb **exits (status 1)** rather than continue with memory and disk out of sync |
+| `I/O failure while reading - aborting rather than serving partial data` | a read failed. Nothing durable is at risk, but the in-memory table would be incomplete, so asmdb exits instead of serving half-loaded rows |
 | `out of memory` | the startup allocations failed |

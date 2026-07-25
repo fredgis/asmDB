@@ -3,17 +3,29 @@ flushed but before the checkpoint reached the .dat file.
 
 Reopening the database must replay this WAL and expose the row.
 
-Usage:  python tests/make_wal.py <out.wal> [id] [value] [tag] [content] [count]
+Usage:
+    python tests/make_wal.py <out.wal> [id] [value] [tag] [content] [count]
+                             [--legacy | --badcrc]
+
+    (default)   emit a current 'ASMWAL02' frame with a valid CRC32
+    --legacy    emit an old 'ASMWAL01' frame with no checksum, to prove such a
+                frame written by an older binary is still replayed on upgrade
+    --badcrc    emit an 'ASMWAL02' frame whose payload was corrupted after the
+                checksum was computed, to prove corruption is detected
 
 Layout mirrors src/wal.inc:
-    +0   8   magic  'ASMWAL01'
+    +0   8   magic  'ASMWAL01' (legacy) or 'ASMWAL02'
     +8   8   N      entry count
     +16  8   count  live-row count to store in the header
     +24  N * { 8 slot index ; REC_SIZE after-image }
-    +..  8   marker 'COMMIT01'   (written and flushed last)
+    +M   8   marker 'COMMIT01'
+    +M+8 8   crc32 of bytes [0, M)      -- 'ASMWAL02' only
+The marker and the checksum are written and flushed together, so a frame can
+never be committed without a checksum describing it.
 """
 import struct
 import sys
+import zlib
 
 # ---- must match src/asmdb.inc ----
 GOLDEN = 0x9E3779B97F4A7C15
@@ -48,25 +60,38 @@ def record(rid: int, value: int, tag: str, content: str, ts: int = 1) -> bytes:
 
 
 def main() -> None:
-    out = sys.argv[1]
-    rid = int(sys.argv[2]) if len(sys.argv) > 2 else 42
-    value = int(sys.argv[3]) if len(sys.argv) > 3 else 4242
-    tag = sys.argv[4] if len(sys.argv) > 4 else 'wal'
-    content = sys.argv[5] if len(sys.argv) > 5 else 'recovered from the write-ahead log'
-    count = int(sys.argv[6]) if len(sys.argv) > 6 else 1
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    flags = {a for a in sys.argv[1:] if a.startswith('--')}
+    legacy = '--legacy' in flags
+    badcrc = '--badcrc' in flags
+
+    out = args[0]
+    rid = int(args[1]) if len(args) > 1 else 42
+    value = int(args[2]) if len(args) > 2 else 4242
+    tag = args[3] if len(args) > 3 else 'wal'
+    content = args[4] if len(args) > 4 else 'recovered from the write-ahead log'
+    count = int(args[5]) if len(args) > 5 else 1
 
     idx = slot_index(rid)
     buf = bytearray()
-    buf += b'ASMWAL01'                  # magic
+    buf += b'ASMWAL01' if legacy else b'ASMWAL02'
     buf += struct.pack('<Q', 1)         # N entries
     buf += struct.pack('<Q', count)     # live-row count for the header
     buf += struct.pack('<Q', idx)       # entry: slot index
     buf += record(rid, value, tag, content)
-    buf += b'COMMIT01'                  # commit marker (flushed last)
+
+    marker_at = len(buf)
+    buf += b'COMMIT01'
+    if not legacy:
+        crc = zlib.crc32(bytes(buf[:marker_at])) & 0xFFFFFFFF
+        buf += struct.pack('<Q', crc)
+        if badcrc:
+            buf[marker_at - 1] ^= 0x01   # corrupt the payload after checksumming
 
     with open(out, 'wb') as f:
         f.write(buf)
-    print(f'wrote {out}: id={rid} value={value} tag={tag} slot={idx} '
+    kind = 'legacy v01' if legacy else ('v02 BAD crc' if badcrc else 'v02')
+    print(f'wrote {out}: {kind} id={rid} value={value} tag={tag} slot={idx} '
           f'count={count} bytes={len(buf)}')
 
 

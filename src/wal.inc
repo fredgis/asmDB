@@ -132,9 +132,17 @@ wal_recover:
     cmp  r12, 24
     jb   .clear
     mov  rbx, [rel g_walbuf]
-    mov  rax, [rel wal_magic]
+    mov  qword [rbp-40], 0           ; 1 -> v02 frame, checksum to verify
+    mov  rax, [rel wal_magic2]
+    cmp  rax, [rbx]
+    je   .v2
+    mov  rax, [rel wal_magic]        ; legacy frame written before checksums
     cmp  rax, [rbx]
     jne  .clear
+    jmp  .magic_ok
+.v2:
+    mov  qword [rbp-40], 1
+.magic_ok:
     mov  rsi, [rbx+8]                ; N
     cmp  rsi, UNDO_MAX
     ja   .clear
@@ -151,6 +159,21 @@ wal_recover:
     add  rdx, rdi
     cmp  rax, [rdx]                  ; verify commit marker
     jne  .clear
+    ; verify the checksum flushed alongside the marker
+    cmp  qword [rbp-40], 0
+    je   .crc_ok                     ; legacy frame - nothing to verify
+    mov  rax, rdi
+    add  rax, 16
+    cmp  r12, rax                    ; marker + checksum must be fully present
+    jb   .clear                      ; torn final write -> treat as uncommitted
+    mov  rcx, rbx
+    mov  rdx, rdi                    ; checksum covers [0, marker offset)
+    call crc32
+    mov  rdx, rbx
+    add  rdx, rdi
+    cmp  rax, [rdx+8]
+    jne  .crcbad
+.crc_ok:
     ; every slot index must address a real slot. A corrupt frame could otherwise
     ; make the redo below write REC_SIZE bytes at an arbitrary file offset,
     ; growing the .dat past its region (and the redo aborts the process on the
@@ -209,6 +232,21 @@ wal_recover:
     mov  rsp, rbp
     pop  rbp
     ret
+.crcbad:
+    ; The frame carries a valid commit marker, so the transaction WAS committed
+    ; and acknowledged - but its bytes no longer match their checksum. Applying
+    ; it would write corrupt records; discarding it would silently lose an
+    ; acknowledged transaction. Neither is acceptable, so stop and say so.
+    lea  rcx, [rel s_err_walcrc]
+    call puts
+    lea  rcx, [rel g_walname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_walcrc_hint]
+    call puts
+    mov  ecx, 1
+    call os_exit
 
 ; wal_close()
 wal_close:
@@ -320,7 +358,7 @@ cmd_commit:
     cmp  qword [rel g_in_txn], 0
     je   .none
     mov  rbx, [rel g_walbuf]
-    mov  rax, [rel wal_magic]
+    mov  rax, [rel wal_magic2]
     mov  [rbx], rax                  ; +0 magic
     mov  rax, [rel g_undo_n]
     mov  [rbx+8], rax                ; +8 N
@@ -361,11 +399,18 @@ cmd_commit:
     mov  r8, rdi
     call wal_write                   ; write header + entries
     call wal_flush
+    ; Commit record = 'COMMIT01' + CRC32 of everything before it. Both go out in
+    ; ONE write+flush, so the checksum is as durable as the commit decision it
+    ; describes: a frame can never be "committed but unchecksummed".
     mov  rax, [rel wal_commit]
     mov  [rsi], rax                  ; place marker in buffer
+    mov  rcx, rbx                    ; buffer start
+    mov  rdx, rdi                    ; length = marker offset
+    call crc32
+    mov  [rsi+8], rax                ; checksum, zero-extended to 8 bytes
     mov  rcx, rdi                    ; marker offset
     mov  rdx, rsi                    ; &marker
-    mov  r8, 8
+    mov  r8, 16                      ; marker + checksum
     call wal_write
     call wal_flush                   ; marker now durable -> committed
     ; apply after-images to asmdb.dat

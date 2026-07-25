@@ -204,6 +204,71 @@ try {
         $code9e = $LASTEXITCODE
         Check 'out-of-range WAL index discarded' ($code9e -eq 0 -and (($r9e -join "`n") -match '\[ OK \] 0 row\(s\)'))
         Check 'out-of-range WAL did not grow .dat' ((Get-Item (Join-Path $work 'ft.dat')).Length -eq (512 + 4194304 * 256))
+
+        # Run 10: WAL frame checksums.
+        # 10a a valid v02 frame replays
+        (@('INSERT 1 10 base original row', 'EXIT') -join "`n") | .\asmdb.exe cv | Out-Null
+        & python $mkwal (Join-Path $work 'cv.wal') 7 777 crc 'checksummed frame' 2 | Out-Null
+        $r10 = (@('COUNT', 'SELECT 7', 'EXIT') -join "`n") | .\asmdb.exe cv
+        $r10 = $r10 -join "`n"
+        Check 'v02 frame replays'        ($r10 -match 'content\s+:\s+checksummed frame')
+        # 10b a byte flipped inside a committed frame is detected, and the WAL is
+        #     kept (not silently erased) so the operator can still act on it
+        (@('INSERT 1 10 base original row', 'EXIT') -join "`n") | .\asmdb.exe cb | Out-Null
+        & python $mkwal (Join-Path $work 'cb.wal') 7 777 crc 'corrupted frame' 2 --badcrc | Out-Null
+        $r10b = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cb 2>&1
+        $code10b = $LASTEXITCODE
+        $r10b = $r10b -join "`n"
+        Check 'bad WAL checksum refused'  ($code10b -ne 0 -and $r10b -match 'checksum mismatch')
+        Check 'bad WAL checksum kept log' ((Get-Item (Join-Path $work 'cb.wal')).Length -gt 0)
+        # 10c deleting the .wal is the documented remedy
+        Remove-Item (Join-Path $work 'cb.wal') -Force
+        $r10c = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cb
+        Check 'db opens after removing the log' (($r10c -join "`n") -match '\[ OK \] 1 row\(s\)')
+        # 10d a legacy (pre-checksum) frame still replays, so upgrading a binary
+        #     never drops an already-acknowledged transaction
+        (@('INSERT 1 10 base original row', 'EXIT') -join "`n") | .\asmdb.exe lg | Out-Null
+        & python $mkwal (Join-Path $work 'lg.wal') 9 999 old 'legacy frame' 2 --legacy | Out-Null
+        $r10d = (@('SELECT 9', 'EXIT') -join "`n") | .\asmdb.exe lg
+        Check 'legacy v01 frame still replays' (($r10d -join "`n") -match 'content\s+:\s+legacy frame')
+
+        # Run 11: fault injection - a failing durable write (ENOSPC-style) must
+        # abort cleanly instead of acknowledging, and the committed WAL it leaves
+        # behind must replay on the next open. This is the only way to exercise
+        # io_fatal, so it builds a throwaway binary with -dFAULT_INJECT=<n>;
+        # the shipping binary contains none of that code.
+        $nasm = @((Get-Command nasm -ErrorAction SilentlyContinue).Source,
+                  "$env:LOCALAPPDATA\bin\NASM\nasm.exe",
+                  "$env:ProgramFiles\NASM\nasm.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+        if ($nasm) {
+            $fi = Join-Path $work 'faulty.exe'
+            Push-Location (Join-Path $root 'src')
+            & $nasm -f bin '-dFAULT_INJECT=4' main.asm -o $fi 2>&1 | Out-Null
+            $nasmCode = $LASTEXITCODE
+            Pop-Location
+            if ($nasmCode -eq 0) {
+                $r11 = (@(
+                    'INSERT 1 100 base first row', 'BEGIN',
+                    'INSERT 2 200 txn committed but not checkpointed', 'COMMIT', 'COUNT', 'EXIT'
+                ) -join "`n") | & $fi fi 2>&1
+                $code11 = $LASTEXITCODE
+                $r11 = $r11 -join "`n"
+                Check 'failed durable write aborts'    ($code11 -ne 0)
+                Check 'failed durable write says why'  ($r11 -match 'I/O failure on a durable write')
+                Check 'no [ OK ] after the failure'    (-not ($r11 -match 'transaction committed'))
+                Check 'commit left a WAL to recover'   ((Get-Item (Join-Path $work 'fi.wal')).Length -gt 0)
+                # the engine-written frame (real CRC, written by the assembly)
+                # must be accepted and replayed by a normal binary
+                $r11b = (@('COUNT', 'SELECT 2', 'EXIT') -join "`n") | .\asmdb.exe fi
+                $r11b = $r11b -join "`n"
+                Check 'engine-written WAL replays'     ($r11b -match 'content\s+:\s+committed but not checkpointed')
+                Check 'recovered count is right'       ($r11b -match '\[ OK \] 2 row\(s\)')
+            } else {
+                Write-Host "  [SKIP] fault-injection checks (nasm build failed)" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "  [SKIP] fault-injection checks (nasm not found)" -ForegroundColor Yellow
+        }
     } else {
         Write-Host "  [SKIP] WAL recovery checks (python not found)" -ForegroundColor Yellow
     }

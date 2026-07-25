@@ -1,7 +1,7 @@
 # Connecting to asmdb from your application
 
 **asmdb is not a server and there is no driver / client library.** It is a
-single ~22 KB executable that behaves as a REPL: it reads one command per line
+single ~24 KB executable that behaves as a REPL: it reads one command per line
 from **stdin** and writes ASCII results to **stdout**. There is no socket, no
 shared library, and no wire protocol.
 
