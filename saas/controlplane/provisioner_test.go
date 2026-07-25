@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"regexp"
 	"testing"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/appcontainers/armappcontainers/v3"
 )
 
 func TestGenerateInstanceIDShape(t *testing.T) {
@@ -39,6 +42,86 @@ func TestTierSpecs(t *testing.T) {
 		if got != want {
 			t.Fatalf("%s spec = %+v, want %+v", tier, got, want)
 		}
+	}
+}
+
+// A Container App's own filesystem is discarded on restart and on scale to
+// zero. If the engine's files are not on a mounted volume the customer's
+// database evaporates the first time the app goes idle, so the volume wiring
+// is asserted here rather than discovered in production.
+func TestInstanceGetsADurableVolume(t *testing.T) {
+	p := &azureProvisioner{
+		location:   "swedencentral",
+		image:      "reg.azurecr.io/asmdb-instance:latest",
+		envStorage: "asmdb-data",
+	}
+
+	for tier := range tierSpecs {
+		t.Run(tier, func(t *testing.T) {
+			in := instance{ID: "db_abcdefghijklmnopqrstuvwx", Tier: tier, ContainerAppName: "db-abcdefghijklmnopqrstuvwx"}
+			app, err := p.buildContainerApp(in, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmpl := app.Properties.Template
+
+			if len(tmpl.Volumes) != 1 {
+				t.Fatalf("volumes = %d, want exactly 1 durable volume", len(tmpl.Volumes))
+			}
+			vol := tmpl.Volumes[0]
+			if got := *vol.StorageType; got != armappcontainers.StorageTypeNfsAzureFile {
+				t.Fatalf("storage type = %q, want %q (EmptyDir is ephemeral)", got, armappcontainers.StorageTypeNfsAzureFile)
+			}
+			if got := *vol.StorageName; got != "asmdb-data" {
+				t.Fatalf("storage name = %q, want the environment storage", got)
+			}
+
+			mounts := tmpl.Containers[0].VolumeMounts
+			if len(mounts) != 1 {
+				t.Fatalf("volume mounts = %d, want 1", len(mounts))
+			}
+			if got := *mounts[0].VolumeName; got != *vol.Name {
+				t.Fatalf("mount references volume %q, but the volume is named %q", got, *vol.Name)
+			}
+			// One share holds every database; the sub-path is what keeps one
+			// customer's files out of another's.
+			if got := *mounts[0].SubPath; got != in.ID {
+				t.Fatalf("sub-path = %q, want the instance id %q", got, in.ID)
+			}
+
+			// The engine is told where to write by ASMDB_DATA. If that path and
+			// the mount path ever drift apart the writes land on the ephemeral
+			// layer and the volume sits there empty.
+			var dataDir string
+			for _, env := range tmpl.Containers[0].Env {
+				if *env.Name == "ASMDB_DATA" {
+					dataDir = *env.Value
+				}
+			}
+			if dataDir == "" {
+				t.Fatal("ASMDB_DATA is not set")
+			}
+			if dataDir != *mounts[0].MountPath {
+				t.Fatalf("ASMDB_DATA = %q but the volume is mounted at %q", dataDir, *mounts[0].MountPath)
+			}
+		})
+	}
+}
+
+// The engine is a single-writer process holding an exclusive lock on its files.
+// A second replica is not more capacity, it is a second database that cannot
+// start, so no tier may ever ask for one.
+func TestNoTierEverAsksForASecondReplica(t *testing.T) {
+	for tier, spec := range tierSpecs {
+		if spec.MaxReplicas != 1 {
+			t.Fatalf("tier %q has maxReplicas %d, want 1", tier, spec.MaxReplicas)
+		}
+	}
+}
+
+func TestProvisionerRefusesToStartWithoutStorage(t *testing.T) {
+	if _, err := newAzureProvisioner(context.Background(), config{}, nil); err == nil {
+		t.Fatal("expected a provisioner with no configuration to be refused")
 	}
 }
 

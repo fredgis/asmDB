@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -39,16 +40,21 @@ func (p *fakeProvisioner) Endpoint(in instance) string {
 }
 
 func TestValidName(t *testing.T) {
-	valid := []string{"my-notes", "a1", "abc123", "a-b-c", "a2345678901234567890123456789012345678z"}
-	for _, name := range valid {
-		if !validName(name) {
-			t.Fatalf("expected valid name %q", name)
+	// CONTRACTS.md §2: 2–40 chars, ^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$.
+	// Built rather than typed, so the boundary cases cannot drift from the
+	// number they claim to test.
+	name := func(n int) string { return "a" + strings.Repeat("b", n-2) + "z" }
+
+	valid := []string{"my-notes", "a1", "abc123", "a-b-c", name(39), name(40)}
+	for _, n := range valid {
+		if !validName(n) {
+			t.Fatalf("expected valid name %q (%d chars)", n, len(n))
 		}
 	}
-	invalid := []string{"", "a", "-abc", "abc-", "ABC", "a_b", "a..b", "a23456789012345678901234567890123456789z"}
-	for _, name := range invalid {
-		if validName(name) {
-			t.Fatalf("expected invalid name %q", name)
+	invalid := []string{"", "a", "-abc", "abc-", "ABC", "a_b", "a..b", name(41)}
+	for _, n := range invalid {
+		if validName(n) {
+			t.Fatalf("expected invalid name %q (%d chars)", n, len(n))
 		}
 	}
 }

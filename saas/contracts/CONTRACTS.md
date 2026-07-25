@@ -150,6 +150,29 @@ Capabilities are real. **Prices are not set** — the site says "pricing at GA".
 Every tier gets the same engine, the same 4 194 304-row ceiling, the same
 durability. Tiers buy **latency and headroom**, not features.
 
+`maxReplicas` is **1 on every tier and is not negotiable**. The engine is a
+single-writer process that takes an exclusive lock on its files; a second
+replica is not extra capacity, it is a second database that cannot start.
+Tiers scale up, never out.
+
+### Storage
+
+Each instance mounts a durable volume at `/data`, and `ASMDB_DATA` points at
+that mount. A Container App's own filesystem is discarded on every restart and
+on every scale to zero, so an instance without a volume loses the customer's
+database the first time it goes idle — the control plane refuses to start if
+the volume is not configured.
+
+| | |
+|---|---|
+| Backing store | Azure Files **NFS 4.1**, one share for the whole platform |
+| Isolation | volume mount `subPath` = the instance id, so each database owns a directory |
+| Auth | none to carry: NFS is reachable only from the private VNet, so no account key exists to leak |
+| Mount path | `/data` — must equal `ASMDB_DATA`, asserted in `provisioner_test.go` |
+
+SMB was rejected: Container Apps' SMB mount needs a storage account key, and
+the accounts here run with `allowSharedKeyAccess: false`.
+
 ---
 
 ## 7. Azure resource names
@@ -165,6 +188,9 @@ Deterministic, so the deployment is idempotent.
 | Instance app | `db-<instance-id-without-prefix>` |
 | Log Analytics | `asmdb-logs` |
 | Managed identity | `asmdb-mi` (AcrPull + Contributor on the RG) |
+| Blob account (control-plane state) | `asmdbst<suffix>` |
+| File account (instance data, Premium NFS) | `asmdbfs<suffix>` |
+| Environment storage | `asmdb-data` → share `instances` |
 
 `<suffix>` = first 8 chars of a hash of the subscription+RG, so re-running the
 deployment finds the same registry instead of creating a second one.

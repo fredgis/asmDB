@@ -20,6 +20,7 @@ type config struct {
 	Image          string
 	Location       string
 	StorageAccount string
+	EnvStorage     string
 	AdminKey       string
 	SiteDir        string
 }
@@ -33,6 +34,7 @@ func loadConfig() (config, error) {
 		Image:          os.Getenv("ASMDB_IMAGE"),
 		Location:       getenv("ASMDB_LOCATION", "swedencentral"),
 		StorageAccount: os.Getenv("ASMDB_STORAGE_ACCOUNT"),
+		EnvStorage:     getenv("ASMDB_ENV_STORAGE", "asmdb-data"),
 		AdminKey:       os.Getenv("ASMDB_ADMIN_KEY"),
 		SiteDir:        getenv("ASMDB_SITE_DIR", "/app/site"),
 	}

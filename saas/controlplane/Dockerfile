@@ -1,12 +1,15 @@
+# Build context must be the repository root:
+#   az acr build --file saas/controlplane/Dockerfile .
 FROM golang:1.25-alpine AS build
-RUN apk add --no-cache git
 WORKDIR /src
-COPY saas/controlplane/ ./
-# go mod tidy resolves and pins the Azure SDK inside the build, so the tree does
-# not have to carry a go.sum that no toolchain on the authoring machine could
-# have generated.
-RUN go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+
+# Dependencies first, as their own layer: the Azure SDK is by far the slowest
+# part of the build and it only changes when go.mod does.
+COPY saas/controlplane/go.mod saas/controlplane/go.sum ./
+RUN go mod download
+
+COPY saas/controlplane/*.go ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" -o /out/controlplane .
 
 FROM alpine:3.20

@@ -51,9 +51,18 @@ type azureProvisioner struct {
 	image          string
 	registryServer string
 	identityID     string
+	envStorage     string
 }
 
 func newAzureProvisioner(ctx context.Context, cfg config, cred azcore.TokenCredential) (*azureProvisioner, error) {
+	// Checked before anything else: without a volume the engine writes to the
+	// container's own filesystem, which Container Apps discards on every restart
+	// and on every scale to zero. Refusing to start is the only safe answer — a
+	// database service that silently loses data is worse than one that will not
+	// boot.
+	if cfg.EnvStorage == "" {
+		return nil, errors.New("ASMDB_ENV_STORAGE is empty: instances would have no durable volume")
+	}
 	apps, err := armappcontainers.NewContainerAppsClient(cfg.SubscriptionID, cred, nil)
 	if err != nil {
 		return nil, err
@@ -80,13 +89,28 @@ func newAzureProvisioner(ctx context.Context, cfg config, cred azcore.TokenCrede
 		image:          cfg.Image,
 		registryServer: registryServer(cfg.Image),
 		identityID:     identityID,
+		envStorage:     cfg.EnvStorage,
 	}, nil
 }
 
 func (p *azureProvisioner) Create(ctx context.Context, in instance, token string) (string, error) {
+	app, err := p.buildContainerApp(in, token)
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := p.apps.BeginCreateOrUpdate(ctx, p.resourceGroup, in.ContainerAppName, app, nil); err != nil {
+		return "", err
+	}
+	return "https://" + in.ContainerAppName + "." + p.environmentDNS, nil
+}
+
+// buildContainerApp is kept separate from Create so the shape of the app can be
+// asserted in tests without an Azure subscription.
+func (p *azureProvisioner) buildContainerApp(in instance, token string) (armappcontainers.ContainerApp, error) {
 	spec, ok := tierSpecs[in.Tier]
 	if !ok {
-		return "", fmt.Errorf("unknown tier %q", in.Tier)
+		return armappcontainers.ContainerApp{}, fmt.Errorf("unknown tier %q", in.Tier)
 	}
 
 	app := armappcontainers.ContainerApp{
@@ -128,6 +152,22 @@ func (p *azureProvisioner) Create(ctx context.Context, in instance, token string
 							CPU:    to.Ptr(spec.CPU),
 							Memory: to.Ptr(spec.Memory),
 						},
+						VolumeMounts: []*armappcontainers.VolumeMount{
+							{
+								VolumeName: to.Ptr("data"),
+								MountPath:  to.Ptr("/data"),
+								SubPath:    to.Ptr(in.ID),
+							},
+						},
+					},
+				},
+				// One NFS share is shared by every instance; the sub-path is the
+				// instance id, so each database owns a directory and sees no other.
+				Volumes: []*armappcontainers.Volume{
+					{
+						Name:        to.Ptr("data"),
+						StorageType: to.Ptr(armappcontainers.StorageTypeNfsAzureFile),
+						StorageName: to.Ptr(p.envStorage),
 					},
 				},
 				Scale: &armappcontainers.Scale{
@@ -138,11 +178,7 @@ func (p *azureProvisioner) Create(ctx context.Context, in instance, token string
 		},
 	}
 
-	_, err := p.apps.BeginCreateOrUpdate(ctx, p.resourceGroup, in.ContainerAppName, app, nil)
-	if err != nil {
-		return "", err
-	}
-	return "https://" + in.ContainerAppName + "." + p.environmentDNS, nil
+	return app, nil
 }
 
 func (p *azureProvisioner) GetState(ctx context.Context, in instance) (liveState, error) {
