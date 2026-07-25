@@ -15,8 +15,8 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'mcp/**'
-      - 'build.sh'
-      - 'build.ps1'
+      - 'scripts/build.sh'
+      - 'scripts/build.ps1'
       - '.github/workflows/ci.yml'
   pull_request:
     paths: *engine
@@ -40,7 +40,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nasm
 
       - name: Build ELF64
-        run: bash ./build.sh
+        run: bash ./scripts/build.sh
 
       - name: Validate ELF header
         run: python3 tests/validate_elf.py build/asmdb
