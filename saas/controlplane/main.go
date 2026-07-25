@@ -21,11 +21,15 @@ type config struct {
 	Location       string
 	StorageAccount string
 	EnvStorage     string
-	AdminKey       string
 	SiteDir        string
+	EntraTenantID  string
+	EntraClientID  string
+	EntraGroupID   string
+	EntraScope     string
 }
 
 func loadConfig() (config, error) {
+	entraClientID := getenv("ASMDB_ENTRA_CLIENT_ID", "3e607c6e-811b-47e6-b9b1-9bbe11812596")
 	cfg := config{
 		Port:           getenv("PORT", "8080"),
 		SubscriptionID: os.Getenv("AZURE_SUBSCRIPTION_ID"),
@@ -35,8 +39,11 @@ func loadConfig() (config, error) {
 		Location:       getenv("ASMDB_LOCATION", "swedencentral"),
 		StorageAccount: os.Getenv("ASMDB_STORAGE_ACCOUNT"),
 		EnvStorage:     getenv("ASMDB_ENV_STORAGE", "asmdb-data"),
-		AdminKey:       os.Getenv("ASMDB_ADMIN_KEY"),
 		SiteDir:        getenv("ASMDB_SITE_DIR", "/app/site"),
+		EntraTenantID:  getenv("ASMDB_ENTRA_TENANT_ID", "<tenant-id>"),
+		EntraClientID:  entraClientID,
+		EntraGroupID:   getenv("ASMDB_ENTRA_GROUP_ID", "<admin-group-id>"),
+		EntraScope:     "api://" + entraClientID + "/" + entraScopeName,
 	}
 
 	var missing []string
@@ -83,7 +90,12 @@ func main() {
 		log.Fatalf("create Azure provisioner: %v", err)
 	}
 
-	api := newAPI(store, provisioner, cfg.AdminKey)
+	verifier, err := newOIDCAccessTokenVerifier(context.Background(), cfg)
+	if err != nil {
+		log.Printf("Entra token verifier unavailable; management API will fail closed: %v", err)
+	}
+
+	api := newAPI(store, provisioner, cfg, verifier)
 	mux := http.NewServeMux()
 	api.register(mux)
 	registerStatic(mux, cfg.SiteDir)

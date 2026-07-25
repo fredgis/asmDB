@@ -31,6 +31,10 @@ type rowPatch struct {
 	Content string `json:"content"`
 }
 
+type execInput struct {
+	Command string `json:"command"`
+}
+
 type page struct {
 	limit  int
 	offset int
@@ -54,6 +58,7 @@ func (a *api) routes() http.Handler {
 	mux.Handle("GET /v1/find", a.auth(http.HandlerFunc(a.handleFind)))
 	mux.Handle("GET /v1/range", a.auth(http.HandlerFunc(a.handleRange)))
 	mux.Handle("POST /v1/verify", a.auth(http.HandlerFunc(a.handleVerify)))
+	mux.Handle("POST /v1/exec", a.auth(http.HandlerFunc(a.handleExec)))
 	mux.Handle("POST /mcp", a.auth(http.HandlerFunc(a.handleMCP)))
 	return loggingMiddleware(mux)
 }
@@ -243,6 +248,21 @@ func (a *api) handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "detail": detail})
+}
+
+func (a *api) handleExec(w http.ResponseWriter, r *http.Request) {
+	var in execInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	lines, ok, err := a.engine.Exec(r.Context(), in.Command)
+	if err != nil {
+		writeMappedError(w, err)
+		return
+	}
+	// PAGE is session state in the engine. Paged REST handlers set PAGE before
+	// each listing, so a terminal PAGE command cannot leak into the data API.
+	writeJSON(w, http.StatusOK, map[string]any{"output": lines, "ok": ok})
 }
 
 func (a *api) writeRowsPage(w http.ResponseWriter, lines []string, err error, p page) {

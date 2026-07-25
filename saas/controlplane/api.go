@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -19,7 +23,9 @@ var (
 type api struct {
 	store       store
 	provisioner provisioner
-	adminKey    string
+	cfg         config
+	verifier    accessTokenVerifier
+	httpClient  *http.Client
 	now         func() time.Time
 }
 
@@ -39,13 +45,52 @@ type createDatabaseRequest struct {
 	Tier string `json:"tier"`
 }
 
-func newAPI(store store, provisioner provisioner, adminKey string) *api {
-	return &api{store: store, provisioner: provisioner, adminKey: adminKey, now: func() time.Time { return time.Now().UTC() }}
+type execRequest struct {
+	Command string `json:"command"`
+}
+
+type execResponse struct {
+	Output []string `json:"output"`
+	OK     bool     `json:"ok"`
+}
+
+func newAPI(store store, provisioner provisioner, cfg config, verifier accessTokenVerifier) *api {
+	return &api{
+		store:       store,
+		provisioner: provisioner,
+		cfg:         cfg,
+		verifier:    verifier,
+		httpClient:  &http.Client{Timeout: 60 * time.Second},
+		now:         func() time.Time { return time.Now().UTC() },
+	}
 }
 
 func (a *api) register(mux *http.ServeMux) {
+	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/api/v1/config", a.withCORS(a.handleConfig))
 	mux.HandleFunc("/api/v1/databases", a.withCORS(a.handleDatabases))
 	mux.HandleFunc("/api/v1/databases/", a.withCORS(a.handleDatabase))
+}
+
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (a *api) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"tenantId": a.cfg.EntraTenantID,
+		"clientId": a.cfg.EntraClientID,
+		"scope":    a.cfg.EntraScope,
+	})
 }
 
 func (a *api) handleDatabases(w http.ResponseWriter, r *http.Request) {
@@ -53,8 +98,14 @@ func (a *api) handleDatabases(w http.ResponseWriter, r *http.Request) {
 	case http.MethodOptions:
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodPost:
+		if !a.authorized(w, r) {
+			return
+		}
 		a.createDatabase(w, r)
 	case http.MethodGet:
+		if !a.authorized(w, r) {
+			return
+		}
 		a.listDatabases(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
@@ -62,18 +113,30 @@ func (a *api) handleDatabases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) handleDatabase(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/v1/databases/")
-	if strings.Contains(id, "/") || !idPattern.MatchString(id) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/databases/")
+	parts := strings.Split(rest, "/")
+	if len(parts) == 2 && parts[1] == "exec" {
+		a.handleExec(w, r, parts[0])
+		return
+	}
+	if len(parts) != 1 || !idPattern.MatchString(parts[0]) {
 		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
 		return
 	}
+	id := parts[0]
 
 	switch r.Method {
 	case http.MethodOptions:
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodGet:
+		if !a.authorized(w, r) {
+			return
+		}
 		a.getDatabase(w, r, id)
 	case http.MethodDelete:
+		if !a.authorized(w, r) {
+			return
+		}
 		a.deleteDatabase(w, r, id)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
@@ -81,9 +144,6 @@ func (a *api) handleDatabase(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
-	if !a.authorized(w, r) {
-		return
-	}
 	defer r.Body.Close()
 
 	var req createDatabaseRequest
@@ -186,9 +246,6 @@ func (a *api) getDatabase(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func (a *api) deleteDatabase(w http.ResponseWriter, r *http.Request, id string) {
-	if !a.authorized(w, r) {
-		return
-	}
 	in, err := a.store.Get(r.Context(), id)
 	if err == nil {
 		if err := a.provisioner.Delete(r.Context(), in); err != nil {
@@ -209,6 +266,92 @@ func (a *api) deleteDatabase(w http.ResponseWriter, r *http.Request, id string) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
+	if !idPattern.MatchString(id) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	defer r.Body.Close()
+
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
+		return
+	}
+
+	in, err := a.store.Get(r.Context(), id)
+	if errors.Is(err, errNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(tokenHash(token)), []byte(in.TokenHash)) != 1 {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
+		return
+	}
+
+	var req execRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body", err.Error())
+		return
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "marshal exec request", err.Error())
+		return
+	}
+
+	upstreamURL := strings.TrimRight(a.provisioner.Endpoint(in), "/") + "/v1/exec"
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway", "instance unreachable", err.Error())
+		return
+	}
+	upstreamReq.Header.Set("Authorization", "Bearer "+token)
+	upstreamReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.httpClient.Do(upstreamReq)
+	if err != nil {
+		if isTimeoutError(err) {
+			writeError(w, http.StatusGatewayTimeout, "gateway_timeout", "instance timed out", "")
+			return
+		}
+		writeError(w, http.StatusBadGateway, "bad_gateway", "instance unreachable", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		writeError(w, http.StatusBadGateway, "bad_gateway", "instance returned an error", resp.Status)
+		return
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway", "read instance response", err.Error())
+		return
+	}
+	var out execResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway", "instance returned invalid JSON", err.Error())
+		return
+	}
+	if out.Output == nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway", "instance returned invalid response", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
 	state, err := a.provisioner.GetState(ctx, in)
 	if err != nil {
@@ -226,11 +369,21 @@ func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
 }
 
 func (a *api) authorized(w http.ResponseWriter, r *http.Request) bool {
-	if a.adminKey == "" || r.Header.Get("X-Admin-Key") == a.adminKey {
-		return true
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok || a.verifier == nil || a.cfg.EntraGroupID == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
+		return false
 	}
-	writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid admin key", "")
-	return false
+	claims, err := a.verifier.Verify(r.Context(), token)
+	if err != nil || !containsString(claims.Scopes, entraScopeName) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
+		return false
+	}
+	if !containsString(claims.Groups, a.cfg.EntraGroupID) {
+		writeError(w, http.StatusForbidden, "forbidden", "required group membership missing", "")
+		return false
+	}
+	return true
 }
 
 func (a *api) withCORS(next http.HandlerFunc) http.HandlerFunc {
@@ -249,9 +402,25 @@ func (a *api) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		}
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", methods)
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		next(w, r)
 	}
+}
+
+func bearerToken(header string) (string, bool) {
+	scheme, token, ok := strings.Cut(strings.TrimSpace(header), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(token) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(token), true
+}
+
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func sameOrigin(origin, host string) bool {

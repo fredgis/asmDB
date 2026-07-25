@@ -297,50 +297,56 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
       <p class="sec__sub">
         Tiers buy latency and headroom — never features. The row ceiling, the
         durability guarantees and the change log are identical on all three, because
-        they are properties of the engine, not of a price list.
+        they are properties of the engine, not of a price list. Prices are USD per
+        month; the cost basis is <a href="https://github.com/fredgis/asmDB/blob/main/docs/COST.md">published in the repository</a>.
       </p>
     </div>
 
     <div class="tiers">
       <div class="tier">
         <p class="tier__n">Free</p>
-        <p class="tier__p">—<small>pricing at general availability</small></p>
+        <p class="tier__p">$0<small>USD / month</small></p>
         <ul class="tier__list">
-          <li>0.25 vCPU · 0.5 GiB</li>
-          <li>Sleeps after 5 minutes idle</li>
-          <li>3 databases</li>
-          <li>CLI · REST · MCP</li>
-          <li>4,194,304 rows</li>
+          <li>0.25 vCPU / 0.5 GiB</li>
+          <li>Sleeps when idle</li>
+          <li>Max 3 databases per account</li>
+          <li>Same 4,194,304-row ceiling</li>
+          <li>Identical CLI, REST and MCP</li>
         </ul>
         <div class="tier__cta"><button class="btn btn--ghost" data-tier="free" type="button">Create free database</button></div>
       </div>
 
-      <div class="tier tier--featured">
+      <div class="tier">
         <p class="tier__n">Standard</p>
-        <p class="tier__p">—<small>pricing at general availability</small></p>
+        <p class="tier__p">$15<small>USD / month</small></p>
         <ul class="tier__list">
-          <li>0.5 vCPU · 1 GiB</li>
-          <li>Sleeps after 30 minutes idle</li>
-          <li>20 databases</li>
-          <li>CLI · REST · MCP</li>
-          <li>Change log retention control</li>
+          <li>0.5 vCPU / 1 GiB</li>
+          <li>Sleeps when idle</li>
+          <li>Max 20 databases per account</li>
+          <li>Same 4,194,304-row ceiling</li>
+          <li>Identical CLI, REST and MCP</li>
         </ul>
         <div class="tier__cta"><button class="btn btn--primary" data-tier="standard" type="button">Create standard database</button></div>
       </div>
 
       <div class="tier">
         <p class="tier__n">Premium</p>
-        <p class="tier__p">—<small>pricing at general availability</small></p>
+        <p class="tier__p">$49<small>USD / month</small></p>
         <ul class="tier__list">
-          <li>1 vCPU · 2 GiB</li>
-          <li>Always warm, never sleeps</li>
-          <li>100 databases</li>
-          <li>CLI · REST · MCP</li>
-          <li>Priority on new engine builds</li>
+          <li>1 vCPU / 2 GiB</li>
+          <li>Always warm, no cold start</li>
+          <li>Max 100 databases per account</li>
+          <li>Same 4,194,304-row ceiling</li>
+          <li>Identical CLI, REST and MCP</li>
         </ul>
         <div class="tier__cta"><button class="btn btn--ghost" data-tier="premium" type="button">Create premium database</button></div>
       </div>
     </div>
+    <p class="tier-note">
+      Free uses 0.25 vCPU / 0.5 GiB because Container Apps Consumption has no
+      smaller 1:2 CPU-to-memory pair. Premium keeps a replica resident; the price
+      buys no cold start, not a different engine.
+    </p>
   </div>
 </section>
 
@@ -356,6 +362,33 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
         shown once and never stored in plaintext — copy it before you leave the page.
       </p>
     </div>
+
+    <div class="auth-gate" id="auth-panel">
+      <div class="auth-gate__mark">
+        <img src="assets/logo.png" alt="" width="96" height="96">
+      </div>
+      <div class="auth-gate__copy">
+        <p class="sec__kicker">Console access</p>
+        <h3 class="auth-gate__title">Sign in with Microsoft Entra ID.</h3>
+        <p class="auth-gate__text">
+          Provisioning and the browser CLI are restricted to members of the
+          <strong>ASMDB_ADMIN</strong> security group. There are no local users,
+          passwords or public sign-up path.
+        </p>
+        <div class="auth-gate__actions">
+          <button class="btn btn--primary" id="auth-signin" type="button">Sign in with Microsoft</button>
+          <p class="auth-gate__status mono" id="auth-status">Not signed in.</p>
+        </div>
+        <p class="auth-gate__detail" id="auth-detail">The public site remains available. Sign in to create databases and open the CLI.</p>
+      </div>
+    </div>
+
+    <div class="console-session" id="console-app" hidden>
+      <div class="console-session__bar">
+        <span class="badge">signed in</span>
+        <span id="auth-user">Microsoft account</span>
+        <button class="btn btn--ghost" id="auth-signout" type="button">Sign out</button>
+      </div>
 
     <div class="split">
       <div class="console">
@@ -398,6 +431,35 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
         </p>
       </div>
     </div>
+
+    <div class="terminal console" id="db-terminal" hidden>
+      <div class="terminal__head">
+        <div>
+          <p class="sec__kicker">Browser CLI</p>
+          <h3 class="terminal__title">asmdb on <span id="term-db-id">this database</span></h3>
+        </div>
+        <span class="badge" id="term-state">ready</span>
+      </div>
+      <p class="terminal__meta" id="term-meta">Commands are proxied through the control plane and run against the engine.</p>
+      <div class="field terminal__token" id="term-token-wrap" hidden>
+        <label for="term-token">instance token</label>
+        <input id="term-token" type="password" autocomplete="off" spellcheck="false" placeholder="paste bearer token">
+        <span class="hint">Needed when the token was not returned on this page.</span>
+      </div>
+      <pre class="terminal__screen mono" id="term-screen" aria-live="polite"></pre>
+      <form class="terminal__form" id="term-form">
+        <label class="terminal__prompt" for="term-command">asmdb&gt;</label>
+        <input id="term-command" type="text" autocomplete="off" spellcheck="false" placeholder="HELP">
+        <button class="btn btn--primary" id="term-send" type="submit">Run</button>
+      </form>
+      <div class="terminal__hints" aria-label="starter commands">
+        <button type="button" data-command="HELP">HELP</button>
+        <button type="button" data-command="COUNT">COUNT</button>
+        <button type="button" data-command="SELECT *">SELECT *</button>
+        <button type="button" data-command="INSERT 1 5 tag some text">INSERT 1 5 tag some text</button>
+      </div>
+    </div>
+    </div>
   </div>
 </section>
 
@@ -421,7 +483,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
           <li><a href="https://github.com/fredgis/asmDB/blob/main/docs/ENGINE.md">Specification</a></li>
           <li><a href="https://github.com/fredgis/asmDB/blob/main/docs/COMMANDS.md">Command reference</a></li>
           <li><a href="https://github.com/fredgis/asmDB/blob/main/docs/CDC.md">Change data capture</a></li>
-          <li><a href="https://github.com/fredgis/asmDB/blob/main/SECURITY.md">Security model</a></li>
+          <li><a href="https://github.com/fredgis/asmDB/blob/main/docs/SECURITY.md">Security model</a></li>
         </ul>
       </div>
       <div>
@@ -448,6 +510,9 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
   </div>
 </footer>
 
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"
+        integrity="sha384-B5PXeUfgiegchZiX5iMRssMrHd9NfPhFnITob1HyW1CY76udptWpBsniaDsH/+BY"
+        crossorigin="anonymous"></script>
 <script src="js/console.js"></script>
 </body>
 </html>

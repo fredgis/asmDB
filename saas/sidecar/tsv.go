@@ -154,6 +154,20 @@ func validateLineLength(line string) error {
 	return nil
 }
 
+func validateExecCommand(line string) error {
+	if strings.ContainsAny(line, "\r\n") {
+		return codedError{code: "invalid_request", msg: "command must be a single line"}
+	}
+	if err := validateLineLength(line); err != nil {
+		return err
+	}
+	cmd := strings.TrimSpace(line)
+	if strings.EqualFold(cmd, "EXIT") || strings.EqualFold(cmd, "QUIT") {
+		return codedError{code: "invalid_request", msg: "command is not allowed in the browser terminal"}
+	}
+	return nil
+}
+
 type codedError struct {
 	code string
 	msg  string

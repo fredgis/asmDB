@@ -82,6 +82,40 @@ func (e *Engine) PagedCommand(ctx context.Context, limit, offset int, line strin
 	return e.runLocked(ctx, line, waitRowsStatus)
 }
 
+func (e *Engine) Exec(ctx context.Context, line string) ([]string, bool, error) {
+	if err := validateExecCommand(line); err != nil {
+		return nil, false, err
+	}
+	before := e.generation()
+	e.cmdMu.Lock()
+	defer e.cmdMu.Unlock()
+	if e.closed {
+		return nil, false, errors.New("engine is closed")
+	}
+	if before != e.generation() {
+		return nil, false, errors.New("engine restarted while request was queued")
+	}
+	if err := e.ensureStartedLocked(); err != nil {
+		return nil, false, err
+	}
+	if _, err := e.runLocked(ctx, "FORMAT TABLE", waitStatus); err != nil {
+		return nil, false, err
+	}
+	lines, cmdErr := e.runLocked(ctx, line, waitStatus)
+	if _, err := e.runLocked(context.Background(), "FORMAT TSV", waitStatus); err != nil {
+		e.restartLocked("FORMAT TSV restore failed after exec")
+		return nil, false, fmt.Errorf("FORMAT TSV restore failed: %w", err)
+	}
+	if cmdErr != nil {
+		var ee EngineError
+		if errors.As(cmdErr, &ee) {
+			return lines, false, nil
+		}
+		return lines, false, cmdErr
+	}
+	return lines, true, nil
+}
+
 func (e *Engine) Close(ctx context.Context) {
 	e.cmdMu.Lock()
 	defer e.cmdMu.Unlock()
