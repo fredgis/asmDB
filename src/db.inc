@@ -197,6 +197,10 @@ db_write_header:
     mov  [rel g_hdr+HDR_RESETP], rax
     mov  rax, [rel g_reset_seq]
     mov  [rel g_hdr+HDR_RESETS], rax
+    mov  rax, [rel g_lineage_lo]
+    mov  [rel g_hdr+HDR_LINEAGE], rax
+    mov  rax, [rel g_lineage_hi]
+    mov  [rel g_hdr+HDR_LINEAGE+8], rax
     lea  rdi, [rel g_hdr+HDR_TABLE]
     lea  rsi, [rel g_tablename]
     mov  rcx, TABLE_MAX
@@ -458,6 +462,32 @@ db_open:
     mov  [rel g_reset_pend], rax
     mov  rax, [rel g_hdr_read+HDR_RESETS]
     mov  [rel g_reset_seq], rax
+    ; reset state must be self-consistent: a pending reset is the sequence that
+    ; comes immediately next, and no pending reset means no pending sequence
+    mov  rax, [rel g_reset_pend]
+    cmp  rax, 1
+    ja   .corrupt
+    test rax, rax
+    jnz  .pending
+    cmp  qword [rel g_reset_seq], 0
+    jne  .corrupt
+    jmp  .resetok
+.pending:
+    mov  rax, [rel g_seq]
+    inc  rax
+    cmp  rax, [rel g_reset_seq]
+    jne  .corrupt
+.resetok:
+    ; lineage ties this file to its change log; older files have none yet
+    mov  rax, [rel g_hdr_read+HDR_LINEAGE]
+    mov  [rel g_lineage_lo], rax
+    mov  rax, [rel g_hdr_read+HDR_LINEAGE+8]
+    mov  [rel g_lineage_hi], rax
+    mov  rax, [rel g_lineage_lo]
+    or   rax, [rel g_lineage_hi]
+    jnz  .havelin
+    call cdc_lineage_make            ; adopt one for a pre-1.1 database
+.havelin:
     ; remember which engine last wrote this file (0 = predates the stamp)
     mov  eax, [rel g_hdr_read+HDR_ENGINE]
     mov  [rel g_writer_ver], rax
@@ -488,6 +518,7 @@ db_open:
     call wal_open
     call wal_recover
     call cdc_recover_reset           ; finish a RESET a crash cut short
+    call cdc_check_aligned           ; log and header must now agree
     jmp  .load
 .newfile:
     ; brand-new file: mark it sparse so unwritten slots cost no disk, then set
@@ -496,6 +527,7 @@ db_open:
     call os_set_sparse
     mov  qword [rel g_count], 0
     mov  qword [rel g_writer_ver], ENGINE_VERSION   ; we are creating it
+    call cdc_lineage_make            ; a brand-new database, a brand-new lineage
     cmp  dword [rel g_have_argtable], 0
     jne  .nf_arg
     lea  rsi, [rel g_base]
@@ -518,6 +550,7 @@ db_open:
     call wal_open
     call wal_recover                 ; a committed WAL may predate this file
     call cdc_recover_reset
+    call cdc_check_aligned
 .load:
     ; Map the slot region COPY-ON-WRITE instead of committing 1 GiB and reading
     ; it. Reads fault in on demand (a sparse file's holes cost nothing), writes
@@ -770,8 +803,9 @@ db_upgrade:
     mov  r8, [rel g_walbuf]
     mov  r9, rbx
     call os_pread
-    cmp  rax, 0
-    jle  .streamed                   ; EOF or error - stop with what we have
+    test rax, rax
+    js   io_fatal_read               ; a read error must never look like success
+    jz   .short_src                  ; EOF before the header's own length
     mov  rbx, rax
     xor  rsi, rsi                    ; offset inside the chunk
 .rec:
@@ -856,6 +890,17 @@ db_upgrade:
     jmp  .ret
 .nosrc:
     lea  rcx, [rel s_upg_nosrc]
+    call puts
+    mov  eax, 1
+    jmp  .ret
+.short_src:
+    ; The source ended before the region its own header describes. Persisting
+    ; what we read and calling it a migration would silently produce a partial
+    ; database, so refuse - the destination is a separate file and the original
+    ; is untouched, so nothing is lost by stopping here.
+    mov  rcx, r14
+    call os_close
+    lea  rcx, [rel s_upg_short]
     call puts
     mov  eax, 1
 .ret:

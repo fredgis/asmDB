@@ -372,7 +372,7 @@ if command -v python3 >/dev/null 2>&1; then
     else
         echo "  [FAIL] CDC torn tail is trimmed"; fail=$((fail+1))
     fi
-    printf '\xFF' | dd of=cdc1.cdc bs=1 seek=60 conv=notrunc status=none
+    printf '\xFF' | dd of=cdc1.cdc bs=1 seek=124 conv=notrunc status=none
     bad_size="$(stat -c%s cdc1.cdc)"
     r15="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb cdc1 2>&1)"; rc=$?
     check 'CDC bad checksum refused' 'checksum'                               "$r15"
@@ -430,6 +430,56 @@ if command -v python3 >/dev/null 2>&1; then
     else
         echo "  [SKIP] CDC crash checks (nasm not found)"
     fi
+
+    # 15i a COMPLETE frame with a damaged trailer is corruption, not a torn
+    #     append: refuse and keep the log
+    printf '%s\n' 'INSERT 1 1 a un' 'INSERT 2 2 b deux' 'EXIT' | ./asmdb cdct > /dev/null
+    tsz="$(stat -c%s cdct.cdc)"
+    printf '\x00' | dd of=cdct.cdc bs=1 seek=384 conv=notrunc status=none
+    rt="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb cdct 2>&1)"; rc=$?
+    check 'CDC damaged trailer refused' 'trailer is damaged'                  "$rt"
+    if [[ $rc -ne 0 && "$(stat -c%s cdct.cdc)" == "$tsz" ]]; then
+        echo "  [PASS] CDC damaged trailer kept log"
+    else
+        echo "  [FAIL] CDC damaged trailer kept log"; fail=$((fail+1))
+    fi
+
+    # 15j a log AHEAD of the database would make every future commit look
+    #     already-published while the data kept moving - refuse
+    printf '%s\n' 'INSERT 1 1 a un' 'INSERT 2 2 b deux' 'EXIT' | ./asmdb cdca > /dev/null
+    printf '\x00\x00\x00\x00\x00\x00\x00\x00' | dd of=cdca.dat bs=1 seek=88 conv=notrunc status=none
+    ra="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb cdca 2>&1)"
+    check 'CDC ahead of the database refused' 'disagree on the last committed sequence' "$ra"
+
+    # 15k removing the log is the documented escape hatch: the database still
+    #     opens and the stream resumes after the watermark
+    printf '%s\n' 'INSERT 1 1 a un' 'INSERT 2 2 b deux' 'EXIT' | ./asmdb cdcd > /dev/null
+    rm -f cdcd.cdc
+    printf '%s\n' 'INSERT 3 3 c trois' 'EXIT' | ./asmdb cdcd > /dev/null
+    check 'stream resumes after the watermark' 'frames=1 last_seq=3' "$(python3 "$dump" cdcd.cdc --quiet)"
+    # 15l slot reuse: DELETE then INSERT on the same tombstone must emit BOTH
+    printf '%s\n' 'INSERT 5 50 old ancienne ligne' 'EXIT' | ./asmdb reuse > /dev/null
+    printf '%s\n' 'BEGIN' 'DELETE 5' 'INSERT 9 90 new nouvelle ligne' 'COMMIT' 'EXIT' | ./asmdb reuse > /dev/null
+    ru="$(python3 "$dump" reuse.cdc)"
+    check 'slot reuse deletes the old id' 'DELETE id=5'        "$ru"
+    check 'slot reuse upserts the new id' 'UPSERT id=9'        "$ru"
+
+    # 15m a fresh database must refuse a change log belonging to another one
+    printf '%s\n' 'INSERT 1 1 a un' 'EXIT' | ./asmdb lineA > /dev/null
+    cp lineA.cdc lineB.cdc
+    rl="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb lineB 2>&1)"
+    check 'foreign change log refused' 'different database'    "$rl"
+
+    # 15n the log carries a header, and a log recreated after removal starts at
+    #     the watermark and still verifies frame by frame
+    if [[ "$(head -c 8 lineA.cdc)" == "ASMCDCH1" ]]; then
+        echo "  [PASS] log has a file header"
+    else
+        echo "  [FAIL] log has a file header"; fail=$((fail+1))
+    fi
+    rm -f cdcd.cdc
+    printf '%s\n' 'INSERT 7 7 g sept' 'EXIT' | ./asmdb cdcd > /dev/null
+    check 'recreated log verifies from its base' 'frames=1'    "$(python3 "$dump" cdcd.cdc --quiet)"
 else
     echo "  [SKIP] CDC checks (python3 not found)"
 fi

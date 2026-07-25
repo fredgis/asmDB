@@ -7,7 +7,7 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). ~30 KB. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). ~33 KB. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -17,7 +17,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-~30%20KB%20PE%20%2F%20~39%20KB%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-~33%20KB%20PE%20%2F%20~41%20KB%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -140,8 +140,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~30 KB</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~39 KB</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~33 KB</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~41 KB</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -350,7 +350,7 @@ flowchart LR
 
 ### The deep dive
 
-How ~30 KB of assembly becomes a durable database.
+How ~33 KB of assembly becomes a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -363,7 +363,7 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the binaries stay ~30 KB (PE) / ~39 KB (ELF) on disk — and why a
+which is why the binaries stay ~33 KB (PE) / ~41 KB (ELF) on disk — and why a
 million-row database needs only a few MB of RAM.
 
 #### The record store — four cache lines per row
@@ -435,11 +435,12 @@ bytes no longer match its checksum, asmdb **refuses to open** rather than
 replay corrupt rows or silently drop an acknowledged transaction — see the
 [error reference](docs/COMMANDS.md#error-reference).
 
-## On-disk format: `.dat` and `.wal`
+## On-disk format: `.dat`, `.wal` and `.cdc`
 
-asmdb persists a database as **two files** next to each other: `<name>.dat` holds
-the data, `<name>.wal` is the transaction log (present only while a commit is in
-flight, or after a crash).
+asmdb persists a database as **three files** next to each other: `<name>.dat`
+holds the data, `<name>.wal` is the transaction log (present only while a commit
+is in flight, or after a crash), and `<name>.cdc` is the append-only
+[change log](#change-data-capture), specified in [`docs/CDC.md`](docs/CDC.md).
 
 ### `<name>.dat` — the data file
 
@@ -447,28 +448,34 @@ A **512-byte header** followed by the fixed slot array. Every RVA-style offset i
 exact; there is no padding surprise because the record size never changes.
 
 ```
-offset  size  field        value / meaning
-------  ----  -----------  ---------------------------------------------
-   0      8   magic        "ASMDB\0\0\0"
-   8      4   version      1
-  12      4   record_size  256
-  16      8   capacity     4194304
-  24      8   live_count   number of live rows (rewritten on each flush)
-  32     48   table_name   ASCII, NUL-padded
-  80    432   reserved     zero-filled to 512
- 512    1 GiB slot array   capacity × 256-byte records (sparse on disk)
+offset  size  field             value / meaning
+------  ----  ----------------  ----------------------------------------
+   0      8   magic             "ASMDB\0\0\0"
+   8      4   version           2
+  12      4   record_size       256
+  16      8   capacity          4194304
+  24      8   live_count        number of live rows
+  32     48   table_name        ASCII, NUL-padded
+  80      4   engine_version    the build that last wrote this file
+  88      8   last_commit_seq   change-log watermark
+  96      8   reset_pending     1 while a whole-table replacement is in flight
+ 104      8   reset_pending_seq the sequence that RESET will carry
+ 112     16   lineage           identity shared with <name>.cdc
+ 128    384   reserved          zero-filled to 512
+ 512    1 GiB slot array        capacity × 256-byte records (sparse on disk)
 ```
 
 Slot *i* lives at file offset `512 + i * 256`. A record is
 `u64 id · u8 status · u8 kind · u32 clen · i64 created · i64 updated · i64 value
 · char[40] tag · char[176] content`; `status` is `0` empty, `1` live, `2`
-tombstone. Because the on-disk slot layout mirrors the in-RAM table exactly,
-loading a database is a single `ReadFile` of the whole slot region — no parsing,
-no per-row deserialization.
+tombstone. Because the on-disk slot layout mirrors the in-RAM table exactly, the
+region is **mapped copy-on-write** rather than parsed — no deserialization, and
+only the pages actually touched become resident.
 
-> Note: `db_open` validates only the 5-byte magic, not the version or capacity,
-> so a database created by an older build still opens after the capacity was
-> raised. The header is authoritative for `live_count` and `table_name`.
+> `db_open` validates the magic, the version, the record size, the capacity and
+> the row count, and refuses anything it cannot fully account for rather than
+> reinterpreting it. A database from an incompatible build is migrated with
+> [`--upgrade`](#upgrading-a-database), never silently.
 
 ### `<name>.wal` — the write-ahead log
 
@@ -476,20 +483,32 @@ Written only during `COMMIT` and read only during recovery. Layout, in the exact
 order it is flushed:
 
 ```
-offset        size        field    meaning
-------------  ----------  -------  --------------------------------------
-   0            8         magic    "ASMWAL01"
-   8            8         N        number of staged entries
-  16            8         count    live_count to stamp into the header
-  24         N × 264      entries  N × { u64 slot_index ; 256-byte after-image }
-24 + N×264      8         marker   "COMMIT01"  (written & flushed LAST)
+offset        size        field       meaning
+------------  ----------  ----------  -----------------------------------
+   0            8         magic       "ASMWAL03"
+   8            8         N           number of staged entries
+  16            8         count       live_count to stamp into the header
+  24            8         commit_seq  the change-log sequence this commit takes
+  32            8         flags       bit 0 = RESET
+  40         N × 280      entries     N × { u64 slot_index ; u64 prev_id ;
+                                            u64 prev_status ; 256-byte image }
+40 + N×280      8         marker      "COMMIT01"   ┐ written & flushed
+48 + N×280      8         crc32       of [0, 40+N×280)  ┘ together, LAST
 ```
 
-The marker is the commit point. Recovery reads the log, checks the magic, bounds
-`N`, and looks for `COMMIT01` at the computed offset. If everything lines up it
-replays each entry as an absolute write to `512 + slot_index × 256`; otherwise it
-discards the log. Since every entry is an absolute slot write, replaying a log
-twice is harmless — recovery is idempotent.
+The marker is the commit point, and its checksum ships in the same flush, so a
+frame can never be committed without one. Only slots that **actually changed**
+are staged, which is what makes the frame double as the change set; `prev_id`
+and `prev_status` are what let a reused slot emit `DELETE(old)` alongside
+`UPSERT(new)`.
+
+Recovery reads the log, verifies the magic, the marker and the checksum, then —
+before touching the data file — publishes the change frame if the crash lost it,
+replays each entry as an absolute write to `512 + slot_index × 256`, and only
+then truncates the log. Since every entry is an absolute slot write and the
+change frame is keyed by sequence, replaying twice is harmless: recovery is
+idempotent. Frames carrying the older `ASMWAL01`/`ASMWAL02` magic are still
+replayed, so an engine upgrade never drops an acknowledged commit.
 
 ## Performance
 
@@ -703,7 +722,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.0.0 · 0.9.0 · 0.8.0 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.1.0 · 1.0.0 · 0.9.0 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -722,6 +741,53 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+<summary><b>1.1.0</b> — CDC lineage, dense sequences, and four audit fixes</summary>
+
+An external audit of 1.0.0 found that the change log, while structurally sound,
+had gaps that undermined the very guarantee it exists to provide. All of them
+are closed.
+
+**A reused slot no longer loses its `DELETE`.** `DELETE 5` then `INSERT 9`
+landing on the same tombstone inside one transaction produced only `UPSERT 9` —
+a consumer kept row 5 forever. WAL entries (v03) now carry what the slot held
+*before*, so both the commit path and recovery emit `DELETE(5)` **and**
+`UPSERT(9)`.
+
+**The log is no longer anonymous.** A 64-byte file header carries a **lineage**
+shared with `<db>.dat`, plus `base_seq`. Pairing a fresh database with an old
+log used to restart sequences at 1 while the log held 100, so the next hundred
+commits looked "already published" and were dropped in silence. That pairing is
+now refused. `base_seq` also lets a log recreated after an operator removed it
+stay verifiable instead of pretending to be the start of history.
+
+**Sequences must be dense, not merely increasing.** `1, 3` was accepted; since
+the engine advances by exactly one per frame, a gap means history was lost. The
+emit gate is equally strict: only `seq == last` (already published) or
+`seq == last + 1` (the next frame) are legitimate.
+
+**A complete frame is never trimmed.** Trimming is now permitted *only* when the
+frame does not fit in the file. Any failure on a frame that is physically
+complete — magic, trailer, checksum, structure — refuses the open and keeps the
+file. An I/O error aborts rather than truncating anything.
+
+Also: `ROLLBACK` clears the pending-reset flag (a rolled-back `TRUNCATE` could
+arm a spurious `RESET` for the next commit); `reset_pending` invariants are
+checked at open; frame validation bounds `op_count` before multiplying it and
+rejects unknown flags; and the snapshot-after-`RESET` rule is now a stated
+contract — *only load a backup whose watermark is ≥ the reset's sequence*.
+
+**Found outside the CDC:** `--upgrade` treated a read error or premature EOF
+while streaming the source as "done", persisted the partial result and reported
+success. It now aborts on error and refuses on a short source.
+
+`README.md` and `ENGINE.md` were describing the pre-CDC protocol and the v1
+header — for a durability feature, contradictory documentation is a defect, so
+both are now in step with `docs/CDC.md`.
+
+Tests: 102 → 113 checks per platform.
+</details>
 
 <details>
 <summary><b>1.0.0</b> — change data capture, and the format that makes it stable</summary>

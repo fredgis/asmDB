@@ -110,9 +110,11 @@ entry:
     mov  rcx, WAL_BUF_SIZE
     call valloc_req
     mov  [rel g_walbuf], rax
-    mov  rcx, WAL_BUF_SIZE
+    ; A change frame can carry TWO operations per staged entry (a reused slot
+    ; emits DELETE(old) then UPSERT(new)), so size it for the worst case.
+    mov  rcx, CDC_BUF_SIZE
     call valloc_req
-    mov  [rel g_cdcbuf], rax         ; one CDC frame at a time
+    mov  [rel g_cdcbuf], rax
 
     mov  qword [rel g_readpos], 0
     mov  qword [rel g_readlen], 0

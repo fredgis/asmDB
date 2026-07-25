@@ -415,7 +415,7 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
         $r15 = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cdc1 2>&1
         Check 'CDC torn tail is trimmed' ($LASTEXITCODE -eq 0 -and (Get-Item $cdcPath).Length -eq $bytes.Length)
         $b2 = [IO.File]::ReadAllBytes($cdcPath)
-        $b2[60] = $b2[60] -bxor 0xFF                                          # corrupt frame 1's payload
+        $b2[64 + 60] = $b2[64 + 60] -bxor 0xFF      # corrupt frame 1's payload (past the file header)
         [IO.File]::WriteAllBytes($cdcPath, $b2)
         $sizeBad = (Get-Item $cdcPath).Length
         $r15b = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cdc1 2>&1
@@ -470,6 +470,72 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
         } else {
             Write-Host "  [SKIP] CDC crash checks (nasm not found)" -ForegroundColor Yellow
         }
+
+        # 15i a COMPLETE frame whose trailer is damaged is corruption, not a
+        #     torn append: refuse and keep the log
+        (@('INSERT 1 1 a un', 'INSERT 2 2 b deux', 'EXIT') -join "`n") | .\asmdb.exe cdct | Out-Null
+        $tp = Join-Path $work 'cdct.cdc'
+        $tb = [IO.File]::ReadAllBytes($tp); $tsz = $tb.Length
+        $tb[64 + 320] = 0                              # trailer of frame 1, past the file header
+        [IO.File]::WriteAllBytes($tp, $tb)
+        $rt = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cdct 2>&1
+        Check 'CDC damaged trailer refused' ($LASTEXITCODE -ne 0 -and ($rt -join "`n") -match 'trailer is damaged')
+        Check 'CDC damaged trailer kept log' ((Get-Item $tp).Length -eq $tsz)
+
+        # 15j a log that is AHEAD of the database would make every future commit
+        #     look already-published while the data kept moving - refuse
+        (@('INSERT 1 1 a un', 'INSERT 2 2 b deux', 'EXIT') -join "`n") | .\asmdb.exe cdca | Out-Null
+        $dp = Join-Path $work 'cdca.dat'
+        $fs = [IO.File]::Open($dp, 'Open', 'Write')
+        $fs.Seek(88, 'Begin') | Out-Null
+        $fs.Write([BitConverter]::GetBytes([uint64]0), 0, 8)   # rewind the watermark
+        $fs.Close()
+        $ra = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cdca 2>&1
+        Check 'CDC ahead of the database refused' ($LASTEXITCODE -ne 0 -and ($ra -join "`n") -match 'disagree on the last committed sequence')
+
+        # 15k removing the log is the documented escape hatch: the database
+        #     still opens and the stream resumes after the watermark
+        (@('INSERT 1 1 a un', 'INSERT 2 2 b deux', 'EXIT') -join "`n") | .\asmdb.exe cdcd | Out-Null
+        Remove-Item (Join-Path $work 'cdcd.cdc') -Force
+        (@('INSERT 3 3 c trois', 'EXIT') -join "`n") | .\asmdb.exe cdcd | Out-Null
+        $jd = CdcJson 'cdcd'
+        # 15l slot reuse: DELETE then INSERT landing on the same tombstone must
+        #     emit BOTH events. Only the UPSERT would leave a consumer holding a
+        #     row the database no longer has.
+        (@('INSERT 5 50 old ancienne ligne', 'EXIT') -join "`n") | .\asmdb.exe reuse | Out-Null
+        $j5 = CdcJson 'reuse'
+        $slot5 = $j5.frames.Count
+        (@('BEGIN', 'DELETE 5', 'INSERT 9 90 new nouvelle ligne', 'COMMIT', 'EXIT') -join "`n") | .\asmdb.exe reuse | Out-Null
+        $j6 = CdcJson 'reuse'
+        Check 'slot reuse log validates' ($null -ne $j6)
+        if ($j6) {
+            $last = $j6.frames[-1]
+            $ops = @($last.ops)
+            Check 'slot reuse emits two operations' ($ops.Count -eq 2)
+            Check 'slot reuse deletes the old id'   (@($ops | Where-Object { $_.op -eq 'DELETE' -and $_.id -eq 5 }).Count -eq 1)
+            Check 'slot reuse upserts the new id'   (@($ops | Where-Object { $_.op -eq 'UPSERT' -and $_.id -eq 9 }).Count -eq 1)
+        }
+
+        # 15m a fresh database must refuse a change log belonging to another one
+        (@('INSERT 1 1 a un', 'EXIT') -join "`n") | .\asmdb.exe lineA | Out-Null
+        Copy-Item (Join-Path $work 'lineA.cdc') (Join-Path $work 'lineB.cdc') -Force
+        $rl = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe lineB 2>&1
+        Check 'foreign change log refused' ($LASTEXITCODE -ne 0 -and ($rl -join "`n") -match 'different database')
+
+        # 15n the log carries a header tying it to the database, and its
+        #     sequence numbering starts where the header says
+        $cb = [IO.File]::ReadAllBytes((Join-Path $work 'lineA.cdc'))
+        Check 'log has a file header' ([Text.Encoding]::ASCII.GetString($cb[0..7]) -eq 'ASMCDCH1')
+        $db = [IO.File]::ReadAllBytes((Join-Path $work 'lineA.dat'))[0..159]
+        Check 'log lineage matches the database' (
+            [BitConverter]::ToUInt64($cb, 16) -eq [BitConverter]::ToUInt64($db, 112) -and
+            [BitConverter]::ToUInt64($cb, 24) -eq [BitConverter]::ToUInt64($db, 120))
+        # after removing the log, the new one starts at the watermark, and the
+        # reader still verifies it frame by frame
+        Remove-Item (Join-Path $work 'cdcd.cdc') -Force -ErrorAction SilentlyContinue
+        (@('INSERT 7 7 g sept', 'EXIT') -join "`n") | .\asmdb.exe cdcd | Out-Null
+        $jn = CdcJson 'cdcd'
+        Check 'recreated log verifies from its base' ($null -ne $jn -and $jn.frames.Count -eq 1)
     } else {
         Write-Host "  [SKIP] CDC checks (python not found)" -ForegroundColor Yellow
     }

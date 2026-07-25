@@ -176,6 +176,8 @@ wal_recover:
     mov  qword [rbp-48], WAL_HDR_V2  ; entry base
     mov  qword [rbp-56], 0           ; commit_seq (v03 only)
     mov  qword [rbp-64], 0           ; flags (v03 only)
+    mov  qword [rbp-72], UNDO_ENTRY  ; entry stride
+    mov  qword [rbp-80], 8           ; after-image offset within an entry
     mov  rax, [rel wal_magic3]
     cmp  rax, [rbx]
     je   .v3
@@ -189,6 +191,8 @@ wal_recover:
 .v3:
     mov  qword [rbp-40], 1
     mov  qword [rbp-48], WAL_HDR_V3
+    mov  qword [rbp-72], WAL_ENT_V3
+    mov  qword [rbp-80], WAL_ENT_IMAGE
     mov  rax, [rbx+24]
     mov  [rbp-56], rax               ; commit_seq
     mov  rax, [rbx+32]
@@ -200,9 +204,9 @@ wal_recover:
     mov  rsi, [rbx+8]                ; N
     cmp  rsi, UNDO_MAX
     ja   .clear
-    ; marker offset = entry base + N * UNDO_ENTRY
+    ; marker offset = entry base + N * entry stride
     mov  rax, rsi
-    imul rax, rax, UNDO_ENTRY
+    imul rax, [rbp-72]
     add  rax, [rbp-48]               ; rax = marker offset
     mov  rdi, rax                    ; save marker offset
     add  rax, 8
@@ -241,7 +245,7 @@ wal_recover:
     cmp  r12, rsi
     jae  .chk_done
     mov  rax, r12
-    imul rax, rax, UNDO_ENTRY
+    imul rax, [rbp-72]
     add  rax, [rbp-48]
     add  rax, rbx                    ; entry ptr
     mov  rdx, [rax]                  ; slot index
@@ -274,11 +278,12 @@ wal_recover:
     cmp  r12, rsi
     jae  .apply_done
     mov  rax, r12
-    imul rax, rax, UNDO_ENTRY
+    imul rax, [rbp-72]
     add  rax, [rbp-48]
     add  rax, rbx                    ; entry ptr
     mov  rdi, [rax]                  ; index
-    lea  rdx, [rax+8]                ; image ptr
+    add  rax, [rbp-80]
+    mov  rdx, rax                    ; image ptr
     mov  rcx, rdi
     shl  rcx, REC_SHIFT
     add  rcx, HDR_SIZE               ; file offset
@@ -423,6 +428,7 @@ cmd_begin:
     jne  .active
     mov  qword [rel g_in_txn], 1
     mov  qword [rel g_undo_n], 0
+    mov  qword [rel g_txn_reset], 0  ; start from a clean slate
     mov  rax, [rel g_count]
     mov  [rel g_count_snap], rax
     lea  rcx, [rel s_txn_begin]
@@ -489,11 +495,15 @@ txn_flush:
     jz   .skip
     mov  rax, [rbp-48]
     mov  [rdi], rax                  ; slot index
+    mov  rax, [rsi+REC_ID]
+    mov  [rdi+WAL_ENT_PREVID], rax   ; what the slot held before
+    movzx eax, byte [rsi+REC_STATUS]
+    mov  [rdi+WAL_ENT_PREVST], rax
     mov  rcx, [rbp-56]
-    lea  rdx, [rdi+8]
+    lea  rdx, [rdi+WAL_ENT_IMAGE]
     mov  r8, REC_SIZE
     call mem_copy                    ; final image
-    add  rdi, UNDO_ENTRY
+    add  rdi, WAL_ENT_V3
     inc  r13
 .skip:
     inc  r12
@@ -560,11 +570,11 @@ txn_flush:
     cmp  r12, r13
     jae  .applied
     mov  rax, r12
-    imul rax, rax, UNDO_ENTRY
+    imul rax, rax, WAL_ENT_V3
     add  rax, rbx
     add  rax, WAL_HDR_V3             ; staged entry i
     mov  rdi, [rax]                  ; slot index
-    lea  rdx, [rax+8]                ; image
+    lea  rdx, [rax+WAL_ENT_IMAGE]    ; image
     mov  rcx, rdi
     shl  rcx, REC_SHIFT
     add  rcx, HDR_SIZE               ; file offset
@@ -603,6 +613,7 @@ auto_begin:
     mov  qword [rel g_in_txn], 1
     mov  qword [rel g_auto_txn], 1
     mov  qword [rel g_undo_n], 0
+    mov  qword [rel g_txn_reset], 0
     mov  rax, [rel g_count]
     mov  [rel g_count_snap], rax
 .already:
@@ -677,6 +688,8 @@ cmd_rollback:
     mov  [rel g_count], rax
     mov  qword [rel g_in_txn], 0
     mov  qword [rel g_auto_txn], 0
+    mov  qword [rel g_txn_reset], 0  ; a rolled-back TRUNCATE must not leave a
+                                     ; reset armed for the NEXT commit to emit
     mov  qword [rel g_undo_n], 0
     call wal_truncate
     lea  rcx, [rel s_txn_rollback]

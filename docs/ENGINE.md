@@ -89,7 +89,7 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **~30 KB PE64** whose only dependency is
+- The result is a single self-contained **~33 KB PE64** whose only dependency is
   `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the exe —
   it is obtained from `VirtualAlloc` at startup.
 
@@ -462,16 +462,24 @@ The WAL is a **single staging frame** that mirrors the in-memory buffer
 (`g_walbuf`) to disk:
 
 ```
-+0    8              magic  'ASMWAL02'
-+8    8              N      entry count
++0    8              magic  'ASMWAL03'
++8    8              N      entry count (only slots that actually changed)
 +16   8              count  live-row count to publish into the header on apply
-+24   N * (8 + 256)  entries: { u64 slot index ; 256-byte after-image }
++24   8              commit_seq  the change-log sequence this commit takes
++32   8              flags  bit 0 = RESET
++40   N * (8+8+8+256) entries: { u64 slot index ; u64 prev_id ;
+                                 u64 prev_status ; 256-byte after-image }
 +M    8              marker 'COMMIT01'   ┐ written and flushed LAST,
 +M+8  8              crc32  of [0, M)    ┘ together, in one write
 ```
 
-- Each entry is `UNDO_ENTRY = 8 + 256 = 264` bytes: a slot index followed by the
-  **post-mutation image** of that slot, so replay is idempotent redo.
+- Each entry is `WAL_ENT_V3 = 280` bytes. The after-image makes replay an
+  idempotent redo; `prev_id` and `prev_status` describe what the slot held
+  *before*, which is what lets a reused tombstone emit `DELETE(old)` as well as
+  `UPSERT(new)` in the change log (see [`CDC.md`](CDC.md)).
+- Only slots whose **logical** state changed are staged, so the frame doubles as
+  the transaction's change set — and a transaction that changed nothing writes
+  no frame and consumes no sequence.
 - A single entry format captures INSERT, UPDATE and DELETE alike (DELETE writes
   a slot whose `status = 2`).
 - The `'COMMIT01'` marker is the atomicity point: it is written and flushed only
@@ -481,9 +489,9 @@ The WAL is a **single staging frame** that mirrors the in-memory buffer
   never be "committed but unchecksummed". A table-driven implementation
   (`crc32_init` builds 256 dwords once at startup) keeps the cost proportional
   to the bytes actually staged, not to the 2 MiB buffer.
-- Frames carrying the older `'ASMWAL01'` magic have no checksum and are still
-  replayed, so upgrading the binary never discards a transaction that was
-  already acknowledged.
+- Frames carrying the older `'ASMWAL01'` (no checksum) or `'ASMWAL02'` (no
+  sequence) magic are still replayed, so upgrading the binary never discards a
+  transaction that was already acknowledged.
 
 ---
 
@@ -536,18 +544,24 @@ slots that no longer hold the rows it captured.
 
 `COMMIT` performs a strict write-ahead sequence (`cmd_commit`):
 
-1. Stage the frame in `g_walbuf`: magic, `N`, new `count`, then the **current
-   after-image** of every touched slot read from the live table.
+1. Stage the frame in `g_walbuf`: magic, `N`, new `count`, `commit_seq`, flags,
+   then — for every slot whose **logical** state changed — its index, what it
+   held before, and its final image. Unchanged slots are not staged at all.
 2. `WriteFile` the header + entries to the WAL, then **`FlushFileBuffers`**.
-3. Write the `'COMMIT01'` marker and **`FlushFileBuffers` again** — the
-   transaction is now durably committed.
-4. Apply each after-image to `<db>.dat` (`write_at` at `HDR_SIZE + slot*256`).
-5. `db_write_header`, `db_flush`, then **`wal_truncate`** — the checkpoint that
-   empties the WAL.
+3. Write the `'COMMIT01'` marker and its checksum and **`FlushFileBuffers`
+   again** — the transaction is now durably committed.
+4. **Append the change frame to `<db>.cdc` and flush it.** This sits between the
+   commit decision and the data file on purpose: a consumer can never see a row
+   in the database that is missing from the log, and recovery can only ever have
+   to *add* a frame, never remove one.
+5. Apply each after-image to `<db>.dat` (`write_at` at `HDR_SIZE + slot*256`).
+6. `db_write_header` (publishing `count` and `last_commit_seq`), `db_flush`,
+   then **`wal_truncate`** — the checkpoint that empties the WAL.
 
 If the process dies before step 3 completes, the WAL has no valid marker and the
-transaction never happened. If it dies between steps 3 and 5, the marked WAL is
-replayed on next startup.
+transaction never happened. If it dies between steps 3 and 6, the marked WAL is
+replayed on next startup — republishing the change frame first if step 4 was
+lost.
 
 The *order* of the two flushes is the entire correctness argument — the marker is
 written and flushed **only after** the data is already durable in the log:
@@ -585,7 +599,8 @@ table is read into RAM:
    index must be `< CAPACITY` and the stored `count` must be `<= CAPACITY`.
    Otherwise redo would write a 256-byte record at an arbitrary file offset and
    grow the `.dat` past its region, so the whole frame is discarded instead.
-3. Verify the **CRC-32** stored next to the marker (`'ASMWAL02'` frames). Three
+3. Verify the **CRC-32** stored next to the marker (`'ASMWAL02'`/`'ASMWAL03'`
+   frames). Three
    outcomes, and the distinction matters:
    - *checksum absent because the frame is short* → the final 16-byte write was
      torn, so the commit never completed → **discard**;
@@ -596,10 +611,12 @@ table is read into RAM:
      Neither is acceptable, so the engine **refuses to open** and says so,
      leaving the `.wal` in place. The operator can restore from a backup, or
      delete the `.wal` to reopen at the last checkpoint.
-4. Otherwise the frame is committed: **redo** every after-image into
-   `<db>.dat`, publish the stored `count` into the header, flush, and truncate
-   the WAL. Every redo write is checked; a failure aborts (§7.5) rather than
-   leaving the checkpoint half-applied.
+4. Otherwise the frame is committed: **publish the change frame** to
+   `<db>.cdc` if the crash lost it (keyed by `commit_seq`, so replaying is
+   idempotent), then **redo** every after-image into `<db>.dat`, publish the
+   count and the sequence into the header, flush, and truncate the WAL. Every
+   redo write is checked; a failure aborts (§7.5) rather than leaving the
+   checkpoint half-applied.
 
 Both open paths then read the slot region into RAM — including the path that
 *created* the `.dat`, because a committed WAL can predate the data file and its

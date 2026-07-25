@@ -95,7 +95,7 @@
 ; HDR_ENGINE purely for diagnostics: it tells you which build touched a
 ; database, without ever affecting whether it can be opened.
 %define ENGINE_MAJOR 1
-%define ENGINE_MINOR 0
+%define ENGINE_MINOR 1
 %define ENGINE_PATCH 0
 %define ENGINE_VERSION ((ENGINE_MAJOR << 16) | (ENGINE_MINOR << 8) | ENGINE_PATCH)
 
@@ -108,6 +108,7 @@
 %define HDR_SEQ    88         ; u64: last_commit_seq published to the CDC log
 %define HDR_RESETP 96         ; u64: 1 = a global RESET is mid-flight
 %define HDR_RESETS 104        ; u64: the sequence that RESET will carry
+%define HDR_LINEAGE 112       ; 16 bytes: identity shared with the change log
 
 ; ---- Change data capture (<db>.cdc) ----
 ; Append-only log, one frame per committed transaction that changed something.
@@ -129,6 +130,34 @@
 %define CDC_OP_UPSERT  1
 %define CDC_OP_DELETE  2
 %define CDC_FLAG_RESET 1
+; Worst case: every staged entry emits two operations (a reused slot yields
+; DELETE(old) + UPSERT(new)), so the staging buffer must hold 2*UNDO_MAX ops.
+%define CDC_MAX_OPS    (UNDO_MAX * 2)
+%define CDC_BUF_SIZE   (CDC_HDR_SIZE + CDC_MAX_OPS * CDC_OP_SIZE + CDC_TAIL_SIZE)
+
+; ---- CDC file header (64 bytes, precedes the first frame) ----
+; Without it a log is anonymous: pair a fresh <db>.dat with an old <db>.cdc and
+; the new database restarts at sequence 1 while the log already holds 100, so
+; every one of the next hundred commits looks "already published" and is
+; silently dropped. The lineage ties the two files together, and base_seq says
+; where this log's numbering starts so a log recreated after an operator removed
+; it can still be verified frame by frame.
+;   +0   8  magic 'ASMCDCH1'
+;   +8   4  cdc_format_version
+;   +12  4  record_format_version
+;   +16  16 lineage (matches the .dat header at HDR_LINEAGE)
+;   +32  8  base_seq - the first frame carries base_seq + 1
+;   +40  8  crc32 of [0, 40), zero-extended
+;   +48  8  reserved
+;   +56  8  trailer 'CDCHEND1'
+%define CDCH_SIZE      64
+%define CDCH_FMT       8
+%define CDCH_RECFMT    12
+%define CDCH_LINEAGE   16
+%define CDCH_BASESEQ   32
+%define CDCH_CRC       40
+%define CDCH_TRAILER   56
+%define CDC_FORMAT     1
 
 ; ---- WAL record tags ----
 %define WAL_BEGIN  1
@@ -140,3 +169,20 @@
 ; so recovery can republish a change frame that a crash lost.
 %define WAL_HDR_V2 24
 %define WAL_HDR_V3 40
+
+; ---- WAL entry layouts ----
+; v01/v02 entries are {slot index, after-image} = UNDO_ENTRY bytes.
+; v03 entries also carry what the slot held BEFORE the transaction touched it.
+; Without that, a slot whose tombstone gets reused inside one transaction
+; (DELETE 5 then INSERT 9 landing on the same slot) would only ever produce
+; UPSERT 9 - the DELETE of row 5 would vanish and a consumer would keep it
+; forever. The previous id and status are what let commit and recovery both
+; emit DELETE(old) followed by UPSERT(new).
+;   +0    8   slot index
+;   +8    8   prev_id
+;   +16   8   prev_status
+;   +24 REC_SIZE  after-image
+%define WAL_ENT_PREVID  8
+%define WAL_ENT_PREVST  16
+%define WAL_ENT_IMAGE   24
+%define WAL_ENT_V3      (WAL_ENT_IMAGE + REC_SIZE)

@@ -20,6 +20,139 @@
 ; still produces exactly one RESET on the next open.
 ; -----------------------------------------------------------------------------
 
+; cdc_lineage_make() - derive a 128-bit identity for a new database. This is an
+;   identity check, not a security one: it only has to make two unrelated
+;   databases collide with vanishing probability, so mixing the wall clock, the
+;   high-resolution counter and the golden-ratio hash is enough.
+cdc_lineage_make:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call os_now_ms
+    mov  [rbp-8], rax
+    call os_perf_counter
+    mov  rdx, [rbp-8]
+    mov  rcx, GOLDEN
+    imul rax, rcx
+    xor  rax, rdx
+    mov  [rel g_lineage_lo], rax
+    mov  rdx, rax
+    call os_perf_counter
+    mov  rcx, GOLDEN
+    imul rax, rcx
+    rol  rdx, 17
+    xor  rax, rdx
+    mov  [rel g_lineage_hi], rax
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cdc_hdr_write() - lay the file header at offset 0 and flush it.
+cdc_hdr_write:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    lea  rdi, [rel g_cdch_buf]
+    mov  rcx, CDCH_SIZE
+    mov  rdx, rdi
+    mov  r8, rcx
+    call mem_zero
+    lea  rdi, [rel g_cdch_buf]
+    mov  rax, [rel cdch_magic]
+    mov  [rdi], rax
+    mov  dword [rdi+CDCH_FMT], CDC_FORMAT
+    mov  dword [rdi+CDCH_RECFMT], DB_VERSION
+    mov  rax, [rel g_lineage_lo]
+    mov  [rdi+CDCH_LINEAGE], rax
+    mov  rax, [rel g_lineage_hi]
+    mov  [rdi+CDCH_LINEAGE+8], rax
+    mov  rax, [rel g_cdc_base]
+    mov  [rdi+CDCH_BASESEQ], rax
+    lea  rcx, [rel g_cdch_buf]
+    mov  rdx, CDCH_CRC
+    call crc32
+    lea  rdi, [rel g_cdch_buf]
+    mov  [rdi+CDCH_CRC], rax
+    mov  rax, [rel cdch_trailer]
+    mov  [rdi+CDCH_TRAILER], rax
+    mov  rcx, [rel g_cdc_handle]
+    xor  rdx, rdx
+    lea  r8, [rel g_cdch_buf]
+    mov  r9, CDCH_SIZE
+    call cdc_write_all
+    mov  rcx, [rel g_cdc_handle]
+    call os_fsync
+    test rax, rax
+    jnz  io_fatal
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cdc_hdr_load() -> rax = 1 header present and valid / 0 legacy headerless log
+;   Refuses outright on a damaged or foreign header.
+cdc_hdr_load:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    xor  rcx, rcx
+    lea  rdx, [rel g_cdch_buf]
+    mov  r8, CDCH_SIZE
+    call cdc_read
+    test rax, rax
+    js   io_fatal_read
+    cmp  rax, CDCH_SIZE
+    jb   .legacy                     ; too short to hold a header
+    lea  rdi, [rel g_cdch_buf]
+    mov  rax, [rel cdch_magic]
+    cmp  rax, [rdi]
+    jne  .legacy                     ; starts with a frame -> pre-1.1 log
+    mov  rax, [rel cdch_trailer]
+    cmp  rax, [rdi+CDCH_TRAILER]
+    jne  .bad
+    lea  rcx, [rel g_cdch_buf]
+    mov  rdx, CDCH_CRC
+    call crc32
+    lea  rdi, [rel g_cdch_buf]
+    cmp  rax, [rdi+CDCH_CRC]
+    jne  .bad
+    cmp  dword [rdi+CDCH_FMT], CDC_FORMAT
+    jne  .bad
+    ; the log must belong to THIS database
+    mov  rax, [rdi+CDCH_LINEAGE]
+    cmp  rax, [rel g_lineage_lo]
+    jne  .foreign
+    mov  rax, [rdi+CDCH_LINEAGE+8]
+    cmp  rax, [rel g_lineage_hi]
+    jne  .foreign
+    mov  rax, [rdi+CDCH_BASESEQ]
+    mov  [rel g_cdc_base], rax
+    mov  [rel g_cdc_lastseq], rax    ; frames start at base + 1
+    mov  rax, 1
+    jmp  .out
+.legacy:
+    mov  qword [rel g_cdc_legacy], 1
+    mov  qword [rel g_cdc_base], 0
+    xor  rax, rax
+.out:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+.foreign:
+    lea  rcx, [rel s_err_cdc_lineage]
+    jmp  .refuse
+.bad:
+    lea  rcx, [rel s_err_cdc_hdr]
+.refuse:
+    call puts
+    lea  rcx, [rel g_cdcname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_cdc_hint]
+    call puts
+    mov  ecx, 1
+    call os_exit
+
 ; cdc_open() - open/create <db>.cdc and validate what is already in it.
 ;   Sets g_cdc_end (append offset) and g_cdc_lastseq.
 cdc_open:
@@ -31,7 +164,24 @@ cdc_open:
     mov  [rel g_cdc_handle], rax
     cmp  rax, INVALID_HANDLE
     je   .openfail
+    ; an empty file gets a fresh header starting at the current watermark, so a
+    ; log the operator removed resumes verifiably instead of anonymously
+    mov  rcx, rax
+    call os_filesize
+    test rax, rax
+    js   io_fatal_read
+    test rax, rax
+    jnz  .existing
+    mov  rax, [rel g_seq]
+    mov  [rel g_cdc_base], rax
+    mov  [rel g_cdc_lastseq], rax
+    call cdc_hdr_write
+    mov  qword [rel g_cdc_end], CDCH_SIZE
+    jmp  .done
+.existing:
+    call cdc_hdr_load
     call cdc_scan
+.done:
     mov  rsp, rbp
     pop  rbp
     ret
@@ -97,13 +247,17 @@ cdc_scan:
     mov  [rbp-32], r12
     mov  [rbp-40], r13
     mov  qword [rel g_cdc_end], 0
-    mov  qword [rel g_cdc_lastseq], 0
     mov  rcx, [rel g_cdc_handle]
     call os_filesize
     test rax, rax
     js   io_fatal_read
     mov  r13, rax                    ; file length
     xor  rbx, rbx                    ; cursor
+    cmp  qword [rel g_cdc_legacy], 0
+    jne  .scanning                   ; pre-1.1 log: frames start at byte 0
+    mov  rbx, CDCH_SIZE
+    mov  [rel g_cdc_end], rbx
+.scanning:
 .frame:
     mov  rax, r13
     sub  rax, rbx                    ; bytes left
@@ -114,14 +268,32 @@ cdc_scan:
     lea  rdx, [rel g_cdc_hdrbuf]
     mov  r8, CDC_HDR_SIZE
     call cdc_read
+    test rax, rax
+    js   io_fatal_read               ; cannot read the log - never trim on that
     cmp  rax, CDC_HDR_SIZE
     jne  .trim
     mov  rax, [rel cdc_magic]
     cmp  rax, [rel g_cdc_hdrbuf]
     jne  .badframe                   ; garbage in the middle of the log
     mov  r12, [rel g_cdc_hdrbuf+8]   ; frame_size
-    ; frame_size must match op_count exactly
+    ; op_count must be something this build could have written, checked BEFORE
+    ; it is multiplied out so a hostile value cannot overflow the arithmetic
     mov  rax, [rel g_cdc_hdrbuf+24]  ; op_count
+    mov  rdx, CDC_MAX_OPS
+    cmp  rax, rdx
+    ja   .badframe
+    ; unknown flags mean a newer writer; refuse rather than misread the frame
+    mov  rdx, [rel g_cdc_hdrbuf+32]
+    mov  rcx, ~CDC_FLAG_RESET
+    test rdx, rcx
+    jnz  .badframe
+    ; a RESET carries no operations, by definition
+    test rdx, CDC_FLAG_RESET
+    jz   .notreset
+    test rax, rax
+    jnz  .badframe
+.notreset:
+    ; frame_size must match op_count exactly
     imul rax, rax, CDC_OP_SIZE
     add  rax, CDC_HDR_SIZE + CDC_TAIL_SIZE
     cmp  rax, r12
@@ -131,22 +303,26 @@ cdc_scan:
     add  rax, r12
     cmp  rax, r13
     ja   .trim
-    ; sequence must strictly increase
+    ; sequences are dense: the engine advances by exactly one per frame, so a
+    ; gap means history was lost or altered, not merely reordered
     mov  rax, [rel g_cdc_hdrbuf+16]
-    cmp  rax, [rel g_cdc_lastseq]
-    jbe  .badseq
+    mov  rdx, [rel g_cdc_lastseq]
+    inc  rdx
+    cmp  rax, rdx
+    jne  .badseq
     mov  [rbp-48], rax               ; this frame's seq
     ; verify trailer + checksum over the whole frame
     mov  rcx, r12
     call cdc_load_frame              ; rcx = size, reads at rbx into g_cdcbuf
     test rax, rax
+    js   io_fatal_read
     jz   .trim
     mov  rsi, [rel g_cdcbuf]
     mov  rax, r12
     sub  rax, 8
     mov  rdx, [rel cdc_trailer]
     cmp  rdx, [rsi+rax]              ; trailer at frame_size-8
-    jne  .trim                       ; only a torn tail can lack its trailer
+    jne  .badtrailer                 ; the frame FITS, so this is damage
     mov  rcx, rsi
     mov  rdx, r12
     sub  rdx, CDC_TAIL_SIZE          ; checksum covers everything before it
@@ -188,6 +364,9 @@ cdc_scan:
 .badcrc:
     lea  rcx, [rel s_err_cdc_crc]
     jmp  .refuse
+.badtrailer:
+    lea  rcx, [rel s_err_cdc_tail]
+    jmp  .refuse
 .badseq:
     lea  rcx, [rel s_err_cdc_seq]
     jmp  .refuse
@@ -204,27 +383,35 @@ cdc_scan:
     mov  ecx, 1
     call os_exit
 
-; cdc_load_frame(rcx = size) -> rax = 1 read in full / 0 short
+; cdc_load_frame(rcx = size) -> rax = 1 read in full, 0 short (torn), -1 error
 ;   Reads the frame at rbx into g_cdcbuf. Only sizes that fit the staging
 ;   buffer are accepted; a larger one cannot have been written by this build.
+;   A short read and an I/O error are deliberately DIFFERENT answers: the first
+;   means a crash cut an append short, the second means we cannot see the file,
+;   and only the first may ever lead to trimming it.
 cdc_load_frame:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
     mov  [rbp-8], rcx
-    mov  rax, WAL_BUF_SIZE
+    mov  rax, CDC_BUF_SIZE
     cmp  rcx, rax
-    ja   .no
+    ja   .short                      ; larger than this build can write
     mov  rcx, rbx
     mov  rdx, [rel g_cdcbuf]
     mov  r8, [rbp-8]
     call cdc_read
+    test rax, rax
+    js   .error
     cmp  rax, [rbp-8]
-    jne  .no
+    jne  .short
     mov  rax, 1
     jmp  .out
-.no:
+.short:
     xor  rax, rax
+    jmp  .out
+.error:
+    mov  rax, -1
 .out:
     mov  rsp, rbp
     pop  rbp
@@ -332,6 +519,74 @@ cdc_write_all:
     pop  rbp
     ret
 
+; cdc_seq_gate(rcx = seq) -> rax = 1 write it / 0 already published
+;   Only two answers are legitimate, and anything else is an inconsistency we
+;   must not paper over:
+;     seq == lastseq      the crash happened after the append; skip it
+;     seq == lastseq + 1  the next frame; write it
+;   A lower sequence would rewrite history, and a higher one would leave a hole.
+;   In particular a log that is artificially AHEAD would make every future
+;   commit look "already published" while the data file kept moving - silent,
+;   permanent divergence for a consumer. Refuse instead.
+cdc_seq_gate:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  rax, [rel g_cdc_lastseq]
+    cmp  rcx, rax
+    je   .skip
+    inc  rax
+    cmp  rcx, rax
+    je   .write
+    lea  rcx, [rel s_err_cdc_gap]
+    call puts
+    lea  rcx, [rel g_cdcname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_cdc_hint]
+    call puts
+    mov  ecx, 1
+    call os_exit
+.write:
+    mov  rax, 1
+    jmp  .out
+.skip:
+    xor  rax, rax
+.out:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cdc_check_aligned() - after WAL replay and any pending RESET, the log and the
+;   header must agree on where the stream is. They can legitimately disagree
+;   *during* recovery (a crash between the append and the header write leaves
+;   the log one ahead), which is why this runs last.
+;   An empty log with a non-zero watermark is the one benign case: the operator
+;   discarded the history, so we adopt the watermark and carry on - the next
+;   frame is still strictly greater than anything a consumer ever saw.
+cdc_check_aligned:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  rax, [rel g_cdc_lastseq]
+    cmp  rax, [rel g_seq]
+    jne  .mismatch
+    mov  rsp, rbp
+    pop  rbp
+    ret
+.mismatch:
+    lea  rcx, [rel s_err_cdc_align]
+    call puts
+    lea  rcx, [rel g_cdcname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_cdc_hint]
+    call puts
+    mov  ecx, 1
+    call os_exit
+
 ; cdc_emit_reset(rcx = commit_seq) - append a single RESET frame, unless a frame
 ;   with that sequence is already there (idempotent recovery).
 cdc_emit_reset:
@@ -339,10 +594,12 @@ cdc_emit_reset:
     mov  rbp, rsp
     sub  rsp, 0x40
     mov  [rbp-8], rcx
-    cmp  rcx, [rel g_cdc_lastseq]
-    jbe  .already                    ; already published
+    call cdc_seq_gate
+    test rax, rax
+    jz   .already                    ; already published
+    mov  rcx, [rbp-8]
     mov  rdx, CDC_FLAG_RESET
-    call cdc_frame_begin             ; rcx = seq
+    call cdc_frame_begin
     mov  rdx, rdi
     xor  rcx, rcx                    ; no operations
     call cdc_frame_end
@@ -352,15 +609,19 @@ cdc_emit_reset:
     ret
 
 ; cdc_emit_from_wal(rcx = entry base ptr, rdx = N, r8 = seq, r9 = flags)
-;   Build a change frame from a WAL frame's after-images. Doing it from the
-;   after-images - rather than from the undo log - is what makes the commit path
-;   and the recovery path produce byte-identical frames: the status byte in the
-;   image already says whether the row ended up present (UPSERT) or gone
-;   (DELETE), and unchanged rows were filtered out before they were staged.
+;   Build a change frame from a v03 WAL frame. Doing it from the staged entries
+;   - rather than from the undo log - is what makes the commit path and the
+;   recovery path produce byte-identical frames.
+;
+;   Each entry can yield up to TWO operations, and that matters: when a slot's
+;   tombstone is reused inside one transaction the row that used to live there
+;   is gone, so the entry emits DELETE(prev_id) *and* UPSERT(new id). Emitting
+;   only the final image would leave a consumer holding a row the database no
+;   longer has.
 cdc_emit_from_wal:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x60
+    sub  rsp, 0x70
     mov  [rbp-8], rbx
     mov  [rbp-16], rsi
     mov  [rbp-24], rdi
@@ -369,9 +630,12 @@ cdc_emit_from_wal:
     mov  r12, rcx                    ; entries
     mov  r13, rdx                    ; N
     mov  [rbp-48], r9                ; flags
-    cmp  r8, [rel g_cdc_lastseq]
-    jbe  .already                    ; this commit is already in the log
+    mov  [rbp-56], r8                ; seq
     mov  rcx, r8
+    call cdc_seq_gate
+    test rax, rax
+    jz   .already                    ; this commit is already in the log
+    mov  rcx, [rbp-56]
     mov  rdx, [rbp-48]
     call cdc_frame_begin             ; rdi = op cursor
     test qword [rbp-48], CDC_FLAG_RESET
@@ -382,30 +646,43 @@ cdc_emit_from_wal:
     cmp  rbx, r13
     jae  .seal
     mov  rax, rbx
-    imul rax, rax, UNDO_ENTRY
+    imul rax, rax, WAL_ENT_V3
     add  rax, r12                    ; entry i
-    lea  rcx, [rax+8]                ; after-image
+    mov  [rbp-64], rax
+    lea  rcx, [rax+WAL_ENT_IMAGE]    ; after-image
+    mov  [rbp-72], rcx
+    ; --- did a row that used to live here disappear? ---
+    cmp  qword [rax+WAL_ENT_PREVST], ST_OCCUPIED
+    jne  .after                      ; nothing was there before
+    mov  rdx, [rax+WAL_ENT_PREVID]
     cmp  byte [rcx+REC_STATUS], ST_OCCUPIED
-    je   .upsert
-    ; anything not live is a removal
+    jne  .emit_del                   ; still occupied? then compare identities
+    cmp  rdx, [rcx+REC_ID]
+    je   .after                      ; same row, just updated
+.emit_del:
+    mov  rax, [rbp-64]
+    mov  rdx, [rax+WAL_ENT_PREVID]
     mov  qword [rdi], CDC_OP_DELETE
-    mov  rax, [rcx+REC_ID]
-    mov  [rdi+8], rax
+    mov  [rdi+8], rdx
     lea  rdx, [rdi+16]
     mov  r8, REC_SIZE
     call mem_zero
-    jmp  .opdone
-.upsert:
+    add  rdi, CDC_OP_SIZE
+    inc  rsi
+.after:
+    ; --- and is a row present now? ---
+    mov  rcx, [rbp-72]
+    cmp  byte [rcx+REC_STATUS], ST_OCCUPIED
+    jne  .opdone
     mov  qword [rdi], CDC_OP_UPSERT
     mov  rax, [rcx+REC_ID]
     mov  [rdi+8], rax
-    mov  [rbp-56], rcx
     lea  rdx, [rdi+16]
     mov  r8, REC_SIZE
     call mem_copy                    ; rcx = src, rdx = dst, r8 = len
-.opdone:
     add  rdi, CDC_OP_SIZE
     inc  rsi
+.opdone:
     inc  rbx
     jmp  .op
 .seal:

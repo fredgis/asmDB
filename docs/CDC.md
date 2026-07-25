@@ -33,8 +33,39 @@ engine knowing the consumer exists.
 
 ## Frame format
 
-Little-endian throughout. The file has no header of its own: it is frames back
-to back, and a zero-byte file simply means "nothing has changed yet".
+Little-endian throughout. A log written by engine 1.1 or later begins with a
+**64-byte file header**, then frames back to back. A zero-byte file, or a file
+holding only the header, simply means "nothing has changed yet".
+
+### File header
+
+```
+offset  size  field
++0       8    magic         'ASMCDCH1'
++8       4    cdc_format_version
++12      4    record_format_version
++16     16    lineage       identity shared with <db>.dat
++32      8    base_seq      the first frame carries base_seq + 1
++40      8    crc32         of bytes [0, 40), zero-extended
++48      8    reserved
++56      8    trailer       'CDCHEND1'
+```
+
+The header exists because an anonymous log is dangerous. Pair a **fresh**
+`<db>.dat` with an **old** `<db>.cdc` and the database restarts at sequence 1
+while the log already holds 100 — every one of the next hundred commits would
+look "already published" and be dropped in silence. The `lineage` ties the two
+files together and is checked on every open; a log from another database is
+refused outright.
+
+`base_seq` is what lets a log remain verifiable after an operator removes it:
+the replacement starts at the current watermark rather than pretending to be
+the beginning of history, and the reader can still check every frame.
+
+A log with no header is a **legacy** log written by engine 1.0.0. It is still
+read, with the lineage check skipped.
+
+### Frames
 
 ```
 offset  size  field
@@ -78,10 +109,19 @@ state**, and the comparison is *logical*, not byte-wise:
 | Before | After | Event |
 |---|---|---|
 | absent | live | `UPSERT` |
-| live | live, different | `UPSERT` (final image) |
-| live | live, identical | *nothing* |
+| live | live, same id, different | `UPSERT` (final image) |
+| live | live, same id, identical | *nothing* |
+| live | live, **different id** | `DELETE` (old id) **and** `UPSERT` (new id) |
 | live | absent | `DELETE` |
 | absent | absent | *nothing* |
+
+The fourth row is the one that is easy to get wrong. A slot whose tombstone is
+reused inside a single transaction — `DELETE 5` then `INSERT 9` landing on the
+same slot — holds a *different row* at the end. Emitting only `UPSERT 9` would
+leave a consumer holding row 5 forever. That is why a v03 WAL entry records what
+the slot held before the transaction touched it, not just the final image:
+without the previous id, neither the commit path nor recovery could tell that
+something disappeared.
 
 Consequences worth stating plainly:
 
@@ -114,6 +154,21 @@ publishes the `RESET` — exactly once, however many times it reopens.
 
 Inside an explicit transaction, `TRUNCATE` only *declares* the reset; `COMMIT`
 turns it into the frame. A `ROLLBACK` therefore emits nothing.
+
+### When is the snapshot ready?
+
+A `RESET` carries no data — it tells the consumer to re-snapshot. But the frame
+is published *before* the change reaches `<db>.dat`, so reacting to it
+immediately can read a backup that still shows the **old** state. The watermark
+resolves it, and this is a contract, not advice:
+
+> After receiving a `RESET` carrying sequence **N**, only load a `BACKUP` whose
+> `last_commit_seq` is **≥ N**. If it is lower, the snapshot predates the reset:
+> discard it and take another.
+
+Concretely: on `RESET(N)`, take a `BACKUP`, read its watermark, and retry until
+it reaches `N`. Then resume from the frames after that watermark, exactly as at
+first bootstrap.
 
 ## Commit ordering
 
@@ -158,14 +213,49 @@ were staged, so the WAL frame **is** the change set.
 
 | Condition | Action |
 |---|---|
-| last frame stops short, or has no trailer | **trim** it — a crash mid-append was never acknowledged |
+| last frame does not fit in the file | **trim** it — a crash mid-append was never acknowledged |
+| complete frame, damaged trailer | **refuse to open**, keep the file |
 | complete frame, checksum mismatch | **refuse to open**, keep the file |
 | sequence not strictly increasing | **refuse to open**, keep the file |
 | bad magic mid-file, or `frame_size` inconsistent with `op_count` | **refuse to open**, keep the file |
+| the log cannot be read at all (I/O error) | **abort**, never trim |
 
-The asymmetry is the point: an unfinished append is noise and is discarded, but
-a *complete* frame that fails verification is evidence of damage and is
-preserved for inspection. The engine never rewrites history.
+The asymmetry is the point: an append that never finished is noise and is
+discarded, but a frame that is physically *complete* and still fails
+verification is evidence of damage, and is preserved for inspection. An I/O
+error is neither — trimming a file we cannot read would turn a transient fault
+into permanent loss.
+
+### The sequence gate
+
+When the engine is about to write a frame with sequence `S`, only two answers
+are legitimate:
+
+| | Meaning |
+|---|---|
+| `S == last_seq` | the crash happened after the append; skip it |
+| `S == last_seq + 1` | the next frame; write it |
+| anything else | **refuse** |
+
+A lower sequence would rewrite history. A higher one would leave a hole. And a
+log that is artificially **ahead** is the dangerous case: every future commit
+would look "already published" and be silently skipped while `<db>.dat` kept
+moving — permanent, invisible divergence. So after replaying the WAL and
+finishing any pending `RESET`, the engine also checks that the log and the
+header agree:
+
+```
+g_cdc_lastseq == last_commit_seq
+```
+
+They can legitimately differ *during* recovery — a crash between the append and
+the header write leaves the log one ahead — which is exactly why the check runs
+last, once recovery has closed that gap.
+
+**One benign exception:** an *empty* log with a non-zero watermark. That is what
+an operator leaves behind by deleting the file, so the engine adopts the
+watermark and carries on. The next frame is still strictly greater than anything
+a consumer ever saw, so no sequence is ever reused.
 
 ## Bootstrapping a consumer
 

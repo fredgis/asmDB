@@ -29,6 +29,12 @@ g_seq:         dq 0                  ; last_commit_seq published (header +88)
 g_reset_pend:  dq 0                  ; header +96
 g_reset_seq:   dq 0                  ; header +104
 g_txn_reset:   dq 0                  ; this transaction replaced the whole table
+g_lineage_lo:  dq 0                  ; identity shared by <db>.dat and <db>.cdc
+g_lineage_hi:  dq 0
+g_cdc_base:    dq 0                  ; this log's frames start at base+1
+g_cdc_legacy:  dq 0                  ; 1 = headerless log written before 1.1
+                align 8
+g_cdch_buf:    times CDCH_SIZE db 0
 g_undo:        dq 0
 g_undo_n:      dq 0
 g_count_snap:  dq 0
@@ -103,6 +109,8 @@ wal_magic3:    db 'ASMWAL03'         ; adds commit_seq + flags for change captur
 wal_commit:    db 'COMMIT01'
 cdc_magic:     db 'ASMCDC01'
 cdc_trailer:   db 'CDCEND01'
+cdch_magic:    db 'ASMCDCH1'
+cdch_trailer:  db 'CDCHEND1'
 
 s_prompt:      db 'asmdb> ', 0
 s_unknown:     db '[ERR] unknown command - type HELP', 13, 10, 0
@@ -174,6 +182,8 @@ s_upg_slots:    db ' slots', 13, 10, 0
 s_upg_already:  db '[ OK ] already in the current format - nothing to do', 13, 10, 0
 s_upg_cant:     db '[ERR] no automatic migration from that format in this build', 13, 10, 0
 s_upg_nosrc:    db '[ERR] no database file to upgrade', 13, 10, 0
+s_upg_short:    db '[ERR] source ends before the region its header describes - refusing to', 13, 10
+                db '      migrate a partial database. The original was NOT modified.', 13, 10, 0
 s_upg_dest:     db '  writing   : ', 0
 s_upg_ok:       db '[ OK ] migrated ', 0
 s_upg_rows:     db ' row(s)', 13, 10, 0
@@ -185,6 +195,11 @@ s_err_cdc_open: db '[ERR] cannot open the change log (.cdc)', 13, 10, 0
 s_err_cdc_crc:  db '[ERR] change log frame fails its checksum - refusing to open ', 0
 s_err_cdc_seq:  db '[ERR] change log sequence is not strictly increasing - refusing to open ', 0
 s_err_cdc_frame:db '[ERR] change log holds an unreadable frame - refusing to open ', 0
+s_err_cdc_tail: db '[ERR] change log frame is complete but its trailer is damaged - refusing to open ', 0
+s_err_cdc_gap:  db '[ERR] change log sequence would skip or rewind - refusing to open ', 0
+s_err_cdc_align:db '[ERR] change log and database disagree on the last committed sequence - refusing to open ', 0
+s_err_cdc_hdr:  db '[ERR] change log header is damaged or from another format - refusing to open ', 0
+s_err_cdc_lineage: db '[ERR] change log belongs to a different database - refusing to open ', 0
 s_cdc_hint:     db '      The log was NOT modified. Inspect it with tests/cdc_dump.py, or move it', 13, 10
                 db '      aside and re-snapshot the consumer from a fresh BACKUP.', 13, 10, 0
                 align 8
