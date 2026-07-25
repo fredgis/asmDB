@@ -79,6 +79,7 @@ Four consequences worth stating plainly before designing anything:
 14. [Pricing & packaging](#14-pricing--packaging)
 15. [Go-to-market roadmap](#15-go-to-market-roadmap)
 16. [Risks & open questions](#16-risks--open-questions)
+17. [**Development plan — how we actually build this**](#17-development-plan--how-we-actually-build-this) ⬅ *the execution plan: work breakdown, parallel agent streams, gates*
 
 ---
 
@@ -550,10 +551,10 @@ shipping; premium = ≤5 s RPO + warm replica (§10).
   gateway "wake" signal; the engine's ms cold-start makes this transparent.
 - **Regions:** start single-region multi-AZ; add regions for latency + residency;
   object-storage replication for cross-region DR.
-- **Windows vs Linux:** the engine is Win32/PE today, so instances run on Windows
-  nodes initially. The **Linux syscall port** on the engine roadmap
-  ([`ENGINE.md §12`](ENGINE.md#12-roadmap), v3.0) unlocks cheaper Linux container
-  fleets and Firecracker micro-VMs; the control plane already runs anywhere.
+- **Linux is the fleet target.** The ELF64 engine (~48 KB, no shared-library
+  dependencies) already exists, so instance images are Linux from day one and
+  Firecracker micro-VMs are open for the enterprise tier. The Windows binary
+  stays a first-class development target, not a deployment one.
 
 ---
 
@@ -616,9 +617,15 @@ engine's assembly**, though some ride engine roadmap items.
 
 ## 16. Risks & open questions
 
-- **Windows-only engine** raises fleet cost and blocks Firecracker until the
-  Linux port lands. Open question: prioritise the Linux port vs run Windows
-  nodes for the data plane initially.
+- **Single table per instance.** A database *is* a table, so a tenant with two
+  entities has two instances and **no transaction spans them**. Open question:
+  expose that honestly in the product, or hide it behind a coordinator we own?
+- **`FIND` and `RANGE` are full scans** of the whole slot region — roughly
+  900 ms whatever the row count. A persisted status directory was prototyped
+  and measured *worse* on populated tables (see
+  [`ENGINE.md §12`](ENGINE.md#12-roadmap)), so the answer is a real secondary
+  index, in the engine or in the service. Until then predicate queries must be
+  bounded, cached, or served from an index the service maintains itself.
 - **Single-writer per instance** caps one database's write throughput to one
   engine. Mitigation: partition a hot workload across instances (engine v3.0).
   Open question: expose sharding to users or keep it internal.
@@ -634,6 +641,178 @@ engine's assembly**, though some ride engine roadmap items.
   figure (ahead of SQLite on warm runs, behind on cold ones); don't build
   pricing/marketing on numbers the incremental-checkpoint work hasn't made
   *consistent* yet.
+
+---
+
+## 17. Development plan — how we actually build this
+
+§15 says *what* ships and in which order commercially. This section says *how
+the code gets written*: the work breakdown, which streams run in parallel, who
+owns what, and the gates where they must converge.
+
+The plan is built for **parallel agent execution under a single orchestrator**.
+That imposes two hard rules, and everything below follows from them:
+
+> **Rule 1 — contracts before code.** Nothing fans out until the interfaces
+> between streams are frozen. An agent that has to guess another agent's schema
+> will guess wrong, and the cost lands at integration.
+>
+> **Rule 2 — one owner per directory.** Two agents editing the same file is the
+> single most reliable way to lose work. Every stream owns a path and touches
+> nothing else; the orchestrator alone edits shared files.
+
+### 17.1 Work breakdown
+
+```mermaid
+flowchart TB
+    START(["asmdb engine 1.5.0<br/>Linux ELF64 · stable format 2"]):::done
+
+    subgraph W0["WAVE 0 — FOUNDATIONS (sequential · orchestrator)"]
+        direction LR
+        C1["repo layout<br/><code>saas/</code> tree"]:::found
+        C2["frozen contracts<br/>OpenAPI · protobuf · MCP schema"]:::found
+        C3["control-plane data model<br/>instances · keys · placement"]:::found
+        C4["sidecar ↔ engine protocol<br/>TSV · PAGE · lifecycle"]:::found
+        C5["Azure landing zone<br/>naming · RG · identity · IaC skeleton"]:::found
+        C1 --> C2 --> C3 --> C4 --> C5
+    end
+
+    G0{{"GATE 0<br/>contracts frozen, CI green"}}:::gate
+
+    subgraph W1["WAVE 1 — A LIVE INSTANCE (3 agents in parallel)"]
+        direction LR
+        A["<b>Agent A · data plane</b><br/><code>saas/sidecar/</code><br/>supervise asmdb · HTTP<br/>readers · health · usage events"]:::agent
+        C["<b>Agent C · provisioner</b><br/><code>saas/provisioner/</code><br/>create / stop / resume / destroy<br/>instance → endpoint map"]:::agent
+        I["<b>Agent I · platform</b><br/><code>saas/infra/</code><br/>Bicep · ACR · AKS/ACA<br/>pipelines · environments"]:::agent
+    end
+
+    G1{{"GATE 1 — <b>POST /v1/db returns a live endpoint you can CRUD against</b><br/>end-to-end on real Azure"}}:::gate
+
+    subgraph W2["WAVE 2 — PRODUCTION SHAPE (3 agents in parallel)"]
+        direction LR
+        B["<b>Agent B · edge</b><br/><code>saas/gateway/</code><br/>authn/z · API keys · routing<br/>rate limit · quotas"]:::agent
+        D["<b>Agent D · durability</b><br/><code>saas/durability/</code><br/>snapshot + CDC shipping<br/>restore · PITR · watermarks"]:::agent
+        F["<b>Agent F · observability</b><br/><code>saas/observability/</code><br/>metrics · traces · logs<br/>dashboards · alerts · runbooks"]:::agent
+    end
+
+    G2{{"GATE 2 — survives a node kill, a restore drill<br/>and a load test, with alerts that fire"}}:::gate
+
+    subgraph W3["WAVE 3 — A BUSINESS (3 agents in parallel)"]
+        direction LR
+        E["<b>Agent E · metering</b><br/><code>saas/metering/</code><br/>usage pipeline · aggregation<br/>billing export"]:::agent
+        H["<b>Agent H · surfaces</b><br/><code>saas/clients/</code><br/>REST SDK · hosted MCP<br/>docs · portal"]:::agent
+        S["<b>Agent S · security</b><br/><code>saas/security/</code><br/>threat model · secrets · KMS<br/>network isolation · audit"]:::agent
+    end
+
+    G3{{"GATE 3 — a stranger can sign up, create a database,<br/>use it, and be billed correctly"}}:::gate
+
+    DONE(["public beta"]):::done
+
+    START --> W0 --> G0 --> W1 --> G1 --> W2 --> G2 --> W3 --> G3 --> DONE
+
+    G1 -.->|"engine feedback:<br/>bugs, missing commands"| ENG["asmdb engine<br/>(orchestrator only)"]:::engine
+    G2 -.-> ENG
+    ENG -.->|"new release"| W2
+
+    classDef done fill:#1a7f37,stroke:#0b4a20,color:#fff
+    classDef found fill:#6e4aa0,stroke:#3b1e75,color:#fff
+    classDef agent fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef gate fill:#9a6700,stroke:#5a3d00,color:#fff
+    classDef engine fill:#8250df,stroke:#4c1d95,color:#fff
+```
+
+### 17.2 Stream ownership
+
+Nine streams, at most three running at once. Each owns exactly one directory
+and one deliverable, and is **done** only when its column-3 test passes.
+
+| Stream | Owns | Deliverable | Done when |
+|---|---|---|---|
+| **A** data plane | `saas/sidecar/` | supervises one `asmdb` process; HTTP + engine protocol; spawns `--reader` sessions for reads; emits usage events; health and readiness | a container serves CRUD over HTTP, survives an engine crash, and reports the right row after a restart |
+| **C** provisioner | `saas/provisioner/` | instance lifecycle API and state machine; `instance_id → endpoint`; hibernate/resume | create → use → hibernate → resume → destroy, driven only through the API, with state reconciled after a control-plane restart |
+| **I** platform | `saas/infra/` | Bicep modules, container registry, cluster, environments, CI/CD | one command builds the image and rolls a change to dev; `main` deploys automatically |
+| **B** edge | `saas/gateway/` | TLS termination, API keys then OIDC, per-tenant routing, rate limits, quotas | an unauthenticated call is refused, a tenant cannot reach another tenant's instance, and a quota actually bites |
+| **D** durability | `saas/durability/` | snapshot + `.cdc` shipping to Blob, restore, PITR, backup watermark contract | a deliberately destroyed instance is restored to a point in time, verified by row count **and** `VERIFY` |
+| **F** observability | `saas/observability/` | metrics, traces, structured logs, dashboards, alert rules, runbooks | a fault injected in staging pages a human, and the runbook resolves it |
+| **E** metering | `saas/metering/` | usage events → aggregation → billing export; idempotent, replay-safe | a replayed event stream produces the identical bill twice |
+| **H** surfaces | `saas/clients/` | REST SDK, hosted MCP endpoint, quickstart docs, portal | someone follows the quickstart with no help and stores a row |
+| **S** security | `saas/security/` | threat model, secret handling, encryption at rest, network isolation, audit trail | an external review finds nothing the threat model has not already named |
+
+### 17.3 Frozen contracts (Wave 0 output)
+
+These are the artefacts every later stream codes against. They live in
+`saas/contracts/` and **only the orchestrator changes them**; a stream that
+needs a change raises it and waits.
+
+| Contract | Form | Consumed by |
+|---|---|---|
+| Public API | OpenAPI 3.1 + protobuf | B, H, and every SDK |
+| Instance lifecycle | explicit state machine, states and legal transitions | C, F, D |
+| Sidecar ↔ engine | the stdio protocol: `FORMAT TSV`, `PAGE`, error grammar | A only — but its guarantees leak into B's error mapping |
+| Usage event | one schema, versioned, with an idempotency key | A produces, E consumes |
+| Control-plane schema | SQL DDL, migrations from day one | C, B, E |
+| Durability contract | what a snapshot guarantees, what `last_commit_seq` means for restore | D, and any consumer following the change log |
+
+### 17.4 Azure shape
+
+Deliberately boring, because the interesting part is the engine.
+
+| Concern | Choice | Why |
+|---|---|---|
+| Instance runtime | **Azure Container Apps** for Wave 1, **AKS + operator** behind the same provisioner interface for scale | Container Apps gives scale-to-zero and a per-app endpoint on day one; the abstraction means swapping it later is Agent C's problem alone |
+| Image registry | Azure Container Registry | one image: ELF64 engine + sidecar |
+| Instance volume | managed disk per instance, Blob for durability | matches §9 |
+| Object storage | Azure Blob (cool tier for snapshots) | snapshots + shipped `.cdc` segments |
+| Control-plane store | Azure Database for PostgreSQL Flexible Server | instances, tenants, keys, placement |
+| Secrets | Key Vault + workload identity | no secrets in images or env files |
+| Identity | Entra ID; managed identities between services | no shared keys inside the platform |
+| Observability | Azure Monitor, Log Analytics, App Insights | one place for all three signals |
+| Language | **Go** for sidecar and control plane | one toolchain, static binaries, good Azure SDK; Rust stays open for the sidecar hot path if profiling demands it |
+
+### 17.5 How the orchestration actually runs
+
+1. **I write Wave 0 myself.** Contracts are not delegable — they are the thing
+   that keeps nine streams from diverging.
+2. **Each wave launches its agents together**, each with: its directory, the
+   frozen contracts, an explicit *do not touch* list, and the acceptance test
+   that defines done.
+3. **Agents never integrate their own work.** They deliver into their directory;
+   I do the integration, resolve contract collisions and run the gate.
+4. **A gate is a demonstration, not a checklist.** Gate 1 is not "the code
+   compiles" — it is a live endpoint on real Azure answering a real `INSERT`.
+5. **Engine changes are mine alone.** If a stream needs something the engine
+   does not do, it stops and reports; nobody edits assembly to unblock a
+   service-layer problem.
+6. **Every gate ends with the same three questions:** what did we learn that
+   invalidates the plan, what is now dead code, and what did we claim that is no
+   longer true in the docs.
+
+### 17.6 What the engine's limits force on this plan
+
+Not risks to manage later — constraints that shape the design now.
+
+| Engine reality | Consequence for the build |
+|---|---|
+| A database *is* a table | The provisioner's unit is an instance, and the API must never suggest a tenant can add a table to one. Multi-entity tenants get multiple instances and a routing key. |
+| One writer per instance | Writes cannot scale within an instance. The gateway must not promise otherwise, and the load test must find the ceiling before a customer does. |
+| No cross-instance transaction | Any product feature spanning two entities needs a saga in the control plane. Decide at Wave 0 whether we sell that or refuse it. |
+| `FIND`/`RANGE` are full scans | Predicate queries must be bounded (`PAGE`), cached, or served by an index the service maintains. Not a Wave 3 discovery. |
+| No auth, no encryption, no audit in the engine | 100 % of that is Agent B and Agent S. There is no engine feature coming to help. |
+| `CDCTRIM` is manual | Retention is Agent D's policy, driven by what consumers have acknowledged. Left alone, the change log grows forever. |
+| 4 096 rows per transaction | The API must chunk bulk writes rather than stream them, and say so in the SDK. |
+
+### 17.7 Sequencing risks
+
+- **Gate 1 is the honest one.** Everything before it is scaffolding; a live
+  endpoint on real infrastructure is where the assumptions break. Budget for
+  it to take longer than Waves 2 and 3 combined.
+- **Three agents is the ceiling.** Not because more cannot run, but because
+  integration is serial and I am the integrator.
+- **Contract drift is the failure mode.** If two streams disagree about a
+  schema at a gate, the cost is theirs *and* mine. Hence Wave 0.
+- **Cost runs before revenue.** One container per instance means the fleet bill
+  starts at Gate 1 and metering only lands at Gate 3. Scale-to-zero must work
+  from Wave 1, not be retro-fitted.
 
 ---
 
