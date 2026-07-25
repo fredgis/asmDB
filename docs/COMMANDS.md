@@ -303,6 +303,14 @@ Start a transaction: snapshots the live row count and clears the undo log.
 Subsequent mutations are applied in RAM but **not** written to `.dat` until
 `COMMIT`. Nesting is not supported — a second `BEGIN` is an error.
 
+**A transaction may touch at most 4096 distinct rows.** The undo log has one
+entry per *slot*, not per statement, so updating the same row a thousand times
+costs one entry, while touching 4097 different rows fails the offending
+statement with `[ERR] transaction too large`. Nothing is applied and nothing is
+half-captured — the transaction is left exactly as it was, so `COMMIT` still
+commits only what succeeded. A bulk load must therefore be split into batches of
+at most 4096 rows, or run as autocommit statements.
+
 ```text
 asmdb> BEGIN
 [ OK ] transaction started

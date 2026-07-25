@@ -591,6 +591,17 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
     $r17 = $r17 -join "`n"
     Check 'VERIFY reports a damaged file' ($r17 -match 'verify: \d+ problem\(s\) found')
 
+    # a change-log header cut in half must be refused, not mistaken for a
+    # pre-1.1 headerless log (which would skip the lineage check entirely)
+    (@('INSERT 1 1 a x', 'EXIT') -join "`n") | .\asmdb.exe torn | Out-Null
+    $tp = Join-Path $work 'torn.cdc'
+    $tb = [IO.File]::ReadAllBytes($tp)
+    [IO.File]::WriteAllBytes($tp, $tb[0..29])
+    $rt = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe torn 2>&1
+    $rt = $rt -join "`n"
+    Check 'torn change-log header refused' ($rt -match 'change log header is damaged')
+    Check 'torn change-log header kept'    ((Get-Item $tp).Length -eq 30)
+
     # ---------------------------------------------------------------------
     # Run 18: one writer, many readers
     # ---------------------------------------------------------------------

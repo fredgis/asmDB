@@ -553,6 +553,18 @@ printf '\x09' | dd of=saf.dat bs=1 seek=520 count=1 conv=notrunc status=none
 r17="$(printf '%s\n' 'VERIFY' 'EXIT' | ./asmdb saf 2>&1)"
 check 'VERIFY reports a damaged file' 'verify: [0-9]+ problem\(s\) found' "$r17"
 
+# a change-log header cut in half must be refused, not mistaken for a pre-1.1
+# headerless log (which would skip the lineage check entirely)
+printf '%s\n' 'INSERT 1 1 a x' 'EXIT' | ./asmdb torn > /dev/null
+head -c 30 torn.cdc > torn.cut && mv torn.cut torn.cdc
+rt="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb torn 2>&1)"
+check 'torn change-log header refused' 'change log header is damaged' "$rt"
+if [[ "$(wc -c < torn.cdc)" -eq 30 ]]; then
+    echo "  [PASS] torn change-log header kept"
+else
+    echo "  [FAIL] torn change-log header kept"; fail=$((fail+1))
+fi
+
 # ---------------------------------------------------------------------------
 # Run 18: one writer, many readers
 # ---------------------------------------------------------------------------

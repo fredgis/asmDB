@@ -724,7 +724,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.3.0 · 1.2.0 · 1.1.0 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.3.1 · 1.3.0 · 1.2.0 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -743,6 +743,33 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+<summary><b>1.3.1</b> — the change log validates its own header</summary>
+
+Two checks the change log advertised but never performed.
+
+**A torn header was treated as a pre-1.1 log.** A log whose 64-byte header was
+cut short by a crash fell into the "headerless legacy log" branch — which is
+exactly the branch that skips the lineage check. A truncated header therefore
+disabled the protection against pairing a database with someone else's change
+log. A short file is now only accepted as legacy when it actually begins with a
+frame magic; a half-written header is refused and the file is kept for
+inspection.
+
+**The record format was written and never read.** Every log header carries the
+storage format its frames were produced with. Nothing ever compared it, so a log
+written under a different record layout would have been replayed as if it
+matched. It is now checked like the rest of the header.
+
+Also documented: a transaction may touch at most **4096 distinct rows**. The
+undo log has one entry per slot, so a thousand updates to one row cost one
+entry, but the 4097th distinct row fails the statement — a limit callers doing
+bulk loads need to know about, and which was nowhere in the command reference.
+
+Tests: 137 Windows, 131 Linux.
+
+</details>
 
 <details>
 <summary><b>1.3.0</b> — concurrent readers</summary>

@@ -101,11 +101,32 @@ cdc_hdr_load:
     test rax, rax
     js   io_fatal_read
     cmp  rax, CDCH_SIZE
-    jb   .legacy                     ; too short to hold a header
+    jb   .short
     lea  rdi, [rel g_cdch_buf]
     mov  rax, [rel cdch_magic]
     cmp  rax, [rdi]
-    jne  .legacy                     ; starts with a frame -> pre-1.1 log
+    je   .have_hdr
+    ; No header magic. A genuine pre-1.1 log starts with a FRAME magic; anything
+    ; else is not an asmdb change log at all and must not be adopted silently.
+    mov  rax, [rel cdc_magic]
+    cmp  rax, [rdi]
+    je   .legacy
+    jmp  .bad
+.short:
+    ; Shorter than a header. Empty means a brand-new log. Otherwise it is either
+    ; a pre-1.1 log, which starts with a frame magic, or a header a crash cut in
+    ; half - and a torn header must never be waved through as "legacy", because
+    ; that path skips the lineage check entirely.
+    test rax, rax
+    jz   .legacy
+    cmp  rax, 8
+    jb   .bad
+    lea  rdi, [rel g_cdch_buf]
+    mov  rax, [rel cdc_magic]
+    cmp  rax, [rdi]
+    je   .legacy
+    jmp  .bad
+.have_hdr:
     mov  rax, [rel cdch_trailer]
     cmp  rax, [rdi+CDCH_TRAILER]
     jne  .bad
@@ -116,6 +137,11 @@ cdc_hdr_load:
     cmp  rax, [rdi+CDCH_CRC]
     jne  .bad
     cmp  dword [rdi+CDCH_FMT], CDC_FORMAT
+    jne  .bad
+    ; The record format the frames carry must be the one this build understands.
+    ; It was stamped into every log and never once compared, so a log written
+    ; with a different record layout would have been replayed as if it matched.
+    cmp  dword [rdi+CDCH_RECFMT], DB_VERSION
     jne  .bad
     ; the log must belong to THIS database
     mov  rax, [rdi+CDCH_LINEAGE]
