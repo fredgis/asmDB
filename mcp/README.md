@@ -53,7 +53,7 @@ For keyed rows, the server stores a hidden content prefix
 content round-trips unchanged. On `db_get`/`db_delete` by `key`, the decoded key
 must exactly match the requested key; otherwise the server reports a
 `keyCollision` error instead of returning or deleting a row that belongs to a
-different key. Because the engine content column is 176 bytes, keyed rows must
+different key. Because the engine content column holds 175 usable bytes, keyed rows must
 fit the caller content plus this metadata in 176 UTF-8 bytes.
 
 The rest of the record maps as:
@@ -61,9 +61,9 @@ The rest of the record maps as:
 | Field     | asmdb column | notes |
 |-----------|--------------|-------|
 | `id`/`key`| `id`         | decimal string as-is, or FNV-1a(key) → u64 |
-| `tag`     | `tag`        | UTF-8 category / namespace token (≤ 40 bytes, no whitespace/control chars) |
+| `tag`     | `tag`        | UTF-8 category / namespace token (≤ 39 bytes, no whitespace/control chars) |
 | `value`   | `value`      | optional i64 decimal string payload / score |
-| `content` | `content`    | UTF-8 text (≤ 176 bytes; keyed rows reserve metadata bytes) |
+| `content` | `content`    | UTF-8 text (≤ 175 bytes; keyed rows reserve metadata bytes) |
 | —         | `created` / `updated` | set automatically (unix ms) |
 
 ## Tools
@@ -111,8 +111,9 @@ platforms the default executable name is `build/asmdb`.
 
 | MCP server | Engine | Storage format | CLI protocol |
 |------------|--------|----------------|--------------|
-| 1.1.0 | 1.1.0 | asmdb 1.x `.dat` + `.wal` | REPL with `FORMAT TSV` rows (`R<TAB>...`) and `PAGE <limit> <offset>` |
-| 1.0.0 | 1.0.0 | asmdb 1.x `.dat` + `.wal` | Human table parsing (deprecated; content could be truncated) |
+| 1.2.0 | 1.2.0 – 1.4.x | 2 (`.dat` + `.wal` + `.cdc`) | REPL with `FORMAT TSV` rows (`R<TAB>…`) and `PAGE <limit> <offset>` |
+| 1.1.0 | 1.1.0 | 2 (`.dat` + `.wal` + `.cdc`) | Human table parsing — content silently truncated at 39 bytes; do not use |
+| 1.0.0 | 1.0.0 | 2 (`.dat` + `.wal` + `.cdc`) | Human table parsing — content silently truncated at 39 bytes; do not use |
 
 ### Register with an MCP client
 

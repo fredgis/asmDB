@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   linux:
     name: Linux (ELF64, native run)
@@ -22,6 +25,18 @@ jobs:
         run: bash ./tests/smoke.sh --no-build
       - name: Benchmark (100k rows)
         run: printf 'BENCH 100000\nEXIT\n' | ./build/asmdb bench
+
+  fuzz:
+    name: Fuzz on-disk formats (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Build ELF64
+        run: bash ./build.sh
+      - name: Corrupt .dat/.wal/.cdc and verify refusal
+        run: python3 tests/fuzz/corrupt_formats.py --iterations 50 --seed 12648430
 
   windows:
     name: Windows (PE64)

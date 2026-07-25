@@ -157,25 +157,20 @@ if command -v python3 >/dev/null 2>&1; then
     r9c="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb wr)"
     check 'corrupt WAL discarded'    '\[ OK \] 2 row\(s\)'                 "$r9c"
 
-    # recovery onto a database whose .dat does not exist yet must load the
-    # replayed rows into memory, not just onto disk
+    # a committed log for a database that does not exist yet cannot be
+    # attributed to anything, so it must be refused and kept - replaying it is
+    # how a stray log used to import a foreign row set into a fresh file
     python3 "$root/tests/make_wal.py" nw.wal 42 4242 wal 'recovered-into-memory' 1 > /dev/null
-    r9d="$(printf '%s\n' 'COUNT' 'SELECT 42' 'EXIT' | ./asmdb nw)"
-    check 'WAL replay into a new .dat: count'  '\[ OK \] 1 row\(s\)'       "$r9d"
-    check 'WAL replay into a new .dat: in RAM' 'content[[:space:]]+:[[:space:]]+recovered-into-memory' "$r9d"
+    r9d="$(printf '%s\n' 'COUNT' 'SELECT 42' 'EXIT' | ./asmdb nw 2>&1)"
+    check 'orphan WAL into a new .dat refused' 'belongs to a different database' "$r9d"
+    if [[ -s nw.wal ]]; then echo "  [PASS] orphan WAL is kept"; \
+        else echo "  [FAIL] orphan WAL is kept"; fail=$((fail+1)); fi
 
     # a WAL entry addressing a slot outside the table must be rejected wholesale
-    # rather than written at an arbitrary file offset
-    python3 - <<'PY'
-import struct
-buf = bytearray(b'ASMWAL01')
-buf += struct.pack('<Q', 1)          # N = 1
-buf += struct.pack('<Q', 1)          # count = 1
-buf += struct.pack('<Q', 1 << 55)    # slot index, way out of range
-buf += bytes(256)                    # after-image
-buf += b'COMMIT01'
-open('ft.wal', 'wb').write(buf)
-PY
+    # rather than written at an arbitrary file offset. The frame names the
+    # database it sits next to, so the refusal is about the slot index.
+    printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb ft > /dev/null
+    python3 "$root/tests/make_wal.py" ft.wal 7 777 bad 'out of range' 1 --badslot > /dev/null
     r9e="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb ft 2>&1)"; code9e=$?
     ft_size="$(stat -c%s ft.wal)"
     check 'out-of-range WAL index refused' 'cannot apply'                  "$r9e"
@@ -194,7 +189,14 @@ PY
     printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb cv > /dev/null
     python3 "$root/tests/make_wal.py" cv.wal 7 777 crc 'checksummed frame' 2 > /dev/null
     r10="$(printf '%s\n' 'COUNT' 'SELECT 7' 'EXIT' | ./asmdb cv)"
-    check 'v02 frame replays'        'content[[:space:]]+:[[:space:]]+checksummed frame' "$r10"
+    check 'v04 frame replays'        'content[[:space:]]+:[[:space:]]+checksummed frame' "$r10"
+    # a frame naming a DIFFERENT database is refused, not replayed, and kept
+    printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb fw > /dev/null
+    python3 "$root/tests/make_wal.py" fw.wal 7 777 crc 'foreign frame' 5 --foreign > /dev/null
+    r10f="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb fw 2>&1)"
+    check 'foreign WAL refused'      'belongs to a different database'     "$r10f"
+    if [[ -s fw.wal ]]; then echo "  [PASS] foreign WAL kept"; \
+        else echo "  [FAIL] foreign WAL kept"; fail=$((fail+1)); fi
     # a byte flipped inside a committed frame is detected, and the log is kept
     printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb cb > /dev/null
     python3 "$root/tests/make_wal.py" cb.wal 7 777 crc 'corrupted frame' 2 --badcrc > /dev/null
@@ -205,12 +207,19 @@ PY
     rm -f cb.wal                                   # the documented remedy
     r10c="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb cb)"
     check 'db opens after removing the log' '\[ OK \] 1 row\(s\)'          "$r10c"
-    # a legacy (pre-checksum) frame still replays, so upgrading a binary never
-    # drops an already-acknowledged transaction
+    # a frame that does not name its database at all (v01/v02, written before
+    # 1.4) cannot be told apart from one that wandered in from another
+    # database, so it is refused and kept rather than replayed
     printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb lg > /dev/null
     python3 "$root/tests/make_wal.py" lg.wal 9 999 old 'legacy frame' 2 --legacy > /dev/null
-    r10d="$(printf '%s\n' 'SELECT 9' 'EXIT' | ./asmdb lg)"
-    check 'legacy v01 frame still replays' 'content[[:space:]]+:[[:space:]]+legacy frame' "$r10d"
+    r10d="$(printf '%s\n' 'SELECT 9' 'EXIT' | ./asmdb lg 2>&1)"
+    check 'unnamed v01 frame refused' 'belongs to a different database'    "$r10d"
+    if [[ -s lg.wal ]]; then echo "  [PASS] unnamed v01 frame kept"; \
+        else echo "  [FAIL] unnamed v01 frame kept"; fail=$((fail+1)); fi
+    printf '%s\n' 'INSERT 1 10 base original row' 'EXIT' | ./asmdb lg2 > /dev/null
+    python3 "$root/tests/make_wal.py" lg2.wal 9 999 old 'unnamed frame' 2 --unnamed > /dev/null
+    r10e="$(printf '%s\n' 'SELECT 9' 'EXIT' | ./asmdb lg2 2>&1)"
+    check 'unnamed v02 frame refused' 'belongs to a different database'    "$r10e"
 
     # Run 11: fault injection - a failing durable write (ENOSPC-style) must abort
     # cleanly instead of acknowledging, and the committed WAL it leaves behind
@@ -563,6 +572,31 @@ if [[ "$(wc -c < torn.cdc)" -eq 30 ]]; then
     echo "  [PASS] torn change-log header kept"
 else
     echo "  [FAIL] torn change-log header kept"; fail=$((fail+1))
+fi
+
+# A whole-table operation is crash-atomic. TRUNCATE clears the slots one write
+# at a time, so a crash used to leave some rows deleted, some not, and a row
+# count matching neither. It is announced in the header before it starts, and
+# the next open finishes it.
+if command -v nasm > /dev/null 2>&1; then
+    for n in 2 3 4; do
+        rm -f ct.dat ct.wal ct.cdc
+        nasm -f bin "-dFAULT_INJECT=$n" -o asmdb_f -I "$root/src" "$root/src/main.asm" 2>/dev/null
+        chmod +x asmdb_f
+        printf '%s\n' 'INSERT 1 1 a one' 'INSERT 2 2 b two' 'INSERT 3 3 c three' 'EXIT' | ./asmdb ct > /dev/null
+        printf '%s\n' 'TRUNCATE' 'EXIT' | ./asmdb_f ct > /dev/null 2>&1 || true
+        rc="$(printf '%s\n' 'COUNT' 'VERIFY' 'EXIT' | ./asmdb ct 2>&1)"
+        if grep -q 'finishing a whole-table operation' <<< "$rc" \
+           && grep -q '\[ OK \] 0 row(s)' <<< "$rc" \
+           && grep -q 'no problem found' <<< "$rc"; then
+            echo "  [PASS] TRUNCATE crash at write #$n is finished on reopen"
+        else
+            echo "  [FAIL] TRUNCATE crash at write #$n is finished on reopen"; fail=$((fail+1))
+        fi
+    done
+    rm -f asmdb_f
+else
+    echo "  [SKIP] whole-table crash checks (nasm not found)"
 fi
 
 # ---------------------------------------------------------------------------

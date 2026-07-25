@@ -7,7 +7,7 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). ~33 KB. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). ~40 KB. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -17,7 +17,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-~33%20KB%20PE%20%2F%20~41%20KB%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-~40%20KB%20PE%20%2F%20~48%20KB%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -62,8 +62,37 @@ touch: **over 12 million inserts/second** in RAM (measured below, and
 reproducible — ≈ 12× SQLite on the same machine). That is the whole point of
 writing a database in assembly.
 
+## What fits, and what is enforced
+
+Before you design anything on top of asmdb: the shape of a row and the size of
+the table are **fixed at build time**, and every limit below is refused at write
+time rather than silently trimmed.
+
+<p align="center">
+  <img src="docs/assets/asmdb-capacity.png" alt="asmdb capacity, record layout, enforced limits and durability model" width="920">
+</p>
+
+| | |
+|---|---|
+| **Rows per table** | 4 194 304 slots; comfortable up to ~3.1 M (open addressing) |
+| **Row size** | 256 bytes, fixed — seven columns, no more |
+| **`tag`** | 39 bytes max, one token, no spaces |
+| **`content`** | 175 bytes max, rest of line |
+| **`id`** | `u64`, unique, ≥ 1 |
+| **`value`** | `i64` |
+| **Rows per transaction** | 4 096 distinct rows |
+| **Database on disk** | `<db>.dat` ~1 GiB sparse, plus `<db>.wal` and `<db>.cdc` |
+| **Concurrency** | one writer, unlimited `--reader` sessions |
+| **Not there** | no SQL, no joins, no query planner, no secondary indexes, no auth, no encryption |
+
+One table per database file. A [`FIND`](docs/COMMANDS.md#find) or
+[`RANGE`](docs/COMMANDS.md#range) is a full scan of the 4 194 304 slots;
+[`SELECT <id>`](docs/COMMANDS.md#select) is O(1). Full details in
+[Data model & supported types](#data-model--supported-types).
+
 ## Table of contents
 
+- [What fits, and what is enforced](#what-fits-and-what-is-enforced) — capacity, schema and hard limits
 - [Why it's interesting](#why-its-interesting)
 - [Quickstart](#quickstart)
 - [Runs on Windows & Linux](#runs-on-windows--linux) — one engine, two native binaries
@@ -72,7 +101,7 @@ writing a database in assembly.
 - [MCP server & the CRUD interface](#mcp-server--the-crud-interface)
 - [Change data capture](#change-data-capture) — a durable log of every change
 - [How asmdb works](#how-asmdb-works) — the 60-second version, then a deep dive
-- [On-disk format: `.dat` and `.wal`](#on-disk-format-dat-and-wal)
+- [On-disk format: `.dat`, `.wal` and `.cdc`](#on-disk-format-dat-wal-and-cdc)
 - [Performance](#performance) — benchmarks vs SQLite
 - [How a modern database goes faster](#how-a-modern-database-goes-faster)
 - [Transactional-database principles](#transactional-database-principles) — the pillars & coverage
@@ -140,8 +169,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~33 KB</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~41 KB</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~40 KB</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~48 KB</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -216,8 +245,8 @@ never changes:
 | `16` | 8   | `created` | `i64`       | creation time, unix epoch ms (auto) |
 | `24` | 8   | `updated` | `i64`       | last-update time, unix epoch ms (auto) |
 | `32` | 8   | `value`   | `i64`       | numeric payload / score |
-| `40` | 40  | `tag`     | `char[40]`  | category / namespace, NUL-padded |
-| `80` | 176 | `content` | `char[176]` | free text, NUL-padded |
+| `40` | 40  | `tag`     | `char[40]`  | category / namespace — 39 usable bytes + NUL |
+| `80` | 176 | `content` | `char[176]` | free text — 175 usable bytes + NUL |
 
 On top of that raw layout, `TYPES` advertises a catalog of **logical types**.
 Narrow integers, booleans and floats all ride inside the 64-bit `value` cell —
@@ -234,11 +263,11 @@ chooses the interpretation:
 | `bool`        | 8    | `0 = false` / `1 = true`   | `value` |
 | `f64`         | 64   | IEEE-754 double (bits)     | `value` |
 | `timestamp`   | 64   | unix epoch milliseconds    | `created`, `updated` |
-| `char[40]`    | 320  | fixed ASCII text, ≤ 40 B   | `tag` |
-| `char[176]`   | 1408 | fixed ASCII text, ≤ 176 B  | `content` |
+| `char[40]`    | 320  | text, ≤ 39 B + NUL         | `tag` |
+| `char[176]`   | 1408 | text, ≤ 175 B + NUL        | `content` |
 
 One `.dat` file is one database holding one logical table; its name lives in the
-512-byte header. See [On-disk format](#on-disk-format-dat-and-wal) for the exact bytes.
+512-byte header. See [On-disk format](#on-disk-format-dat-wal-and-cdc) for the exact bytes.
 
 ## MCP server & the CRUD interface
 
@@ -351,7 +380,7 @@ flowchart LR
 
 ### The deep dive
 
-How ~33 KB of assembly becomes a durable database.
+How ~40 KB of assembly becomes a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -364,7 +393,7 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the binaries stay ~33 KB (PE) / ~41 KB (ELF) on disk — and why a
+which is why the binaries stay ~40 KB (PE) / ~48 KB (ELF) on disk — and why a
 million-row database needs only a few MB of RAM.
 
 #### The record store — four cache lines per row
@@ -694,7 +723,7 @@ Two documents, deliberately kept in separate lanes:
 | **Startup & memory** | ✅ the store is **mapped copy-on-write**: opening a database is ~80 ms whatever its size (was ~600 ms), and a 1 M-row database peaks at **~5 MB** of RAM (was ~1 029 MB) |
 | **Portability** | ✅ Windows PE64 + Linux ELF64 from one source, behind a thin `os_*` layer |
 | **Integration** | ✅ MCP server (generic CRUD tools) + Python / C# / C stdio clients |
-| **Tests** | ✅ 61 checks per platform in CI, incl. fault-injected I/O failures |
+| **Tests** | ✅ 143 checks on Windows and the same battery on Linux, plus 24 for the MCP server — fault-injected I/O failures, crash windows, format fuzzing |
 | **Next up** | 🔜 **persisted status directory** (see below), then incremental checkpoint, secondary indexes, SIMD scans |
 
 **The roadmap is driven by measurement, not intuition.** The last milestone came
@@ -724,7 +753,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.3.1 · 1.3.0 · 1.2.0 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.4.0 · 1.3.1 · 1.3.0 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -735,7 +764,7 @@ Two numbers are tracked separately and should not be confused:
 
 | | What it is | How often it moves | Effect |
 |---|---|---|---|
-| **Engine version** | the software (`1.0.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
+| **Engine version** | the software (`1.4.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
 | **Storage format** | the byte layout of `<db>.dat` (`2`) | rarely | decides whether a file can be opened, and what `--upgrade` migrates |
 
 Run `VERSION` inside the REPL to see both, plus which engine last wrote the open
@@ -743,6 +772,68 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+<summary><b>1.4.0</b> — the write-ahead log names its database, whole-table operations survive a crash, and a snapshot stops costing a gigabyte</summary>
+
+**A write-ahead log could be replayed into the wrong database.** The log carried
+no identity at all, so an `<db>.wal` left behind by one database was replayed
+into any other opened under the same base name — including a brand-new, empty
+one, which then adopted the foreign log's row count as well. Demonstrated in one
+command: with only `orphan.wal` on disk, opening `orphan` produced two rows that
+had never been inserted.
+
+Frames are now `ASMWAL04` and carry the 128-bit database lineage. A frame naming
+a different database is refused and the log is kept. A frame naming *no*
+database — v01 to v03, written before this release — cannot be told apart from
+one that wandered in, so it is refused too; the log is left intact and the engine
+build that wrote it can still replay it.
+
+**`TRUNCATE`, `RESTORE` and `BENCH` are now crash-atomic.** They replace every
+row at once, which no write-ahead frame can express, so `reset_pending` only ever
+guaranteed the change log got its `RESET` frame — it said nothing about the table
+itself. A crash halfway through left some rows deleted, some not, and a row count
+matching neither. The operation is now announced in the header and flushed
+*before* it starts, and the announcement is cleared only once the table is
+finished and flushed. The next open sees the announcement and completes the work:
+`TRUNCATE` and `BENCH` converge on an empty table, `RESTORE` re-copies from the
+same snapshot. Tested by crashing at three different points inside a `TRUNCATE`
+and checking the reopened database is fully truncated and passes `VERIFY`.
+
+**A snapshot no longer writes a gigabyte to save three rows.** `BACKUP`,
+`RESTORE` and the `BENCH` checkpoint each wrote all 4 194 304 slots regardless
+of how many were used. The region is now written a 1 MiB chunk at a time and
+chunks that are entirely zero are left as file holes — a hole reads back as
+zeros, which is exactly what an empty slot is. Backing up a three-row database
+allocates **3.2 MiB instead of 1 GiB**, and the test suite went from about six
+minutes to 142 seconds. Overwriting an existing region still zeroes the chunks
+that used to hold rows, so restoring a small snapshot over a large table really
+does remove the old rows.
+
+**Over-long `tag` and `content` are refused instead of truncated.** The columns
+are 40 and 176 bytes but reserve their last byte as a terminator, so the usable
+maxima are **39 and 175**. Anything longer was silently cut and reported as
+success. It is now `[ERR] tag exceeds 39 bytes or content exceeds 175 bytes -
+nothing stored`, matching the rule already applied to over-long input lines. The
+documentation said 40 and 176 throughout; it now says 39 and 175, and the MCP
+server enforces the same numbers.
+
+**A `SECURITY.md` that is honest rather than flattering.** The binary is a single
+segment that is readable, writable *and* executable, loaded at a fixed address
+with no ASLR; the engine has no authentication, no encryption and no audit log;
+CRC32 detects accidental corruption, not an attacker; and `flock` on Linux is
+advisory, so the single-writer guarantee assumes cooperating processes. All of it
+is written down, with a supported-versions table and a disclosure process.
+
+Also: a CycloneDX `sbom.json` covering the three layers (engine — no
+dependencies at all, MCP server, tooling) with `docs/SBOM.md` explaining it; a
+dependency-free fuzz harness that corrupts `.dat`, `.wal` and `.cdc` and asserts
+the engine never reports success on damaged input, wired into CI; and a
+least-privilege `permissions:` block on the workflow.
+
+Tests: 143 checks on Windows, the same battery on Linux, 24 for the MCP server.
+
+</details>
 
 <details>
 <summary><b>1.3.1</b> — the change log validates its own header</summary>

@@ -409,6 +409,26 @@ print_detail:
 
 ; -------------------------- command handlers --------------------------------
 
+; field_end_ok() -> rax = 1 when rsi sits on a token boundary.
+;
+; parse_tok stops once the destination is full, so a token longer than its
+; column left the remainder on the line and the row was stored truncated,
+; silently. Refusing is the same rule already applied to over-long input lines:
+; storing less than the caller wrote must never be reported as success.
+field_end_ok:
+    movzx eax, byte [rsi]
+    test al, al
+    je   .yes
+    cmp  al, ' '
+    je   .yes
+    cmp  al, 9
+    je   .yes
+    xor  eax, eax
+    ret
+.yes:
+    mov  eax, 1
+    ret
+
 ; cmd_insert() - INSERT <id> <value> <tag> <content...>
 cmd_insert:
     push rbp
@@ -433,12 +453,16 @@ cmd_insert:
     lea  rdi, [rel g_tagbuf]
     mov  rdx, TAG_MAX-1
     call parse_tok
-    call advance_token               ; drop any overflow of a long tag token
+    call field_end_ok                ; a tag that did not fit is refused, not cut
+    test rax, rax
+    jz   .toolong
     call skip_spaces_rsi
     lea  rdi, [rel g_contentbuf]
     mov  rdx, CONTENT_MAX-1
     call parse_rest
     mov  [rbp-48], rax               ; content length
+    cmp  byte [rsi], 0
+    jne  .toolong                    ; content ran past the column
     mov  rcx, [rbp-32]
     call store_locate                ; rax=found, rdx=insert
     test rax, rax
@@ -477,6 +501,10 @@ cmd_insert:
     jmp  .done
 .toobig:
     lea  rcx, [rel s_txn_toobig]
+    call puts
+    jmp  .done
+.toolong:
+    lea  rcx, [rel s_err_field]
     call puts
     jmp  .done
 .dup:
@@ -526,12 +554,16 @@ cmd_update:
     lea  rdi, [rel g_tagbuf]
     mov  rdx, TAG_MAX-1
     call parse_tok
-    call advance_token
+    call field_end_ok
+    test rax, rax
+    jz   .toolong
     call skip_spaces_rsi
     lea  rdi, [rel g_contentbuf]
     mov  rdx, CONTENT_MAX-1
     call parse_rest
     mov  [rbp-48], rax               ; content length
+    cmp  byte [rsi], 0
+    jne  .toolong
     mov  rcx, [rbp-32]
     call store_locate
     test rax, rax
@@ -562,6 +594,10 @@ cmd_update:
     jmp  .done
 .toobig:
     lea  rcx, [rel s_txn_toobig]
+    call puts
+    jmp  .done
+.toolong:
+    lea  rcx, [rel s_err_field]
     call puts
     jmp  .done
 .notfound:
@@ -677,7 +713,9 @@ cmd_truncate:
     ; Outside a transaction this is a durable boundary of its own: announce it
     ; in the header BEFORE touching the table, so a crash halfway still yields
     ; exactly one RESET on the next open.
-    call cdc_mark_reset
+    mov  rcx, BULK_TRUNCATE
+    xor  rdx, rdx
+    call bulk_begin
     mov  [rbp-48], rax               ; the sequence the RESET will carry
 .go:
     xor  rbx, rbx                    ; index
@@ -706,13 +744,11 @@ cmd_truncate:
     mov  [rel g_count], rax
     cmp  qword [rel g_in_txn], 0
     jne  .deferred
-    ; autocommit: refresh header row-count and fsync once, then publish the
-    ; RESET and clear the pending flag - in that order, so the frame is durable
-    ; before we stop advertising that one is owed
-    call db_write_header
-    call db_flush
+    ; autocommit: the table is now fully cleared on disk, so stop advertising
+    ; the operation and publish the RESET - in that order, so the frame is
+    ; durable before we stop advertising that one is owed
     mov  rcx, [rbp-48]
-    call cdc_finish_reset
+    call bulk_end
 .deferred:
     lea  rcx, [rel s_ok_trunc]
     call puts
@@ -1512,13 +1548,18 @@ cmd_backup:
     call write_at                    ; 512-byte header at offset 0
     cmp  rax, HDR_SIZE
     jne  .wfail
-    mov  rcx, HDR_SIZE
-    mov  rdx, [rel g_table]
-    mov  r8, CAPACITY*REC_SIZE
-    call write_at                    ; full slot region
-    mov  rdx, CAPACITY*REC_SIZE
-    cmp  rax, rdx
-    jne  .wfail
+    ; The destination is a brand-new file, so every chunk that is all zeros can
+    ; be left as a hole: set the final length first, then write only the chunks
+    ; that actually hold rows. A three-row database costs a few KB, not 1 GiB.
+    mov  rcx, rbx
+    call os_set_sparse
+    mov  rcx, rbx
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    call os_truncate
+    test rax, rax
+    jnz  .wfail
+    xor  rcx, rcx                    ; fresh file
+    call region_write_sparse
     mov  rcx, [rel g_dat_handle]
     call os_fsync
     test rax, rax
@@ -1576,38 +1617,32 @@ cmd_backup:
     pop  rbp
     ret
 
-; cmd_restore() - RESTORE <file> : reload the database (header + slot region)
-; from a backup written by BACKUP, then persist it to the live .dat. Rejected
-; while a transaction is open.
+; restore_apply(rcx = path, rdx = 0 validate only / 1 apply)
+;   -> rax = 0 ok, 1 cannot open, 2 not a backup, 3 truncated or incompatible
 ;
-; The backup is fully validated - magic, format fields, count, and the presence
-; of the LAST byte of the slot region - *before* a single byte of the live table
-; is overwritten. A truncated or foreign backup therefore leaves both the
-; in-memory table and the durable .dat exactly as they were.
-cmd_restore:
+; The snapshot is validated in full - magic, format fields, row count and the
+; presence of the LAST byte of the slot region - before a single byte of the
+; live table is touched, so a foreign or truncated file leaves the database
+; exactly as it was.
+;
+; Splitting validation from application is also what makes an interrupted
+; RESTORE finishable: recovery re-runs the apply step against the same snapshot
+; and converges on the same table, however many times it is attempted.
+restore_apply:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x60
     mov  [rbp-8], rbx
     mov  [rbp-16], rsi
     mov  [rbp-24], rdi
-    cmp  qword [rel g_in_txn], 0
-    jne  .busy
-    call skip_spaces_rsi
-    mov  al, [rsi]
-    test al, al
-    je   .syntax
-    lea  rdi, [rel g_bakname]
-    mov  rdx, 200
-    call parse_tok
-    lea  rcx, [rel g_bakname]
+    mov  [rbp-48], rdx               ; 1 = actually overwrite the table
     call os_open_read
     cmp  rax, INVALID_HANDLE
     je   .openfail
-    mov  rbx, rax                    ; backup handle
+    mov  rbx, rax                    ; snapshot handle
     mov  rax, [rel g_dat_handle]
     mov  [rbp-32], rax               ; saved live handle
-    mov  [rel g_dat_handle], rbx     ; read from the backup
+    mov  [rel g_dat_handle], rbx     ; read through the snapshot
     xor  rcx, rcx
     lea  rdx, [rel g_hdr_read]
     mov  r8, HDR_SIZE
@@ -1629,22 +1664,19 @@ cmd_restore:
     cmp  rax, rdx
     ja   .badtrunc
     mov  [rbp-40], rax               ; keep it: the probe reuses g_hdr_read
-    ; the backup must physically contain the last byte of the slot region
     mov  rcx, rbx
     mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE - 1
     lea  r8, [rel g_hdr_read]
     mov  r9, 1
     call os_pread
     cmp  rax, 1
-    jne  .badtrunc                   ; truncated (or unreadable) backup
-    ; validated - now it is safe to overwrite the live table. Announce the reset
-    ; first (a whole-table replacement is one CDC boundary, not N events), which
-    ; must be written through the LIVE handle, not the read-only backup.
-    mov  rax, [rbp-32]
-    mov  [rel g_dat_handle], rax
-    call cdc_mark_reset
-    mov  [rbp-48], rax
-    mov  [rel g_dat_handle], rbx     ; back to the backup to read the region
+    jne  .badtrunc                   ; truncated (or unreadable) snapshot
+    cmp  qword [rbp-48], 0
+    je   .okclose
+    ; Remember which chunks of the live region hold something *before* the
+    ; snapshot overwrites them, so a chunk that becomes empty is still zeroed on
+    ; disk rather than keeping its old rows.
+    call region_scan_used
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
     mov  r8, CAPACITY*REC_SIZE
@@ -1653,39 +1685,107 @@ cmd_restore:
     cmp  rax, rdx
     jne  io_fatal_read               ; the table is half-loaded; do not go on
     mov  rax, [rbp-40]
-    mov  [rel g_count], rax          ; adopt restored live count
+    mov  [rel g_count], rax
     mov  rax, [rbp-32]
-    mov  [rel g_dat_handle], rax     ; restore live handle
+    mov  [rel g_dat_handle], rax     ; back to the live file
     mov  rcx, rbx
     call os_close
-    call db_write_header             ; persist restored image to the live .dat
-    mov  rcx, HDR_SIZE
-    mov  rdx, [rel g_table]
-    mov  r8, CAPACITY*REC_SIZE
-    call write_at
-    mov  rdx, CAPACITY*REC_SIZE
-    cmp  rax, rdx
-    jne  io_fatal
+    call db_write_header
+    mov  rcx, 1                      ; overwriting an existing region
+    call region_write_sparse
     call db_flush
-    mov  rcx, [rbp-48]
-    call cdc_finish_reset
-    lea  rcx, [rel s_ok_restore]
-    call puts
-    jmp  .done
+    xor  eax, eax
+    jmp  .out
+.okclose:
+    mov  rax, [rbp-32]
+    mov  [rel g_dat_handle], rax
+    mov  rcx, rbx
+    call os_close
+    xor  eax, eax
+    jmp  .out
 .badmagic:
     mov  rax, [rbp-32]
-    mov  [rel g_dat_handle], rax     ; restore live handle before erroring
+    mov  [rel g_dat_handle], rax
     mov  rcx, rbx
     call os_close
-    lea  rcx, [rel s_err_bak_magic]
-    call puts
-    jmp  .done
+    mov  eax, 2
+    jmp  .out
 .badtrunc:
     mov  rax, [rbp-32]
     mov  [rel g_dat_handle], rax
     mov  rcx, rbx
     call os_close
+    mov  eax, 3
+    jmp  .out
+.openfail:
+    mov  eax, 1
+.out:
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_restore() - RESTORE <file> : replace the whole table with a snapshot
+; written by BACKUP. Rejected while a transaction is open.
+;
+; The replacement is announced in the header and flushed before it starts, so a
+; crash mid-copy no longer leaves a table that is half old and half new: the
+; next open sees the announcement and finishes the copy from the same snapshot.
+cmd_restore:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    cmp  qword [rel g_in_txn], 0
+    jne  .busy
+    call skip_spaces_rsi
+    mov  al, [rsi]
+    test al, al
+    je   .syntax
+    lea  rdi, [rel g_bakname]
+    mov  rdx, 200
+    call parse_tok
+    ; validate first: a bad snapshot must not announce anything or arm a reset
+    lea  rcx, [rel g_bakname]
+    xor  rdx, rdx
+    call restore_apply
+    test rax, rax
+    jnz  .failed
+    mov  rcx, BULK_RESTORE
+    lea  rdx, [rel g_bakname]
+    call bulk_begin
+    mov  [rbp-40], rax               ; the sequence the RESET will carry
+    lea  rcx, [rel g_bakname]
+    mov  rdx, 1
+    call restore_apply
+    test rax, rax
+    jnz  .lost
+    mov  rcx, [rbp-40]
+    call bulk_end
+    lea  rcx, [rel s_ok_restore]
+    call puts
+    jmp  .done
+.lost:
+    ; Validated a moment ago, unusable now. The announcement stays on disk, so
+    ; the next open either finishes the restore or refuses - what must not
+    ; happen is reporting success over a half-replaced table.
     lea  rcx, [rel s_err_bak_trunc]
+    call puts
+    jmp  .done
+.failed:
+    cmp  eax, 1
+    je   .openfail
+    cmp  eax, 2
+    je   .badmagic
+    lea  rcx, [rel s_err_bak_trunc]
+    call puts
+    jmp  .done
+.badmagic:
+    lea  rcx, [rel s_err_bak_magic]
     call puts
     jmp  .done
 .openfail:
@@ -1743,8 +1843,11 @@ cmd_bench:
     mov  [rbp-64], rax               ; n_local
     ; reset the table: clear every slot, count = 0. A synthetic reload replaces
     ; the whole table, so it is one RESET for change consumers.
-    call cdc_mark_reset
+    mov  rcx, BULK_BENCH
+    xor  rdx, rdx
+    call bulk_begin
     mov  [rbp-104], rax
+    call region_scan_used            ; what the region held before we wipe it
     mov  qword [rel g_count], 0
     mov  rdi, [rel g_table]
     mov  rcx, CAPACITY*REC_SIZE
@@ -1796,18 +1899,15 @@ cmd_bench:
 .loopend:
     call os_perf_counter             ; end of in-RAM phase
     mov  [rel g_qpc1], rax
-    ; durable checkpoint: whole slot region + header, then fsync
-    mov  rcx, HDR_SIZE
-    mov  rdx, [rel g_table]
-    mov  r8, CAPACITY*REC_SIZE
-    call write_at
-    mov  rdx, CAPACITY*REC_SIZE
-    cmp  rax, rdx
-    jne  io_fatal
+    ; durable checkpoint: the slot region (skipping untouched chunks) + header,
+    ; then fsync. BENCH replaces the whole table, so the chunks that held rows
+    ; before must be zeroed even where the new data does not reach.
+    mov  rcx, 1
+    call region_write_sparse
     call db_write_header
     call db_flush
     mov  rcx, [rbp-104]
-    call cdc_finish_reset
+    call bulk_end
     call os_perf_counter
     mov  [rel g_qpc2], rax
     ; ram_ticks = qpc1 - qpc0 (floor at 1 to avoid divide-by-zero)

@@ -30,8 +30,8 @@ here instead of inlining the list.
 |---|---|
 | `<id>` | primary key, an unsigned integer **≥ 1** and **< 2⁶⁴** (id `0` is reserved; a literal too large to fit is rejected as a syntax error, never wrapped) |
 | `<value>` / `<val>` | the 64-bit signed numeric cell (`i64`); may be interpreted as any narrower [type](#types) by the caller |
-| `<tag>` | a **single token** (no spaces), ≤ 40 bytes — a category / namespace |
-| `<text>` / `<content>` | the **rest of the line** (spaces allowed), ≤ 176 bytes |
+| `<tag>` | a **single token** (no spaces), ≤ 39 bytes — a category / namespace |
+| `<text>` / `<content>` | the **rest of the line** (spaces allowed), ≤ 175 bytes |
 | `<substr>` | a search string for [`FIND`](#find) |
 | `<lo> <hi>` | inclusive numeric bounds for [`RANGE`](#range) |
 | `<file>` | a path for [`BACKUP`](#backup) / [`RESTORE`](#restore) |
@@ -112,7 +112,7 @@ epoch in milliseconds. In autocommit mode the row is flushed to disk immediately
 inside a transaction it is staged until [`COMMIT`](#commit).
 
 **Constraints** — `id` must be **≥ 1** (a `CHECK`; `0` is reserved) and must not
-already exist (unique primary key); `tag` ≤ 40 bytes; `content` ≤ 176 bytes.
+already exist (unique primary key); `tag` ≤ 39 bytes; `content` ≤ 175 bytes. A longer tag or content is **refused**, never truncated.
 
 ```text
 asmdb> INSERT 1001 5 project asmdb is written in x86-64 assembly
@@ -413,8 +413,8 @@ asmdb> SCHEMA
     16      8     created  i64   unix epoch ms (auto)
     24      8     updated  i64   unix epoch ms (auto)
     32      8     value    i64   numeric score / payload
-    40      40    tag      char[40]  category, NUL-padded
-    80      176   content  char[176] free text, NUL-padded
+    40      40    tag      char[40]  category, 39 usable + NUL
+    80      176   content  char[176] free text, 175 usable + NUL
 ```
 
 ---
@@ -442,8 +442,8 @@ asmdb> TYPES
     bool            8  0 = false / 1 = true        value
     f64            64  IEEE-754 double (raw bits)  value
     timestamp      64  unix epoch ms               created, updated
-    char[40]      320  fixed ASCII text, <= 40 B   tag
-    char[176]    1408  fixed ASCII text, <=176 B   content
+    char[40]      320  text, <= 39 B + NUL        tag
+    char[176]    1408  text, <= 175 B + NUL       content
 ```
 
 ---
@@ -462,12 +462,12 @@ file can be opened.
 
 ```text
 asmdb> VERSION
-  asmdb 1.1.0   (stable: the on-disk format is versioned and migratable)
+  asmdb 1.4.0   (stable: the on-disk format is versioned and migratable)
   storage format : 2
   record size    : 256 bytes
   capacity       : 4194304 slots
   platform       : Windows PE64 (kernel32)
-  written by     : engine 1.1.0
+  written by     : engine 1.4.0
 ```
 
 `written by` reads a stamp in the file header. Databases written before 0.9.0
@@ -519,7 +519,9 @@ never announced as a usable snapshot. The live database is not touched either
 way.
 
 The snapshot is written to `<file>.part`, created exclusively, flushed, and only
-then renamed over `<file>`. So a backup either lands whole or not at all, and a
+then renamed over `<file>`. It is written a 1 MiB chunk at a time and chunks
+that hold no rows are left as file holes, so a snapshot of a small database
+costs a few megabytes rather than the full 1 GiB region. So a backup either lands whole or not at all, and a
 failed run never destroys the previous good backup at the same path.
 
 `<file>` is compared to the live `.dat`, `.wal` and `.cdc` **by file identity**

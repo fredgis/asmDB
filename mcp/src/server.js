@@ -26,9 +26,12 @@ const ENGINE_NAME = platform() === "win32" ? "asmdb.exe" : "asmdb";
 const EXE = process.env.ASMDB_EXE || resolve(__dirname, "..", "..", "build", ENGINE_NAME);
 const DIR = process.env.ASMDB_DIR || join(homedir(), ".asmdb");
 const DB = process.env.ASMDB_DB || "asmdb";
-const SERVER_VERSION = "1.1.0";
-const TAG_MAX_BYTES = 40;
-const CONTENT_MAX_BYTES = 176;
+const SERVER_VERSION = "1.2.0";
+// The engine stores 40- and 176-byte columns but reserves the last byte of
+// each as a terminator, so the usable payload is 39 and 175 bytes. Anything
+// longer is refused by the engine, not truncated.
+const TAG_MAX_BYTES = 39;
+const CONTENT_MAX_BYTES = 175;
 const KEY_PREFIX = "\\asmdb-key:";
 const KEY_DELIM = ";";
 

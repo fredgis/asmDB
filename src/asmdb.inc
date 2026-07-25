@@ -49,6 +49,11 @@
 %define TSV_BUF_SIZE   (2 + 5*21 + 2*(TAG_MAX + CONTENT_MAX) + 4)
 %define PAGE_LIMIT_MAX 1000000    ; refuse absurd page sizes rather than wrap
 %define VERIFY_MAX_REPORT 16      ; per-slot problems printed before summarising
+; The slot region is written a chunk at a time so untouched chunks can be left
+; as file holes instead of a gigabyte of zeros.
+%define SPARSE_SHIFT   20         ; 1 MiB chunks
+%define SPARSE_CHUNK   (1 << SPARSE_SHIFT)
+%define REGION_CHUNKS  ((CAPACITY*REC_SIZE) >> SPARSE_SHIFT)
 ; Reader mode: buffered output so a command can be replayed when a commit lands
 ; underneath it, and a bound on how many times that is worth doing.
 %define CAP_BUF_SIZE   0x400000   ; 4 MiB
@@ -114,8 +119,8 @@
 ; HDR_ENGINE purely for diagnostics: it tells you which build touched a
 ; database, without ever affecting whether it can be opened.
 %define ENGINE_MAJOR 1
-%define ENGINE_MINOR 3
-%define ENGINE_PATCH 1
+%define ENGINE_MINOR 4
+%define ENGINE_PATCH 0
 %define ENGINE_VERSION ((ENGINE_MAJOR << 16) | (ENGINE_MINOR << 8) | ENGINE_PATCH)
 
 ; ---- On-disk ----
@@ -128,6 +133,17 @@
 %define HDR_RESETP 96         ; u64: 1 = a global RESET is mid-flight
 %define HDR_RESETS 104        ; u64: the sequence that RESET will carry
 %define HDR_LINEAGE 112       ; 16 bytes: identity shared with the change log
+; A whole-table operation is announced here BEFORE it starts and cleared only
+; once it has finished and been flushed. reset_pending guarantees the change
+; log gets its RESET frame; this guarantees the TABLE ITSELF is finished, which
+; is a different promise: a crash halfway through TRUNCATE/RESTORE/BENCH used to
+; leave a partly transformed table with an inconsistent row count.
+%define HDR_BULK    128       ; u64: 0 none, 1 truncate, 2 restore, 3 bench
+%define HDR_BULKSRC 136       ; char[224]: RESTORE source path, NUL-padded
+%define BULK_NONE     0
+%define BULK_TRUNCATE 1
+%define BULK_RESTORE  2
+%define BULK_BENCH    3
 
 ; ---- Change data capture (<db>.cdc) ----
 ; Append-only log, one frame per committed transaction that changed something.
@@ -188,6 +204,12 @@
 ; so recovery can republish a change frame that a crash lost.
 %define WAL_HDR_V2 24
 %define WAL_HDR_V3 40
+; v04 adds the 128-bit database lineage. Without it a write-ahead log left
+; behind by one database was replayed into any other one that happened to be
+; opened under the same base name - including a brand-new, empty database,
+; which then adopted the foreign log's row count as well.
+%define WAL_HDR_V4 56
+%define WAL_LINEAGE 40           ; 16 bytes inside the v04 frame header
 
 ; ---- WAL entry layouts ----
 ; v01/v02 entries are {slot index, after-image} = UNDO_ENTRY bytes.

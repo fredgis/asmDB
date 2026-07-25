@@ -201,6 +201,12 @@ db_write_header:
     mov  [rel g_hdr+HDR_LINEAGE], rax
     mov  rax, [rel g_lineage_hi]
     mov  [rel g_hdr+HDR_LINEAGE+8], rax
+    mov  rax, [rel g_bulk_kind]
+    mov  [rel g_hdr+HDR_BULK], rax
+    lea  rdi, [rel g_hdr+HDR_BULKSRC]
+    lea  rsi, [rel g_bulk_src]
+    mov  rcx, 224
+    call strcpy_n
     lea  rdi, [rel g_hdr+HDR_TABLE]
     lea  rsi, [rel g_tablename]
     mov  rcx, TABLE_MAX
@@ -501,6 +507,15 @@ db_open:
     cmp  rax, [rel g_reset_seq]
     jne  .corrupt
 .resetok:
+    ; a whole-table operation may have been announced and never finished
+    mov  rax, [rel g_hdr_read+HDR_BULK]
+    cmp  rax, BULK_BENCH
+    ja   .corrupt
+    mov  [rel g_bulk_kind], rax
+    lea  rsi, [rel g_hdr_read+HDR_BULKSRC]
+    lea  rdi, [rel g_bulk_src]
+    mov  rcx, 224
+    call strcpy_n
     ; lineage ties this file to its change log; older files have none yet
     mov  rax, [rel g_hdr_read+HDR_LINEAGE]
     mov  [rel g_lineage_lo], rax
@@ -601,6 +616,7 @@ db_open:
     jz   .mapfail
     add  rax, HDR_SIZE               ; slot region starts after the header
     mov  [rel g_table], rax
+    call bulk_recover                ; finish a whole-table operation a crash cut short
 .done:
     mov  rsp, rbp
     pop  rbp
@@ -1103,6 +1119,260 @@ db_open_reader:
     call puts
     mov  ecx, 1
     call os_exit
+
+; ---------------------------------------------------------------------------
+; Whole-table operations (TRUNCATE / RESTORE / BENCH)
+;
+; These replace every row at once. They are not expressible as a WAL frame - the
+; log would have to hold up to four million after-images - so they are made
+; crash-safe a different way: the operation is *announced* in the header and
+; flushed before it starts, and the announcement is cleared only after it has
+; finished and been flushed. A crash in between leaves the announcement on disk,
+; and the next open finishes the job.
+;
+; This is a separate promise from reset_pending, which only guarantees the
+; change log gets its RESET frame. That flag said nothing about the table
+; itself, so a crash halfway through a TRUNCATE left rows deleted, rows not, and
+; a row count matching neither.
+;
+; Recovery is idempotent by construction: TRUNCATE and BENCH converge on an
+; empty table, and RESTORE re-copies from a source that is still on disk.
+
+; bulk_begin(rcx = kind, rdx = source path or 0) -> rax = the RESET sequence.
+; Announces the operation and the change-log reset in ONE durable header write.
+bulk_begin:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rel g_bulk_kind], rcx
+    lea  rdi, [rel g_bulk_src]
+    mov  rcx, 224
+    call mem_zero_n
+    test rdx, rdx
+    jz   .nosrc
+    mov  rsi, rdx
+    lea  rdi, [rel g_bulk_src]
+    mov  rcx, 224
+    call strcpy_n
+.nosrc:
+    call cdc_mark_reset              ; writes the header and flushes it
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; bulk_end(rcx = the RESET sequence) - the table is finished and durable, so
+; stop advertising the operation, then publish the RESET frame.
+bulk_end:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rcx
+    mov  qword [rel g_bulk_kind], BULK_NONE
+    lea  rdi, [rel g_bulk_src]
+    mov  rcx, 224
+    call mem_zero_n
+    call db_write_header
+    call db_flush
+    mov  rcx, [rbp-8]
+    call cdc_finish_reset
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; mem_zero_n(rdi = ptr, rcx = len)
+mem_zero_n:
+    push rbp
+    mov  rbp, rsp
+    push rdi
+    xor  al, al
+    rep  stosb
+    pop  rdi
+    pop  rbp
+    ret
+
+; bulk_clear_table() - the shared completion for TRUNCATE and BENCH: every live
+; slot becomes a tombstone on disk and the row count becomes zero.
+bulk_clear_table:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx
+    xor  rbx, rbx
+.loop:
+    cmp  rbx, CAPACITY
+    jae  .done
+    mov  rax, rbx
+    shl  rax, REC_SHIFT
+    add  rax, [rel g_table]
+    cmp  byte [rax+REC_STATUS], ST_OCCUPIED
+    jne  .next
+    mov  byte [rax+REC_STATUS], ST_DELETED
+    mov  rcx, rax
+    call db_write_slot
+.next:
+    inc  rbx
+    jmp  .loop
+.done:
+    mov  qword [rel g_count], 0
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; bulk_recover() - called once the table is mapped: finish an operation that a
+; crash interrupted, then stop advertising it.
+bulk_recover:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  rax, [rel g_bulk_kind]
+    cmp  rax, BULK_NONE
+    je   .none
+    lea  rcx, [rel s_bulk_resume]
+    call puts
+    cmp  rax, BULK_RESTORE
+    je   .restore
+    ; TRUNCATE and BENCH both converge on an empty table. BENCH's rows are
+    ; synthetic, so regenerating them would be busywork: an empty, consistent
+    ; table is the honest outcome and the operator can simply run BENCH again.
+    call bulk_clear_table
+    jmp  .finish
+.restore:
+    lea  rcx, [rel g_bulk_src]
+    mov  rdx, 1                      ; apply, not just validate
+    call restore_apply               ; re-copies the snapshot; 0 = ok
+    test rax, rax
+    jnz  .nosrc
+.finish:
+    call db_write_header
+    call db_flush
+    mov  qword [rel g_bulk_kind], BULK_NONE
+    lea  rdi, [rel g_bulk_src]
+    mov  rcx, 224
+    call mem_zero_n
+    call db_write_header
+    call db_flush
+    lea  rcx, [rel s_bulk_done]
+    call puts
+.none:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+.nosrc:
+    ; The snapshot this RESTORE was reading is gone or no longer valid, so the
+    ; table cannot be brought to either end state. Refuse rather than serve a
+    ; half-restored database, and keep the announcement so a later attempt with
+    ; the right file still knows what was in flight.
+    lea  rcx, [rel s_err_bulk_src]
+    call puts
+    lea  rcx, [rel g_bulk_src]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    mov  ecx, 1
+    call os_exit
+
+; mem_is_zero(rcx = ptr, rdx = len) -> rax = 1 when every byte is zero.
+; len must be a multiple of 8.
+mem_is_zero:
+    xor  r8, r8
+.loop:
+    cmp  r8, rdx
+    jae  .yes
+    mov  rax, [rcx+r8]
+    test rax, rax
+    jnz  .no
+    add  r8, 8
+    jmp  .loop
+.yes:
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
+; region_scan_used() - record which chunks of the slot region currently hold
+; anything, into g_chunkmap (one byte per chunk).
+region_scan_used:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rbx
+    xor  rbx, rbx
+.loop:
+    cmp  rbx, REGION_CHUNKS
+    jae  .done
+    mov  rcx, rbx
+    shl  rcx, SPARSE_SHIFT
+    add  rcx, [rel g_table]
+    mov  rdx, SPARSE_CHUNK
+    call mem_is_zero
+    xor  al, 1                       ; 1 = the chunk holds something
+    lea  rdx, [rel g_chunkmap]
+    mov  [rdx+rbx], al
+    inc  rbx
+    jmp  .loop
+.done:
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; region_write_sparse(rcx = 0 fresh file / 1 overwriting an existing region)
+;
+; Writes the slot region to the current g_dat_handle, skipping chunks that are
+; entirely zero.
+;
+; The store is a hash table over a 1 GiB region that is almost all untouched
+; zeros at any realistic load factor, yet BACKUP, RESTORE and the BENCH
+; checkpoint each wrote every byte of it - a gigabyte of I/O to snapshot three
+; rows. A file hole reads back as zeros, which is exactly what an empty slot is,
+; so skipping them is not an approximation.
+;
+; When overwriting a region that already holds data, a chunk that has BECOME
+; zero still has to be written: g_chunkmap, filled by region_scan_used before
+; the new contents were loaded, says which chunks used to hold something.
+region_write_sparse:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rcx               ; overwrite mode
+    xor  rbx, rbx
+.loop:
+    cmp  rbx, REGION_CHUNKS
+    jae  .done
+    mov  rcx, rbx
+    shl  rcx, SPARSE_SHIFT
+    add  rcx, [rel g_table]
+    mov  rdx, SPARSE_CHUNK
+    call mem_is_zero
+    test rax, rax
+    jz   .write                      ; holds data - always write it
+    cmp  qword [rbp-16], 0
+    je   .skip                       ; fresh file: a hole is already correct
+    lea  rdx, [rel g_chunkmap]
+    cmp  byte [rdx+rbx], 0
+    je   .skip                       ; was empty and still is
+.write:
+    mov  rcx, rbx
+    shl  rcx, SPARSE_SHIFT
+    add  rcx, HDR_SIZE               ; file offset
+    mov  rdx, rbx
+    shl  rdx, SPARSE_SHIFT
+    add  rdx, [rel g_table]
+    mov  r8, SPARSE_CHUNK
+    call write_at
+    cmp  rax, SPARSE_CHUNK
+    jne  io_fatal
+.skip:
+    inc  rbx
+    jmp  .loop
+.done:
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
 
 ; db_close()
 db_close:

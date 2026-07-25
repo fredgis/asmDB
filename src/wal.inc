@@ -178,6 +178,10 @@ wal_recover:
     mov  qword [rbp-64], 0           ; flags (v03 only)
     mov  qword [rbp-72], UNDO_ENTRY  ; entry stride
     mov  qword [rbp-80], 8           ; after-image offset within an entry
+    mov  qword [rbp-88], 0           ; 1 -> the frame names its database (v04)
+    mov  rax, [rel wal_magic4]
+    cmp  rax, [rbx]
+    je   .v4
     mov  rax, [rel wal_magic3]
     cmp  rax, [rbx]
     je   .v3
@@ -187,6 +191,17 @@ wal_recover:
     mov  rax, [rel wal_magic]        ; legacy frame written before checksums
     cmp  rax, [rbx]
     jne  .clear
+    jmp  .magic_ok
+.v4:
+    mov  qword [rbp-88], 1
+    mov  qword [rbp-40], 1
+    mov  qword [rbp-48], WAL_HDR_V4
+    mov  qword [rbp-72], WAL_ENT_V3
+    mov  qword [rbp-80], WAL_ENT_IMAGE
+    mov  rax, [rbx+24]
+    mov  [rbp-56], rax               ; commit_seq
+    mov  rax, [rbx+32]
+    mov  [rbp-64], rax               ; flags
     jmp  .magic_ok
 .v3:
     mov  qword [rbp-40], 1
@@ -237,6 +252,29 @@ wal_recover:
     ; contents from now on is a refusal to open, never a discard: dropping the
     ; log would silently erase an acknowledged commit.
     ;
+    ; First: does this log even belong to this database? A v04 frame names its
+    ; database, so a mismatch is refused outright. A log with no name at all
+    ; (v01-v03) cannot be checked, so it is only trusted next to a database that
+    ; already existed - replaying one into a file this process just created is
+    ; how a stray <db>.wal used to import another database's rows, count and all.
+    cmp  qword [rbp-88], 0
+    je   .unnamed
+    mov  rax, [rbx+WAL_LINEAGE]
+    cmp  rax, [rel g_lineage_lo]
+    jne  .foreign
+    mov  rax, [rbx+WAL_LINEAGE+8]
+    cmp  rax, [rel g_lineage_hi]
+    jne  .foreign
+    jmp  .owned
+.unnamed:
+    ; A committed frame that does not say which database it belongs to (v01-v03,
+    ; written before 1.4). There is no way to tell a genuine crash log from one
+    ; that wandered in from another database, and that ambiguity is exactly how
+    ; a stray <db>.wal imported a foreign row set - live count included.
+    ; Refusing loses nothing: the log is kept intact, and the engine build that
+    ; wrote it can still replay it.
+    jmp  .foreign
+.owned:
     ; Every slot index must address a real slot - otherwise the redo below would
     ; write REC_SIZE bytes at an arbitrary file offset, growing the .dat past
     ; its region.
@@ -339,6 +377,23 @@ wal_recover:
     lea  rcx, [rel s_nl]
     call puts
     lea  rcx, [rel s_walcrc_hint]
+    call puts
+    mov  ecx, 1
+    call os_exit
+
+.foreign:
+    ; A committed log that belongs to a different database, or an unnamed one
+    ; sitting next to a database this process just created. Replaying it would
+    ; import someone else's rows AND their row count; deleting it would destroy
+    ; an acknowledged commit that may still be the only copy. So neither: stop
+    ; and let the operator decide which file is the wrong one.
+    lea  rcx, [rel s_err_walown]
+    call puts
+    lea  rcx, [rel g_walname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_walown_hint]
     call puts
     mov  ecx, 1
     call os_exit
@@ -474,7 +529,7 @@ txn_flush:
     ; ---- stage the changed slots ----
     xor  r12, r12                    ; source undo index
     xor  r13, r13                    ; staged count
-    lea  rdi, [rbx+WAL_HDR_V3]
+    lea  rdi, [rbx+WAL_HDR_V4]
 .stage:
     cmp  r12, [rel g_undo_n]
     jae  .staged
@@ -518,7 +573,7 @@ txn_flush:
     jmp  .finish
 .havechanges:
     ; ---- frame header ----
-    mov  rax, [rel wal_magic3]
+    mov  rax, [rel wal_magic4]
     mov  [rbx], rax                  ; +0  magic
     mov  [rbx+8], r13                ; +8  N (staged, not captured)
     mov  rax, [rel g_count]
@@ -533,6 +588,10 @@ txn_flush:
     mov  rax, CDC_FLAG_RESET
 .noreset:
     mov  [rbx+32], rax               ; +32 flags
+    mov  rax, [rel g_lineage_lo]
+    mov  [rbx+WAL_LINEAGE], rax      ; +40 which database this log belongs to
+    mov  rax, [rel g_lineage_hi]
+    mov  [rbx+WAL_LINEAGE+8], rax
     ; ---- write and flush the frame ----
     mov  rsi, rdi                    ; marker slot
     sub  rdi, rbx                    ; marker offset = data length
@@ -555,7 +614,7 @@ txn_flush:
     call wal_write
     call wal_flush                   ; committed
     ; ---- publish to the change log BEFORE touching the data file ----
-    lea  rcx, [rbx+WAL_HDR_V3]
+    lea  rcx, [rbx+WAL_HDR_V4]
     mov  rdx, r13
     mov  r8, [rbp-64]
     xor  r9, r9
@@ -572,7 +631,7 @@ txn_flush:
     mov  rax, r12
     imul rax, rax, WAL_ENT_V3
     add  rax, rbx
-    add  rax, WAL_HDR_V3             ; staged entry i
+    add  rax, WAL_HDR_V4             ; staged entry i
     mov  rdi, [rax]                  ; slot index
     lea  rdx, [rax+WAL_ENT_IMAGE]    ; image
     mov  rcx, rdi

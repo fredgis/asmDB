@@ -8,8 +8,13 @@ Usage:
                              [--legacy | --badcrc]
 
     (default)   emit a current 'ASMWAL02' frame with a valid CRC32
-    --legacy    emit an old 'ASMWAL01' frame with no checksum, to prove such a
-                frame written by an older binary is still replayed on upgrade
+    --unnamed   emit an 'ASMWAL02' frame, which carries no database identity
+                and must therefore be refused rather than replayed
+    --foreign   emit a v04 frame naming a DIFFERENT database, which must be
+                refused with the log left intact
+    --badslot   emit a committed v04 frame whose slot index is outside the
+                table, which must be refused and kept, never applied
+    --legacy    emit an old 'ASMWAL01' frame with no checksum and no identity
     --badcrc    emit an 'ASMWAL02' frame whose payload was corrupted after the
                 checksum was computed, to prove corruption is detected
 
@@ -37,6 +42,10 @@ REC_CREATED, REC_UPDATED, REC_VALUE = 16, 24, 32
 REC_TAG, REC_CONTENT = 40, 80
 TAG_MAX, CONTENT_MAX = 40, 176
 ST_OCCUPIED = 1
+HDR_SIZE = 512
+HDR_LINEAGE = 112
+HDR_SIZE = 512
+HDR_LINEAGE = 112
 
 
 def slot_index(key: int) -> int:
@@ -72,13 +81,43 @@ def main() -> None:
     content = args[4] if len(args) > 4 else 'recovered from the write-ahead log'
     count = int(args[5]) if len(args) > 5 else 1
 
+    unnamed = '--unnamed' in flags or legacy
+
     idx = slot_index(rid)
     buf = bytearray()
-    buf += b'ASMWAL01' if legacy else b'ASMWAL02'
-    buf += struct.pack('<Q', 1)         # N entries
-    buf += struct.pack('<Q', count)     # live-row count for the header
-    buf += struct.pack('<Q', idx)       # entry: slot index
-    buf += record(rid, value, tag, content)
+    if unnamed:
+        buf += b'ASMWAL01' if legacy else b'ASMWAL02'
+        buf += struct.pack('<Q', 1)         # N entries
+        buf += struct.pack('<Q', count)     # live-row count for the header
+        buf += struct.pack('<Q', idx)       # entry: slot index
+        buf += record(rid, value, tag, content)
+    else:
+        # v04 names the database the log belongs to, so the engine can refuse to
+        # replay someone else's. The lineage lives at offset 112 of the .dat
+        # header; take it from the database sitting next to the log, unless the
+        # caller asked for a deliberately foreign one.
+        if '--foreign' in flags:
+            lineage = bytes(range(1, 17))
+        else:
+            lineage = b'\x00' * 16
+            dat = out[:-4] + '.dat' if out.endswith('.wal') else out + '.dat'
+            try:
+                with open(dat, 'rb') as f:
+                    lineage = f.read(HDR_SIZE)[HDR_LINEAGE:HDR_LINEAGE + 16]
+            except OSError:
+                pass
+        buf += b'ASMWAL04'
+        buf += struct.pack('<Q', 1)         # N entries
+        buf += struct.pack('<Q', count)     # live-row count for the header
+        buf += struct.pack('<Q', 1)         # commit_seq
+        buf += struct.pack('<Q', 0)         # flags
+        buf += lineage                      # +40 database lineage
+        if '--badslot' in flags:
+            idx = 1 << 55                   # far outside the table
+        buf += struct.pack('<Q', idx)       # entry: slot index
+        buf += struct.pack('<Q', 0)         # previous id
+        buf += struct.pack('<Q', 0)         # previous status
+        buf += record(rid, value, tag, content)
 
     marker_at = len(buf)
     buf += b'COMMIT01'
@@ -90,7 +129,9 @@ def main() -> None:
 
     with open(out, 'wb') as f:
         f.write(buf)
-    kind = 'legacy v01' if legacy else ('v02 BAD crc' if badcrc else 'v02')
+    kind = ('legacy v01' if legacy else 'v02' if unnamed else 'v04')
+    if badcrc:
+        kind += ' BAD crc'
     print(f'wrote {out}: {kind} id={rid} value={value} tag={tag} slot={idx} '
           f'count={count} bytes={len(buf)}')
 

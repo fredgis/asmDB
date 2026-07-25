@@ -89,7 +89,7 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **~33 KB PE64** whose only dependency is
+- The result is a single self-contained **~40 KB PE64** whose only dependency is
   `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the exe —
   it is obtained from `VirtualAlloc` at startup.
 
@@ -247,8 +247,8 @@ lives at byte offset `i << REC_SHIFT` (`REC_SHIFT = 8`).
 | 16     | 8    | `created` | `i64`      | creation time, unix epoch ms (auto) |
 | 24     | 8    | `updated` | `i64`      | last-update time, unix epoch ms (auto) |
 | 32     | 8    | `value`   | `i64`      | numeric payload / score |
-| 40     | 40   | `tag`     | `char[40]` | category / namespace, NUL-padded |
-| 80     | 176  | `content` | `char[176]`| free text, NUL-padded |
+| 40     | 40   | `tag`     | `char[40]` | category / namespace — 39 usable + NUL |
+| 80     | 176  | `content` | `char[176]`| free text — 175 usable + NUL |
 
 - The `tag` field stores at most **39** bytes plus a guaranteed NUL; `content`
   at most **175** bytes plus a guaranteed NUL. The parser caps input at
@@ -790,8 +790,8 @@ MCP server) chooses the interpretation. The `TYPES` command prints:
 | `bool` | 8 | `0` = false / `1` = true | `value` |
 | `f64` | 64 | IEEE-754 double (raw bits) | `value` |
 | `timestamp` | 64 | unix epoch ms | `created`, `updated` |
-| `char[40]` | 320 | fixed ASCII text, ≤ 40 B | `tag` |
-| `char[176]` | 1408 | fixed ASCII text, ≤ 176 B | `content` |
+| `char[40]` | 320 | text, ≤ 39 B + NUL | `tag` |
+| `char[176]` | 1408 | text, ≤ 175 B + NUL | `content` |
 
 A row therefore carries one 64-bit numeric `value` cell (into which narrow ints,
 `bool`, `f64` and timestamps all fit as raw bits), two automatic timestamps, a

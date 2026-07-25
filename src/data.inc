@@ -33,6 +33,8 @@ g_cdc_lastseq: dq 0                  ; highest commit_seq present in .cdc
 g_seq:         dq 0                  ; last_commit_seq published (header +88)
 g_reset_pend:  dq 0                  ; header +96
 g_reset_seq:   dq 0                  ; header +104
+g_bulk_kind:   dq 0                  ; whole-table operation in flight
+g_bulk_src:    times 224 db 0        ; its source file, for RESTORE
 g_txn_reset:   dq 0                  ; this transaction replaced the whole table
 g_lineage_lo:  dq 0                  ; identity shared by <db>.dat and <db>.cdc
 g_lineage_hi:  dq 0
@@ -71,6 +73,7 @@ g_datname:     times 224 db 0
 g_walname:     times 224 db 0
 g_bakname:     times 224 db 0
 g_tmpname:     times 240 db 0        ; <backup>.part, renamed into place on success
+g_chunkmap:    times 1024 db 0        ; which region chunks held data before a rewrite
 g_idbuf:       times 16 db 0
 g_idbuf2:      times 16 db 0
 g_tablename:   times 64 db 0
@@ -121,6 +124,7 @@ s_dotwal:      db '.wal', 0
                 align 8
 wal_magic:     db 'ASMWAL01'         ; legacy frame (no checksum) - still replayed
 wal_magic2:    db 'ASMWAL02'         ; adds the commit marker checksum
+wal_magic4:    db 'ASMWAL04'         ; adds the database lineage
 wal_magic3:    db 'ASMWAL03'         ; adds commit_seq + flags for change capture
 wal_commit:    db 'COMMIT01'
 cdc_magic:     db 'ASMCDC01'
@@ -137,6 +141,7 @@ s_ok_trunc:    db '[ OK ] table truncated - ', 0
 s_trunc_post:  db ' row(s) removed', 13, 10, 0
 s_err_dup:     db '[ERR] key already exists', 13, 10, 0
 s_err_nf:      db '[ERR] key not found', 13, 10, 0
+s_err_field:   db '[ERR] tag exceeds 39 bytes or content exceeds 175 bytes - nothing stored', 13, 10, 0
 s_err_full:    db '[ERR] table full', 13, 10, 0
 s_err_syntax:  db '[ERR] syntax error - type HELP', 13, 10, 0
 s_err_open:    db '[ERR] cannot open database file', 13, 10, 0
@@ -172,6 +177,11 @@ s_err_bak_rename: db '[ERR] backup written but could not be moved into place', 1
 s_upg_nospace: db '[ERR] upgrade: no free slot for a source row - migration refused', 13, 10, 0
 s_upg_lost:   db '[ERR] upgrade: migrated row count does not match the source: ', 0
 s_err_readonly: db '[ERR] read-only session (--reader) - this command would modify the database', 13, 10, 0
+s_bulk_resume: db '[ OK ] finishing a whole-table operation interrupted by a crash', 13, 10, 0
+s_bulk_done:  db '[ OK ] table operation completed', 13, 10, 0
+s_err_bulk_src: db '[ERR] cannot finish the interrupted RESTORE - snapshot unusable: ', 0
+s_err_walown: db '[ERR] this write-ahead log belongs to a different database - refusing to open ', 0
+s_walown_hint: db '      Move or delete the log if it is stale; restore the matching database if it is not.', 13, 10, 0
 s_err_ro_open: db '[ERR] cannot open the database for reading', 13, 10, 0
 s_err_ro_nofile: db '[ERR] no such database - a reader never creates one', 13, 10, 0
 s_snap_moved: db '[ERR] the database changed while this result was being written - it mixes two states, run it again', 13, 10, 0

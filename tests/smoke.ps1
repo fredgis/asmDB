@@ -182,25 +182,20 @@ try {
         $r9c = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe wr
         Check 'corrupt WAL discarded'    (($r9c -join "`n") -match '\[ OK \] 2 row\(s\)')
 
-        # recovery onto a database whose .dat does not exist yet must load the
-        # replayed rows into memory, not just onto disk
+        # a committed WAL for a database that does not exist yet cannot be
+        # attributed to anything, so it must be refused and kept - replaying it
+        # is how a stray log used to import a foreign row set into a fresh file
         & python $mkwal (Join-Path $work 'nw.wal') 42 4242 wal 'recovered-into-memory' 1 | Out-Null
-        $r9d = (@('COUNT', 'SELECT 42', 'EXIT') -join "`n") | .\asmdb.exe nw
-        $r9d = $r9d -join "`n"
-        Check 'WAL replay into a new .dat: count'  ($r9d -match '\[ OK \] 1 row\(s\)')
-        Check 'WAL replay into a new .dat: in RAM' ($r9d -match 'content\s+:\s+recovered-into-memory')
+        $r9d = ((@('COUNT', 'SELECT 42', 'EXIT') -join "`n") | .\asmdb.exe nw 2>&1) -join "`n"
+        Check 'orphan WAL into a new .dat refused' ($r9d -match 'belongs to a different database')
+        Check 'orphan WAL is kept'                 (Test-Path (Join-Path $work 'nw.wal'))
 
         # a WAL entry addressing a slot outside the table carries a valid marker
         # and checksum, so it IS an acknowledged commit - it must be refused and
-        # KEPT, never silently thrown away
-        $bad = [Collections.Generic.List[byte]]::new()
-        $bad.AddRange([Text.Encoding]::ASCII.GetBytes('ASMWAL01'))
-        $bad.AddRange([BitConverter]::GetBytes([uint64]1))          # N = 1
-        $bad.AddRange([BitConverter]::GetBytes([uint64]1))          # count = 1
-        $bad.AddRange([BitConverter]::GetBytes([uint64]1 -shl 55))  # slot index, way out of range
-        $bad.AddRange((New-Object byte[] 256))                      # after-image
-        $bad.AddRange([Text.Encoding]::ASCII.GetBytes('COMMIT01'))
-        [IO.File]::WriteAllBytes((Join-Path $work 'ft.wal'), $bad.ToArray())
+        # KEPT, never silently thrown away. It names the database it sits next
+        # to, so the refusal is unambiguously about the slot index.
+        (@('INSERT 1 10 base original row', 'EXIT') -join "`n") | .\asmdb.exe ft | Out-Null
+        & python $mkwal (Join-Path $work 'ft.wal') 7 777 bad 'out of range' 1 --badslot | Out-Null
         $ftSize = (Get-Item (Join-Path $work 'ft.wal')).Length
         $r9e = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe ft 2>&1
         $code9e = $LASTEXITCODE
@@ -214,7 +209,14 @@ try {
         & python $mkwal (Join-Path $work 'cv.wal') 7 777 crc 'checksummed frame' 2 | Out-Null
         $r10 = (@('COUNT', 'SELECT 7', 'EXIT') -join "`n") | .\asmdb.exe cv
         $r10 = $r10 -join "`n"
-        Check 'v02 frame replays'        ($r10 -match 'content\s+:\s+checksummed frame')
+        Check 'v04 frame replays'        ($r10 -match 'content\s+:\s+checksummed frame')
+        # 10a2 a frame naming a DIFFERENT database must be refused, not replayed,
+        #      and the log kept so the operator can see what happened
+        (@('INSERT 1 10 base original row', 'EXIT') -join "`n") | .\asmdb.exe fw | Out-Null
+        & python $mkwal (Join-Path $work 'fw.wal') 7 777 crc 'foreign frame' 5 --foreign | Out-Null
+        $r10f = ((@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe fw 2>&1) -join "`n"
+        Check 'foreign WAL refused'      ($r10f -match 'belongs to a different database')
+        Check 'foreign WAL kept'         (Test-Path (Join-Path $work 'fw.wal'))
         # 10b a byte flipped inside a committed frame is detected, and the WAL is
         #     kept (not silently erased) so the operator can still act on it
         (@('INSERT 1 10 base original row', 'EXIT') -join "`n") | .\asmdb.exe cb | Out-Null
@@ -228,12 +230,18 @@ try {
         Remove-Item (Join-Path $work 'cb.wal') -Force
         $r10c = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe cb
         Check 'db opens after removing the log' (($r10c -join "`n") -match '\[ OK \] 1 row\(s\)')
-        # 10d a legacy (pre-checksum) frame still replays, so upgrading a binary
-        #     never drops an already-acknowledged transaction
+        # 10d a frame that does not name its database at all (v01/v02, written
+        #     before 1.4) cannot be told apart from one that wandered in from
+        #     another database, so it is refused and kept rather than replayed
         (@('INSERT 1 10 base original row', 'EXIT') -join "`n") | .\asmdb.exe lg | Out-Null
         & python $mkwal (Join-Path $work 'lg.wal') 9 999 old 'legacy frame' 2 --legacy | Out-Null
-        $r10d = (@('SELECT 9', 'EXIT') -join "`n") | .\asmdb.exe lg
-        Check 'legacy v01 frame still replays' (($r10d -join "`n") -match 'content\s+:\s+legacy frame')
+        $r10d = ((@('SELECT 9', 'EXIT') -join "`n") | .\asmdb.exe lg 2>&1) -join "`n"
+        Check 'unnamed v01 frame refused' ($r10d -match 'belongs to a different database')
+        Check 'unnamed v01 frame kept'    (Test-Path (Join-Path $work 'lg.wal'))
+        (@('INSERT 1 10 base original row', 'EXIT') -join "`n") | .\asmdb.exe lg2 | Out-Null
+        & python $mkwal (Join-Path $work 'lg2.wal') 9 999 old 'unnamed frame' 2 --unnamed | Out-Null
+        $r10e = ((@('SELECT 9', 'EXIT') -join "`n") | .\asmdb.exe lg2 2>&1) -join "`n"
+        Check 'unnamed v02 frame refused' ($r10e -match 'belongs to a different database')
 
         # Run 11: fault injection - a failing durable write (ENOSPC-style) must
         # abort cleanly instead of acknowledging, and the committed WAL it leaves
@@ -601,6 +609,32 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
     $rt = $rt -join "`n"
     Check 'torn change-log header refused' ($rt -match 'change log header is damaged')
     Check 'torn change-log header kept'    ((Get-Item $tp).Length -eq 30)
+
+    # ---------------------------------------------------------------------
+    # Run 17b: a whole-table operation is crash-atomic. TRUNCATE clears four
+    # million slots one write at a time, so a crash used to leave some rows
+    # deleted, some not, and a row count matching neither. The operation is now
+    # announced in the header before it starts and the next open finishes it.
+    # ---------------------------------------------------------------------
+    $nasmBin = @((Get-Command nasm -ErrorAction SilentlyContinue).Source,
+                 "$env:LOCALAPPDATA\bin\NASM\nasm.exe",
+                 "$env:ProgramFiles\NASM\nasm.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if ($py -and $nasmBin) {
+        foreach ($n in 2, 3, 4) {
+            Remove-Item (Join-Path $work 'ct.*') -Force -ErrorAction SilentlyContinue
+            & $nasmBin -f bin ("-dFAULT_INJECT={0}" -f $n) -o (Join-Path $work 'asmdb_f.exe') -I (Join-Path $root 'src') (Join-Path $root 'src\main.asm') 2>&1 | Out-Null
+            (@('INSERT 1 1 a one', 'INSERT 2 2 b two', 'INSERT 3 3 c three', 'EXIT') -join "`n") | .\asmdb.exe ct | Out-Null
+            (@('TRUNCATE', 'EXIT') -join "`n") | .\asmdb_f.exe ct 2>&1 | Out-Null
+            $rc = ((@('COUNT', 'VERIFY', 'EXIT') -join "`n") | .\asmdb.exe ct 2>&1) -join "`n"
+            Check "TRUNCATE crash at write #$n is finished on reopen" `
+                ($rc -match 'finishing a whole-table operation' -and
+                 $rc -match '\[ OK \] 0 row\(s\)' -and
+                 $rc -match 'no problem found')
+        }
+        Remove-Item (Join-Path $work 'asmdb_f.exe') -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "  [SKIP] whole-table crash checks (nasm not found)" -ForegroundColor Yellow
+    }
 
     # ---------------------------------------------------------------------
     # Run 18: one writer, many readers
