@@ -757,10 +757,21 @@ The theme is "never lie about durability, never corrupt on crash."
 | Item | What it adds | CRUD path helped |
 |------|--------------|------------------|
 | ~~**CRC32 on WAL frames**~~ | ✅ **done** — table-driven CRC-32 written and flushed with the commit marker; a damaged committed frame is refused instead of replayed (§6.2, §7.3) | durable C/U/D |
+| **Lazy (copy-on-write) `.dat` mapping** ⭐ | **the measured next bottleneck.** `db_open` currently commits and reads the whole 1 GiB slot region, so **opening a database costs ~600 ms whatever it contains** — 0 rows, 1 000 rows and 1 000 000 rows all measure the same. Mapping the file copy-on-write (`FILE_MAP_COPY` / `MAP_PRIVATE`) instead makes open O(1) and residency proportional to the pages actually touched. A *private* mapping is the point: uncommitted changes stay out of the file, so the WAL durability model of §7 is unchanged | every command, especially short-lived CLI/MCP invocations |
 | **Incremental checkpoint** | a dirty-slot bitmap so `COMMIT` flushes only touched pages, not the whole 1 GiB region — the fix for the bulk-durable benchmark | durable bulk write |
 | **Group commit** | coalesce concurrent `COMMIT`s into one `fsync` | high-rate durable writes |
 | **Dynamic resize / rehash** | grow the table past load factor 0.75 instead of erroring; power-of-two doubling + incremental re-probe | all CRUD at scale |
 | ~~**Short-write / error propagation**~~ | ✅ **done** — every read/write/flush return is checked; a failed durable write aborts instead of acknowledging (§7.5) | all persistence |
+
+> **Measured, and one idea already rejected on the numbers.** A dense
+> one-byte-per-slot status mirror (so scans stream 4 MiB instead of touching
+> 1 GiB of strided records) was prototyped and **reverted**: with the eager load
+> in place a full `SELECT *` is already lost in the noise of the ~600 ms open,
+> and the mirror's rebuild pass made every open ~100 ms *slower*. It becomes
+> worthwhile only **after** the lazy mapping lands — at which point scanning
+> records would fault in the whole file, and a dense mirror is exactly what
+> keeps a scan from doing that. Order matters: mapping first, then the mirror,
+> then SIMD kernels on top of it.
 
 ### v1.5 — Make reads fast at scale (indexing & scans)
 
@@ -770,7 +781,8 @@ The theme is "stop doing O(capacity) scans."
 |------|--------------|------------------|
 | **Secondary hash index on `tag`** | O(1) "all rows with tag = X" instead of a full scan in `FIND` | filtered Read |
 | **Bitmap index on `kind`** | one bit per slot per kind; AND/OR predicates by streaming bitmaps | multi-predicate Read |
-| **AVX2 / AVX-512 scan kernels** | vectorised `SELECT *`/`FIND`/`COUNT`: compare 8–16 status bytes or `value` cells per instruction | analytical Read |
+| **Dense status mirror** | one byte per slot in a contiguous array so a scan streams 4 MiB instead of touching 1 GiB of strided records. **Depends on the lazy mapping** (v1.0) — see the note there for why it does not pay off before | every full scan |
+| **AVX2 / AVX-512 scan kernels** | vectorised `SELECT *`/`FIND`/`COUNT`: compare 32–64 slots per instruction over the dense mirror above, with a CPUID gate and a scalar fallback | analytical Read |
 | **Range queries on `value`/`created`** | `SELECT WHERE value > n`, `created BETWEEN a AND b` over a sorted side-index | temporal recall |
 | **Prefix / fuzzy `FIND`** | substring search accelerated with a SIMD `memchr`-style first-byte filter | search |
 

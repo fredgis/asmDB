@@ -612,21 +612,39 @@ and recovery protocol, the MCP integration, and the full roadmap — see
 Two documents, deliberately kept in separate lanes:
 
 - **[`docs/ENGINE.md`](docs/ENGINE.md) — the engine roadmap.** Everything here
-  stays **100% x86-64 assembly**: hardening (incremental checkpoint, group
-  commit, dynamic resize), fast reads (secondary/bitmap indexes, AVX2/512
-  scans, range queries), columnar storage + compression, then concurrency,
-  partitioning, and an in-asm binary wire protocol. The **Linux ELF64 port** and
-  **CRC-32-checksummed WAL frames** are already shipped. See
-  [§12 Roadmap](docs/ENGINE.md#12-roadmap).
+  stays **100% x86-64 assembly**. See [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 - **[`docs/SAAS.md`](docs/SAAS.md) — the productization plan.** How the assembly
   engine becomes **asmdb Cloud**: a hosted, pay-as-you-go database service where
   every database instance runs in its **own isolated micro-container** with a
-  dedicated `asmdb.exe`. Covers provisioning & lifecycle, per-instance isolation,
-  the HTTP/gRPC + remote-MCP access layer, consumption metering & billing,
-  durability/backups, HA, security/compliance, deployment, pricing, and a phased
-  GTM. The engine is the data plane and stays assembly; **this control/service
-  layer may use any language** (Rust/Go), by design. (Hosted agent memory is one
-  example workload on top.)
+  dedicated `asmdb` process. Covers provisioning & lifecycle, per-instance
+  isolation, the HTTP/gRPC + remote-MCP access layer, consumption metering &
+  billing, durability/backups, HA, security/compliance, deployment, pricing, and
+  a phased GTM. The engine is the data plane and stays assembly; **this
+  control/service layer may use any language** (Rust/Go), by design. (Hosted
+  agent memory is one example workload on top.)
+
+### Where the engine stands today
+
+| Area | Status |
+|---|---|
+| **CRUD + transactions** | ✅ `INSERT`/`SELECT`/`UPDATE`/`DELETE`/`TRUNCATE`/`COUNT`, `BEGIN`/`COMMIT`/`ROLLBACK`, `FIND`, `RANGE` |
+| **Durability** | ✅ WAL with two-phase flush, **CRC-32 per frame**, idempotent crash recovery |
+| **Safety** | ✅ every read/write/flush checked; a failed durable write aborts instead of acknowledging; a corrupt or foreign `.dat` is refused, never silently recreated |
+| **Portability** | ✅ Windows PE64 + Linux ELF64 from one source, behind a thin `os_*` layer |
+| **Integration** | ✅ MCP server (generic CRUD tools) + Python / C# / C stdio clients |
+| **Tests** | ✅ 61 checks per platform in CI, incl. fault-injected I/O failures |
+| **Next up** | 🔜 **lazy `.dat` mapping** (see below), then incremental checkpoint, secondary indexes, SIMD scans |
+
+**The next bottleneck is measured, not guessed.** Opening a database costs
+**~600 ms regardless of its size** — 0 rows, 1 000 rows and 1 000 000 rows all
+measure the same, because `db_open` commits and reads the *entire* 1 GiB slot
+region up front even though the file is sparse and mostly holes. That fixed cost
+dwarfs every query: a full `SELECT *` scan on top of it is barely measurable.
+So the next engine milestone is to **map the `.dat` copy-on-write instead of
+allocating and reading it eagerly**, which makes open O(1) and memory
+proportional to the data actually touched — with the durability model unchanged,
+because a private mapping keeps uncommitted changes out of the file. Details in
+[§12 Roadmap](docs/ENGINE.md#12-roadmap).
 
 ## Project layout
 
