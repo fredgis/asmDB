@@ -1,6 +1,7 @@
 param(
     [string]$Tag = 'latest',
     [switch]$SkipBuild,
+    [switch]$SkipApim,
     [switch]$WhatIf
 )
 
@@ -40,6 +41,86 @@ function Get-OutputValue($Outputs, [string]$Name) {
     return $Outputs.$Name.value
 }
 
+function Test-ExistingEnvironmentCanMovePrivate {
+    try {
+        $env = Invoke-AzJson @('containerapp', 'env', 'show', '--name', 'asmdb-env', '--resource-group', $ResourceGroup)
+    }
+    catch {
+        return
+    }
+    if (-not $env) { return }
+
+    $infraSubnetId = $null
+    if ($env.properties -and $env.properties.vnetConfiguration) {
+        $infraSubnetId = $env.properties.vnetConfiguration.infrastructureSubnetId
+    }
+
+    if ([string]::IsNullOrWhiteSpace($infraSubnetId)) {
+        $message = @"
+Container Apps environment 'asmdb-env' already exists without VNet integration.
+Azure cannot add vnetConfiguration/internal ingress to an existing non-VNet Container Apps environment in place.
+Delete the apps in that environment first (asmdb-cp and any db-* instance apps), then delete 'asmdb-env', and rerun this script.
+"@
+        if ($WhatIf) {
+            Write-Warning $message
+        }
+        else {
+            throw $message
+        }
+    }
+}
+
+function Get-DeploymentErrorSummary {
+    $operations = Invoke-AzJson @(
+        'deployment', 'operation', 'group', 'list',
+        '--resource-group', $ResourceGroup,
+        '--name', $DeploymentName,
+        '--query', "[?properties.provisioningState=='Failed'].{resource:properties.targetResource.resourceName,status:properties.statusMessage}",
+        '--output', 'json'
+    )
+    if ($operations) { return ($operations | ConvertTo-Json -Depth 20) }
+    return 'No failed deployment operation details were returned by Azure.'
+}
+
+function Invoke-GroupDeployment([string]$Description, [string]$ControlPlaneImage) {
+    $parameters = @("tag=$Tag", "location=$Location", "deployApim=$(-not $SkipApim)")
+    if (-not [string]::IsNullOrWhiteSpace($ControlPlaneImage)) {
+        $parameters += "controlPlaneImage=$ControlPlaneImage"
+    }
+
+    Write-Host ''
+    Write-Host $Description
+    if (-not $SkipApim) {
+        Write-Host 'APIM Developer SKU creation commonly takes 30-45 minutes. Waiting with a 90-minute budget and printing progress...'
+    }
+
+    $deploymentArgs = @(
+        'deployment', 'group', 'create',
+        '--resource-group', $ResourceGroup,
+        '--name', $DeploymentName,
+        '--template-file', $TemplateFile,
+        '--parameters'
+    ) + $parameters + @('--no-wait')
+    Invoke-Az $deploymentArgs
+
+    $deadline = (Get-Date).AddMinutes(90)
+    $started = Get-Date
+    do {
+        Start-Sleep -Seconds 30
+        $deployment = Invoke-AzJson @('deployment', 'group', 'show', '--resource-group', $ResourceGroup, '--name', $DeploymentName)
+        $state = $deployment.properties.provisioningState
+        $elapsed = [int]((Get-Date) - $started).TotalMinutes
+        Write-Host ("Deployment state: {0} (elapsed {1} min)" -f $state, $elapsed)
+
+        if ($state -eq 'Succeeded') { return $deployment }
+        if ($state -in @('Failed', 'Canceled')) {
+            throw "Deployment '$DeploymentName' $state. $((Get-DeploymentErrorSummary))"
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    throw "Deployment '$DeploymentName' did not complete within 90 minutes."
+}
+
 Require-AzCli
 
 $account = Invoke-AzJson @('account', 'show')
@@ -59,28 +140,25 @@ $group = Invoke-AzJson @('group', 'show', '--name', $ResourceGroup)
 if (-not $group) { throw "Resource group '$ResourceGroup' does not exist. It must be created before running this script." }
 if ($group.location -ne $Location) { throw "Resource group '$ResourceGroup' is in '$($group.location)', expected '$Location'." }
 
+Test-ExistingEnvironmentCanMovePrivate
+
 if ($WhatIf) {
-    Invoke-Az @(
+    $whatIfParameters = @("tag=$Tag", "location=$Location", "deployApim=$(-not $SkipApim)")
+    $whatIfArgs = @(
         'deployment', 'group', 'what-if',
         '--resource-group', $ResourceGroup,
         '--name', $DeploymentName,
         '--template-file', $TemplateFile,
-        '--parameters', "tag=$Tag", "location=$Location"
-    )
+        '--parameters'
+    ) + $whatIfParameters
+    Invoke-Az $whatIfArgs
     return
 }
 
-$deployment = Invoke-AzJson @(
-    'deployment', 'group', 'create',
-    '--resource-group', $ResourceGroup,
-    '--name', $DeploymentName,
-    '--template-file', $TemplateFile,
-    '--parameters', "tag=$Tag", "location=$Location"
-)
+$deployment = Invoke-GroupDeployment 'Deploying infrastructure with placeholder control-plane image...' $null
 $outputs = $deployment.properties.outputs
 $registryName = Get-OutputValue $outputs 'registryName'
 $registryLoginServer = Get-OutputValue $outputs 'registryLoginServer'
-$controlPlaneFqdn = Get-OutputValue $outputs 'controlPlaneFqdn'
 $controlPlaneImage = "$registryLoginServer/asmdb-controlplane:$Tag"
 
 if (-not $SkipBuild) {
@@ -97,11 +175,19 @@ if (-not $SkipBuild) {
     }
 }
 
+$deployment = Invoke-GroupDeployment 'Deploying real control-plane image...' $controlPlaneImage
+$outputs = $deployment.properties.outputs
+$controlPlaneFqdn = Get-OutputValue $outputs 'controlPlaneFqdn'
+$controlPlaneInternalFqdn = Get-OutputValue $outputs 'controlPlaneInternalFqdn'
+$apimGatewayUrl = Get-OutputValue $outputs 'apimGatewayUrl'
+$instanceStorageName = Get-OutputValue $outputs 'instanceStorageName'
+$instancePublicBase = Get-OutputValue $outputs 'instancePublicBase'
+
 Invoke-Az @(
     'containerapp', 'update',
     '--name', 'asmdb-cp',
     '--resource-group', $ResourceGroup,
-    '--image', $controlPlaneImage
+    '--set-env-vars', "ASMDB_PUBLIC_BASE=$instancePublicBase", "ASMDB_ENV_STORAGE=$instanceStorageName"
 )
 
 $deadline = (Get-Date).AddMinutes(10)
@@ -117,11 +203,21 @@ if ($app.properties.latestReadyRevisionName -ne $app.properties.latestRevisionNa
     throw "Container App revision did not become healthy within 10 minutes. Latest='$($app.properties.latestRevisionName)', ready='$($app.properties.latestReadyRevisionName)', state='$($app.properties.provisioningState)'."
 }
 
-$url = "https://$controlPlaneFqdn"
+$url = $apimGatewayUrl
 Write-Host ''
 Write-Host 'asmdb Cloud deployment ready'
-Write-Host "Control plane URL: $url"
+if ($SkipApim) {
+    Write-Host 'APIM was skipped; no public site URL was deployed.'
+}
+else {
+    Write-Host "Site URL:          $url"
+}
+Write-Host "Control plane:     https://$controlPlaneInternalFqdn (private)"
+Write-Host "Instance base URL: $instancePublicBase"
+Write-Host "Instance storage:  $instanceStorageName"
 Write-Host "Registry:          $registryName ($registryLoginServer)"
 Write-Host ''
 Write-Host 'Create a database:'
-Write-Host "curl -X POST '$url/api/v1/databases' -H 'Content-Type: application/json' -d '{`"name`":`"my-notes`",`"tier`":`"free`"}'"
+if (-not $SkipApim) {
+    Write-Host "curl -X POST '$url/api/v1/databases' -H 'Content-Type: application/json' -d '{`"name`":`"my-notes`",`"tier`":`"free`"}'"
+}
