@@ -31,6 +31,24 @@ func TestGenerateAccessTokenShape(t *testing.T) {
 	}
 }
 
+func TestDerivePlatformToken(t *testing.T) {
+	const secret = "master-secret"
+	id := "db_abcdefghijklmnopqrstuvwx"
+	got := derivePlatformToken(secret, id)
+	if got == "" {
+		t.Fatal("empty platform token")
+	}
+	if again := derivePlatformToken(secret, id); again != got {
+		t.Fatalf("token not stable: %q then %q", got, again)
+	}
+	if other := derivePlatformToken(secret, "db_bcdefghijklmnopqrstuvwxy"); other == got {
+		t.Fatal("different instance ids derived the same platform token")
+	}
+	if got == secret {
+		t.Fatal("derived token must not equal master secret")
+	}
+}
+
 func TestTierSpecs(t *testing.T) {
 	tests := map[string]tierSpec{
 		"free":     {CPU: 0.25, Memory: "0.5Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 3},
@@ -41,6 +59,48 @@ func TestTierSpecs(t *testing.T) {
 		got := tierSpecs[tier]
 		if got != want {
 			t.Fatalf("%s spec = %+v, want %+v", tier, got, want)
+		}
+	}
+}
+
+func TestInstanceGetsPlatformToken(t *testing.T) {
+	p := &azureProvisioner{
+		location:       "swedencentral",
+		image:          "reg.azurecr.io/asmdb-instance:latest",
+		envStorage:     "asmdb-data",
+		platformSecret: "master-secret",
+	}
+	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", Tier: "free", ContainerAppName: "db-abcdefghijklmnopqrstuvwx"}
+	app, err := p.buildContainerApp(in, "customer-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := derivePlatformToken("master-secret", in.ID)
+	var got string
+	for _, env := range app.Properties.Template.Containers[0].Env {
+		if *env.Name == "ASMDB_PLATFORM_TOKEN" {
+			got = *env.Value
+		}
+	}
+	if got != want {
+		t.Fatalf("ASMDB_PLATFORM_TOKEN = %q, want derived token %q", got, want)
+	}
+}
+
+func TestInstanceOmitsPlatformTokenWithoutSecret(t *testing.T) {
+	p := &azureProvisioner{
+		location:   "swedencentral",
+		image:      "reg.azurecr.io/asmdb-instance:latest",
+		envStorage: "asmdb-data",
+	}
+	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", Tier: "free", ContainerAppName: "db-abcdefghijklmnopqrstuvwx"}
+	app, err := p.buildContainerApp(in, "customer-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, env := range app.Properties.Template.Containers[0].Env {
+		if *env.Name == "ASMDB_PLATFORM_TOKEN" {
+			t.Fatal("ASMDB_PLATFORM_TOKEN should be omitted without ASMDB_PLATFORM_SECRET")
 		}
 	}
 }
@@ -122,6 +182,42 @@ func TestNoTierEverAsksForASecondReplica(t *testing.T) {
 func TestProvisionerRefusesToStartWithoutStorage(t *testing.T) {
 	if _, err := newAzureProvisioner(context.Background(), config{}, nil); err == nil {
 		t.Fatal("expected a provisioner with no configuration to be refused")
+	}
+}
+
+func TestEndpointUsesPublicBase(t *testing.T) {
+	p := &azureProvisioner{
+		environmentDNS: "internal.example.test",
+		publicBase:     "https://asmdb-apim.azure-api.net/db",
+	}
+	in := instance{ID: "db_7k2m9x4qp1va8ne03wjr5tzy", ContainerAppName: "db-7k2m9x4qp1va8ne03wjr5tzy"}
+	want := "https://asmdb-apim.azure-api.net/db/7k2m9x4qp1va8ne03wjr5tzy"
+	if got := p.Endpoint(in); got != want {
+		t.Fatalf("Endpoint() = %q, want %q", got, want)
+	}
+}
+
+func TestEndpointTrimsPublicBaseTrailingSlash(t *testing.T) {
+	p := &azureProvisioner{
+		environmentDNS: "internal.example.test",
+		publicBase:     "https://asmdb-apim.azure-api.net/db/",
+	}
+	in := instance{ID: "db_7k2m9x4qp1va8ne03wjr5tzy", ContainerAppName: "db-7k2m9x4qp1va8ne03wjr5tzy"}
+	want := "https://asmdb-apim.azure-api.net/db/7k2m9x4qp1va8ne03wjr5tzy"
+	if got := p.Endpoint(in); got != want {
+		t.Fatalf("Endpoint() = %q, want %q", got, want)
+	}
+}
+
+func TestEndpointFallsBackToInternalAddress(t *testing.T) {
+	p := &azureProvisioner{environmentDNS: "niceforest.internal"}
+	in := instance{ID: "db_7k2m9x4qp1va8ne03wjr5tzy", ContainerAppName: "db-7k2m9x4qp1va8ne03wjr5tzy"}
+	want := "https://db-7k2m9x4qp1va8ne03wjr5tzy.niceforest.internal"
+	if got := p.Endpoint(in); got != want {
+		t.Fatalf("Endpoint() = %q, want %q", got, want)
+	}
+	if got := p.InternalEndpoint(in); got != want {
+		t.Fatalf("InternalEndpoint() = %q, want %q", got, want)
 	}
 }
 

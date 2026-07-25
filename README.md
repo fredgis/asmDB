@@ -28,6 +28,10 @@
 **asmdb** is a tiny, transactional database engine written from scratch in
 x86-64 assembly — and it is a *real* database, not a demo.
 
+<p align="center">
+  <img src="docs/assets/asmdb-repository-banner.png" alt="asmdb" width="100%">
+</p>
+
 |  | |
 |---|---|
 | 🔩 **Nothing underneath it** | NASM emits the executable **directly** (`nasm -f bin`). No linker, no C runtime, no libraries — the whole engine is one `.asm` tree |

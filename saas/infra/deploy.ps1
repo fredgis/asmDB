@@ -2,7 +2,15 @@ param(
     [string]$Tag = 'latest',
     [switch]$SkipBuild,
     [switch]$SkipApim,
-    [switch]$WhatIf
+    [switch]$WhatIf,
+
+    # Microsoft Entra ID objects backing the console sign-in. None of these are
+    # secrets — the browser flow is authorization-code with PKCE, so there is no
+    # client secret to carry. They are parameters rather than literals so the
+    # platform can be deployed into another directory without a code change.
+    [string]$EntraTenantId = '<tenant-id>',
+    [string]$EntraClientId = '<console-app-id>',
+    [string]$EntraGroupId  = '<admin-group-id>'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -183,11 +191,37 @@ $apimGatewayUrl = Get-OutputValue $outputs 'apimGatewayUrl'
 $instanceStorageName = Get-OutputValue $outputs 'instanceStorageName'
 $instancePublicBase = Get-OutputValue $outputs 'instancePublicBase'
 
+# The platform secret derives one introspection token per instance. It must
+# survive redeployment: regenerating it would invalidate every derived token and
+# silently break stats on every existing database. So it is generated once, on
+# the first deployment that finds it missing, and read back thereafter.
+$existing = Invoke-AzJson @('containerapp', 'show', '--name', 'asmdb-cp', '--resource-group', $ResourceGroup)
+$platformSecret = $null
+foreach ($e in @($existing.properties.template.containers[0].env)) {
+    if ($e -and $e.PSObject.Properties.Name -contains 'name' -and $e.name -eq 'ASMDB_PLATFORM_SECRET') {
+        if ($e.PSObject.Properties.Name -contains 'value') { $platformSecret = $e.value }
+    }
+}
+if (-not $platformSecret) {
+    $bytes = New-Object byte[] 32
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $platformSecret = [Convert]::ToBase64String($bytes)
+    Write-Host '>> generated a new platform secret (first deployment)'
+} else {
+    Write-Host '>> reusing the existing platform secret'
+}
+
 Invoke-Az @(
     'containerapp', 'update',
     '--name', 'asmdb-cp',
     '--resource-group', $ResourceGroup,
-    '--set-env-vars', "ASMDB_PUBLIC_BASE=$instancePublicBase", "ASMDB_ENV_STORAGE=$instanceStorageName"
+    '--set-env-vars',
+        "ASMDB_PUBLIC_BASE=$instancePublicBase",
+        "ASMDB_ENV_STORAGE=$instanceStorageName",
+        "ASMDB_ENTRA_TENANT_ID=$EntraTenantId",
+        "ASMDB_ENTRA_CLIENT_ID=$EntraClientId",
+        "ASMDB_ENTRA_GROUP_ID=$EntraGroupId",
+        "ASMDB_PLATFORM_SECRET=$platformSecret"
 )
 
 $deadline = (Get-Date).AddMinutes(10)

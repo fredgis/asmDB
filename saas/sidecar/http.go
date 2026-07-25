@@ -9,13 +9,20 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 var countRE = regexp.MustCompile(`\[\s*OK\s*\]\s*(\d+)`)
 
 type api struct {
-	engine *Engine
-	token  string
+	engine        *Engine
+	token         string
+	platformToken string
+	started       time.Time
+	statsMu       sync.Mutex
+	statsCached   *statsResponse
+	statsAt       time.Time
 }
 
 type rowInput struct {
@@ -49,6 +56,7 @@ type apiError struct {
 func (a *api) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", a.handleHealth)
+	mux.Handle("GET /v1/stats", a.introspectionAuth(http.HandlerFunc(a.handleStats)))
 	mux.Handle("GET /v1/rows", a.auth(http.HandlerFunc(a.handleList)))
 	mux.Handle("GET /v1/rows/{id}", a.auth(http.HandlerFunc(a.handleGet)))
 	mux.Handle("POST /v1/rows", a.auth(http.HandlerFunc(a.handleInsert)))
@@ -65,18 +73,36 @@ func (a *api) routes() http.Handler {
 
 func (a *api) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		const prefix = "Bearer "
-		auth := r.Header.Get("Authorization")
-		got := ""
-		if strings.HasPrefix(auth, prefix) {
-			got = strings.TrimPrefix(auth, prefix)
-		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) != 1 {
+		if !tokenEqual(bearerToken(r), a.token) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (a *api) introspectionAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := bearerToken(r)
+		if !tokenEqual(got, a.token) && !tokenEqual(got, a.platformToken) {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, prefix) {
+		return strings.TrimPrefix(auth, prefix)
+	}
+	return ""
+}
+
+func tokenEqual(got, want string) bool {
+	return want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -85,7 +111,16 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "engine_error", "engine is not healthy", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "engine": "1.5.0", "rows": count})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "engine": engineVersion, "rows": count})
+}
+
+func (a *api) handleStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := a.stats(r)
+	if err != nil {
+		writeMappedError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
 }
 
 func (a *api) handleList(w http.ResponseWriter, r *http.Request) {

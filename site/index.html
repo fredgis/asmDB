@@ -30,6 +30,7 @@
     <div class="nav__links">
       <a href="#engine">engine</a>
       <a href="#mcp">mcp</a>
+      <a href="#web">web</a>
       <a href="#tiers">tiers</a>
       <a href="https://github.com/fredgis/asmDB">source</a>
       <a class="nav__cta nav__keep" href="#create">create a database</a>
@@ -231,14 +232,14 @@
 {
   <span class="p">"mcpServers"</span>: {
     <span class="p">"asmdb"</span>: {
-      <span class="p">"url"</span>: <span class="s">"https://db-xxxx.swedencentral.azurecontainerapps.io/mcp"</span>,
+      <span class="p">"url"</span>: <span class="s">"https://&lt;gateway-host&gt;/db/7k2m9x4qp1va8ne03wjr5tzy/mcp"</span>,
       <span class="p">"headers"</span>: {
         <span class="p">"Authorization"</span>: <span class="s">"Bearer &lt;your token&gt;"</span>
       }
     }
   }
 }</pre>
-          <figcaption>The endpoint and token are returned when you create the database.</figcaption>
+          <figcaption>The endpoint is returned at creation; the token is shown once and should go straight into a secret manager.</figcaption>
         </figure>
 
         <figure style="margin-top: var(--space-lg)">
@@ -246,6 +247,113 @@
 <span class="k">npx</span> asmdb-mcp <span class="c">--db</span> ./memory</pre>
           <figcaption>The same tools, the same engine, over stdio.</figcaption>
         </figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================ web ================================= -->
+<section class="sec web" id="web">
+  <div class="shell">
+    <div class="sec__head">
+      <p class="sec__kicker">Web applications</p>
+      <h2 class="sec__title">The browser never gets the database token.</h2>
+      <p class="sec__sub">
+        The instance access token is a bearer token with full authority over that
+        database: read, write, delete and <code>TRUNCATE</code>. A web application
+        calls asmdb from its server. The browser talks to your backend, never to
+        the database directly, and the private database environment is not
+        reachable from the public internet.
+      </p>
+    </div>
+
+    <div class="web__path mono" aria-label="request path">
+      <span>browser</span>
+      <span aria-hidden="true">→</span>
+      <span>your backend</span>
+      <span aria-hidden="true">→</span>
+      <span>https://&lt;gateway-host&gt;/db/7k2m9x4qp1va8ne03wjr5tzy/v1/rows</span>
+      <span class="web__secret">Authorization: Bearer INSTANCE_TOKEN</span>
+    </div>
+
+    <div class="split">
+      <div>
+        <figure>
+          <pre class="code"><span class="c">// app/api/notes/route.ts — server-side only</span>
+<span class="k">const</span> endpoint = process.env.ASMDB_ENDPOINT!;
+<span class="c">// returned as https://&lt;gateway-host&gt;/db/7k2m9x4qp1va8ne03wjr5tzy</span>
+<span class="k">const</span> token = process.env.ASMDB_INSTANCE_TOKEN!;
+
+<span class="k">type</span> Row = { id: string; value: string; tag: string; content: string; created: string; updated: string };
+
+<span class="k">async function</span> asmdb(path: string, init: RequestInit = {}) {
+  <span class="k">return</span> fetch(`${endpoint}${path}`, {
+    ...init,
+    headers: {
+      authorization: [<span class="s">"Bearer"</span>, token].join(<span class="s">" "</span>),
+      <span class="p">"content-type"</span>: <span class="s">"application/json"</span>,
+      ...init.headers
+    }
+  });
+}
+
+<span class="k">export async function</span> GET() {
+  <span class="k">const</span> res = <span class="k">await</span> asmdb(<span class="s">"/v1/rows?limit=100&amp;offset=0"</span>);
+  <span class="k">const</span> data = <span class="k">await</span> res.json() <span class="k">as</span> { rows: Row[]; count: number; hasMore: boolean; nextOffset: number };
+  <span class="k">return</span> Response.json(data);
+}
+
+<span class="k">export async function</span> POST(request: Request) {
+  <span class="k">const</span> body = <span class="k">await</span> request.json() <span class="k">as</span> { id: string; value: string; tag: string; content: string };
+  <span class="k">const</span> res = <span class="k">await</span> asmdb(<span class="s">"/v1/rows"</span>, {
+    method: <span class="s">"POST"</span>,
+    body: JSON.stringify(body)
+  });
+  <span class="k">return</span> Response.json(<span class="k">await</span> res.json() <span class="k">as</span> { row: Row }, { status: res.status });
+}</pre>
+          <figcaption>The endpoint is returned at creation. The token is shown once, then belongs in server configuration.</figcaption>
+        </figure>
+      </div>
+
+      <div>
+        <div class="web__facts">
+          <div class="web__fact">
+            <p class="web__fact-k">strings</p>
+            <p class="web__fact-b">
+              Numeric fields cross the wire as decimal strings. <code>id</code> is
+              u64 and <code>value</code> is i64; neither should be parsed as a
+              JavaScript <code>number</code>.
+            </p>
+          </div>
+          <div class="web__fact">
+            <p class="web__fact-k">limits</p>
+            <p class="web__fact-b">
+              <code>tag</code> is 39 bytes and <code>content</code> is 175 bytes.
+              Longer input is refused, not truncated, so forms should validate
+              before posting.
+            </p>
+          </div>
+          <div class="web__fact">
+            <p class="web__fact-k">paging</p>
+            <p class="web__fact-b">
+              Listings default to <code>limit=100</code>, cap at <code>1000</code>
+              and page with <code>offset</code>. <code>FIND</code> and
+              <code>RANGE</code> are full scans, not keystroke-by-keystroke search
+              endpoints.
+            </p>
+          </div>
+          <div class="web__fact">
+            <p class="web__fact-k">shape</p>
+            <p class="web__fact-b">
+              One database is one fixed-shape table. There is no
+              <code>CREATE TABLE</code>, no joins and no schema migration step.
+            </p>
+          </div>
+        </div>
+        <p class="sec__sub" style="font-size: var(--text-base)">
+          Backends do not have to be JavaScript. Python, C# and C clients ship in
+          the repository under <code>clients/</code>.
+        </p>
       </div>
     </div>
   </div>
@@ -262,12 +370,12 @@
     <div class="split">
       <figure>
         <pre class="code"><span class="c"># REST — every field is a string, on purpose</span>
-<span class="k">curl</span> -X POST https://db-xxxx.../v1/rows \
+<span class="k">curl</span> -X POST https://&lt;gateway-host&gt;/db/7k2m9x4qp1va8ne03wjr5tzy/v1/rows \
   -H <span class="s">"Authorization: Bearer $TOKEN"</span> \
   -d <span class="s">'{"id":"1001","value":"5",
        "tag":"project","content":"hello"}'</span>
 
-<span class="k">curl</span> https://db-xxxx.../v1/rows?limit=100 \
+<span class="k">curl</span> https://&lt;gateway-host&gt;/db/7k2m9x4qp1va8ne03wjr5tzy/v1/rows?limit=100 \
   -H <span class="s">"Authorization: Bearer $TOKEN"</span></pre>
         <figcaption>Bounded by default — <code>limit</code> caps at 1000.</figcaption>
       </figure>
@@ -390,75 +498,118 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
         <button class="btn btn--ghost" id="auth-signout" type="button">Sign out</button>
       </div>
 
-    <div class="split">
-      <div class="console">
-        <div class="field">
-          <label for="db-name">name</label>
-          <input id="db-name" type="text" value="my-notes" maxlength="40"
-                 pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" autocomplete="off" spellcheck="false">
-          <span class="hint">lowercase letters, digits and hyphens</span>
-        </div>
-        <div class="field">
-          <label for="db-tier">tier</label>
-          <select id="db-tier">
-            <option value="free">free — 0.25 vCPU · sleeps after 5 min</option>
-            <option value="standard" selected>standard — 0.5 vCPU · sleeps after 30 min</option>
-            <option value="premium">premium — 1 vCPU · always warm</option>
-          </select>
-        </div>
-        <div class="hero__actions" style="margin-top: 0">
-          <button class="btn btn--primary" id="db-create" type="button">Create database</button>
-          <button class="btn btn--ghost" id="db-list" type="button">List mine</button>
+      <div class="console console-create">
+        <div class="console-create__form">
+          <div class="field">
+            <label for="db-name">name</label>
+            <input id="db-name" type="text" value="my-notes" maxlength="40"
+                   pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" autocomplete="off" spellcheck="false">
+            <span class="hint">lowercase letters, digits and hyphens</span>
+          </div>
+          <div class="field">
+            <label for="db-tier">tier</label>
+            <select id="db-tier">
+              <option value="free">free — 0.25 vCPU · sleeps after 5 min</option>
+              <option value="standard" selected>standard — 0.5 vCPU · sleeps after 30 min</option>
+              <option value="premium">premium — 1 vCPU · always warm</option>
+            </select>
+          </div>
+          <div class="console-create__actions">
+            <button class="btn btn--primary" id="db-create" type="button">Create database</button>
+            <button class="btn btn--ghost" id="db-list" type="button">Refresh list</button>
+          </div>
         </div>
         <div class="out mono" id="db-out" role="status" aria-live="polite">Ready. Pick a tier and press create.</div>
       </div>
 
-      <div>
-        <figure>
-          <pre class="code"><span class="c"># the same thing, from a terminal</span>
-<span class="k">curl</span> -X POST https://&lt;control-plane&gt;/api/v1/databases \
-  -H <span class="s">"content-type: application/json"</span> \
-  -d <span class="s">'{"name":"my-notes","tier":"standard"}'</span>
+      <div class="console-grid" id="console-grid">
+        <section class="console-card db-list-card" aria-labelledby="db-list-title">
+          <div class="console-card__head">
+            <div>
+              <p class="sec__kicker">Databases</p>
+              <h3 class="console-card__title" id="db-list-title">Your instances</h3>
+            </div>
+            <span class="badge" id="db-list-status">loading</span>
+          </div>
+          <div class="db-list" id="database-list" role="listbox" aria-label="databases"></div>
+        </section>
 
-<span class="c"># -&gt; { "id": "db_...", "endpoint": "https://db-....io",
-#      "token": "shown once", "state": "provisioning" }</span></pre>
-          <figcaption>Provisioning returns immediately; the container is warm within seconds.</figcaption>
-        </figure>
-        <p class="sec__sub" style="font-size: var(--text-base)">
-          One instance is one engine process holding one table, with its own write-ahead
-          log, its own change log and its own single-writer lock. Nothing is shared with
-          anyone else's data — isolation is a container boundary, not a tenant column.
-        </p>
-      </div>
-    </div>
+        <section class="console-card preview-card" aria-labelledby="preview-title">
+          <div class="console-card__head">
+            <div>
+              <p class="sec__kicker">Preview</p>
+              <h3 class="console-card__title" id="preview-title">Table rows</h3>
+            </div>
+            <span class="badge" id="preview-status">bounded</span>
+          </div>
+          <p class="console-card__note">Reads <code>/v1/rows?limit=20&amp;offset=0</code>. No unbounded listing is issued. Scroll sideways on small screens.</p>
+          <div class="table-wrap" id="preview-wrap" tabindex="0" aria-label="table preview, scroll horizontally if needed">
+            <table class="preview-table">
+              <thead>
+                <tr><th>id</th><th>value</th><th>tag</th><th>content</th><th>updated</th></tr>
+              </thead>
+              <tbody id="preview-rows">
+                <tr><td colspan="5">Select a database.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
 
-    <div class="terminal console" id="db-terminal" hidden>
-      <div class="terminal__head">
-        <div>
-          <p class="sec__kicker">Browser CLI</p>
-          <h3 class="terminal__title">asmdb on <span id="term-db-id">this database</span></h3>
-        </div>
-        <span class="badge" id="term-state">ready</span>
+        <section class="console-card monitor-card" aria-labelledby="monitor-title">
+          <div class="console-card__head">
+            <div>
+              <p class="sec__kicker">Monitoring</p>
+              <h3 class="console-card__title" id="monitor-title">Live stats</h3>
+            </div>
+            <span class="badge" id="monitor-state">—</span>
+          </div>
+          <div class="metrics">
+            <div class="metric">
+              <p class="metric__k">rows</p>
+              <p class="metric__v" id="metric-rows">—</p>
+              <div class="meter" aria-hidden="true"><span id="rows-meter"></span></div>
+            </div>
+            <div class="metric">
+              <p class="metric__k">cpu</p>
+              <p class="metric__v" id="metric-cpu">—</p>
+              <p class="metric__hint">derived from two samples</p>
+            </div>
+            <div class="metric">
+              <p class="metric__k">memory</p>
+              <p class="metric__v" id="metric-memory">—</p>
+              <p class="metric__hint" id="metric-storage">allocated storage —</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="terminal console-card" id="db-terminal" aria-labelledby="terminal-title">
+          <div class="terminal__head">
+            <div>
+              <p class="sec__kicker">CLI</p>
+              <h3 class="terminal__title" id="terminal-title">asmdb on <span id="term-db-id">no database selected</span></h3>
+            </div>
+            <span class="badge" id="term-state">ready</span>
+          </div>
+          <p class="terminal__meta" id="term-meta">Select a database. Commands are proxied through the control plane.</p>
+          <div class="field terminal__token" id="term-token-wrap" hidden>
+            <label for="term-token">instance token</label>
+            <input id="term-token" type="password" autocomplete="off" spellcheck="false" placeholder="paste bearer token">
+            <span class="hint">Shown once at creation. Paste it here if this browser session does not have it.</span>
+          </div>
+          <pre class="terminal__screen mono" id="term-screen" aria-live="polite"></pre>
+          <form class="terminal__form" id="term-form">
+            <label class="terminal__prompt" for="term-command">asmdb&gt;</label>
+            <input id="term-command" type="text" autocomplete="off" spellcheck="false" placeholder="HELP">
+            <button class="btn btn--primary" id="term-send" type="submit">Run</button>
+          </form>
+          <div class="terminal__hints" aria-label="starter commands">
+            <button type="button" data-command="HELP">HELP</button>
+            <button type="button" data-command="COUNT">COUNT</button>
+            <button type="button" data-command="SELECT *">SELECT *</button>
+            <button type="button" data-command="INSERT 1 5 tag some text">INSERT 1 5 tag some text</button>
+          </div>
+        </section>
       </div>
-      <p class="terminal__meta" id="term-meta">Commands are proxied through the control plane and run against the engine.</p>
-      <div class="field terminal__token" id="term-token-wrap" hidden>
-        <label for="term-token">instance token</label>
-        <input id="term-token" type="password" autocomplete="off" spellcheck="false" placeholder="paste bearer token">
-        <span class="hint">Needed when the token was not returned on this page.</span>
-      </div>
-      <pre class="terminal__screen mono" id="term-screen" aria-live="polite"></pre>
-      <form class="terminal__form" id="term-form">
-        <label class="terminal__prompt" for="term-command">asmdb&gt;</label>
-        <input id="term-command" type="text" autocomplete="off" spellcheck="false" placeholder="HELP">
-        <button class="btn btn--primary" id="term-send" type="submit">Run</button>
-      </form>
-      <div class="terminal__hints" aria-label="starter commands">
-        <button type="button" data-command="HELP">HELP</button>
-        <button type="button" data-command="COUNT">COUNT</button>
-        <button type="button" data-command="SELECT *">SELECT *</button>
-        <button type="button" data-command="INSERT 1 5 tag some text">INSERT 1 5 tag some text</button>
-      </div>
-    </div>
     </div>
   </div>
 </section>
@@ -490,6 +641,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
         <h4>Interfaces</h4>
         <ul>
           <li><a href="#mcp">MCP server</a></li>
+          <li><a href="#web">Web applications</a></li>
           <li><a href="#access">REST API</a></li>
           <li><a href="https://github.com/fredgis/asmDB/tree/main/clients">Clients</a></li>
         </ul>

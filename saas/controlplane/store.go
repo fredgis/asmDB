@@ -22,6 +22,8 @@ type instance struct {
 	ID               string    `json:"id"`
 	Name             string    `json:"name"`
 	Tier             string    `json:"tier"`
+	Image            string    `json:"image,omitempty"`
+	Engine           string    `json:"engine,omitempty"`
 	TokenHash        string    `json:"token_hash"`
 	CreatedAt        time.Time `json:"created_at"`
 	ContainerAppName string    `json:"container_app_name"`

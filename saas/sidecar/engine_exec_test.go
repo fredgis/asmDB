@@ -125,6 +125,8 @@ func TestFakeEngineHelper(t *testing.T) {
 				fmt.Println("+----+-------+")
 			}
 			fmt.Println("[ OK ] 1 row(s)")
+		case "COUNT":
+			fmt.Println("[ OK ] 1")
 		case "FAIL":
 			fmt.Println("[ERR] forced failure")
 		case "EXIT", "QUIT":

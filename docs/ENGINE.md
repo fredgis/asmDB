@@ -1,5 +1,9 @@
 # asmdb — Engine Specification
 
+<p align="center">
+  <img src="assets/asmdb-core-engine.png" alt="asmdb core engine" width="90%">
+</p>
+
 > The precise technical reference for **asmdb**: a minimalist, transactional
 > database written in **x86-64 assembly** (NASM, `-f bin`), with **no linker**
 > and **no C runtime**. One engine source builds two native binaries — a

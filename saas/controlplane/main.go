@@ -21,6 +21,8 @@ type config struct {
 	Location       string
 	StorageAccount string
 	EnvStorage     string
+	PublicBase     string
+	PlatformSecret string
 	SiteDir        string
 	EntraTenantID  string
 	EntraClientID  string
@@ -29,7 +31,7 @@ type config struct {
 }
 
 func loadConfig() (config, error) {
-	entraClientID := getenv("ASMDB_ENTRA_CLIENT_ID", "3e607c6e-811b-47e6-b9b1-9bbe11812596")
+	entraClientID := getenv("ASMDB_ENTRA_CLIENT_ID", "<console-app-id>")
 	cfg := config{
 		Port:           getenv("PORT", "8080"),
 		SubscriptionID: os.Getenv("AZURE_SUBSCRIPTION_ID"),
@@ -39,6 +41,8 @@ func loadConfig() (config, error) {
 		Location:       getenv("ASMDB_LOCATION", "swedencentral"),
 		StorageAccount: os.Getenv("ASMDB_STORAGE_ACCOUNT"),
 		EnvStorage:     getenv("ASMDB_ENV_STORAGE", "asmdb-data"),
+		PublicBase:     os.Getenv("ASMDB_PUBLIC_BASE"),
+		PlatformSecret: os.Getenv("ASMDB_PLATFORM_SECRET"),
 		SiteDir:        getenv("ASMDB_SITE_DIR", "/app/site"),
 		EntraTenantID:  getenv("ASMDB_ENTRA_TENANT_ID", "<tenant-id>"),
 		EntraClientID:  entraClientID,
@@ -73,6 +77,9 @@ func main() {
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
+	}
+	if cfg.PlatformSecret == "" {
+		log.Printf("ASMDB_PLATFORM_SECRET is empty; live instance stats are disabled")
 	}
 
 	cred, err := azidentity.NewDefaultAzureCredential(nil)

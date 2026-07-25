@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,15 @@ import (
 	"regexp"
 	"strings"
 	"time"
+)
+
+const (
+	statsRequestTimeout = 2 * time.Second
+	statsListTimeout    = 3 * time.Second
+	healthCheckTimeout  = 3 * time.Second
+	backupTimeout       = 30 * time.Second
+	costMaxWindow       = 31 * 24 * time.Hour
+	costMetricGrain     = 15 * time.Minute
 )
 
 var (
@@ -26,18 +36,25 @@ type api struct {
 	cfg         config
 	verifier    accessTokenVerifier
 	httpClient  *http.Client
+	statsClient *http.Client
 	now         func() time.Time
 }
 
 type databaseResponse struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Tier      string `json:"tier"`
-	State     string `json:"state"`
-	Endpoint  string `json:"endpoint"`
-	Token     string `json:"token,omitempty"`
-	CreatedAt string `json:"created_at"`
-	Error     string `json:"error,omitempty"`
+	ID               string         `json:"id"`
+	Name             string         `json:"name"`
+	Tier             string         `json:"tier"`
+	Image            string         `json:"image,omitempty"`
+	Engine           string         `json:"engine,omitempty"`
+	State            string         `json:"state"`
+	Endpoint         string         `json:"endpoint"`
+	Token            string         `json:"token,omitempty"`
+	CreatedAt        string         `json:"created_at"`
+	Error            string         `json:"error,omitempty"`
+	Stats            *statsResponse `json:"stats,omitempty"`
+	UpgradeAvailable bool           `json:"upgradeAvailable"`
+	AvailableEngine  string         `json:"availableEngine,omitempty"`
+	AvailableImage   string         `json:"availableImage,omitempty"`
 }
 
 type createDatabaseRequest struct {
@@ -54,6 +71,23 @@ type execResponse struct {
 	OK     bool     `json:"ok"`
 }
 
+type rotateTokenResponse struct {
+	Token   string `json:"token"`
+	Warning string `json:"warning"`
+}
+
+type statsResponse struct {
+	Available bool            `json:"available"`
+	Reason    string          `json:"reason,omitempty"`
+	Stats     json.RawMessage `json:"stats,omitempty"`
+}
+
+type healthResponse struct {
+	Status string `json:"status"`
+	Engine string `json:"engine"`
+	Rows   int64  `json:"rows"`
+}
+
 func newAPI(store store, provisioner provisioner, cfg config, verifier accessTokenVerifier) *api {
 	return &api{
 		store:       store,
@@ -61,6 +95,7 @@ func newAPI(store store, provisioner provisioner, cfg config, verifier accessTok
 		cfg:         cfg,
 		verifier:    verifier,
 		httpClient:  &http.Client{Timeout: 60 * time.Second},
+		statsClient: &http.Client{Timeout: statsRequestTimeout},
 		now:         func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -68,6 +103,7 @@ func newAPI(store store, provisioner provisioner, cfg config, verifier accessTok
 func (a *api) register(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/api/v1/config", a.withCORS(a.handleConfig))
+	mux.HandleFunc("/api/v1/costs", a.withCORS(a.handleCosts))
 	mux.HandleFunc("/api/v1/databases", a.withCORS(a.handleDatabases))
 	mux.HandleFunc("/api/v1/databases/", a.withCORS(a.handleDatabase))
 }
@@ -117,6 +153,18 @@ func (a *api) handleDatabase(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(rest, "/")
 	if len(parts) == 2 && parts[1] == "exec" {
 		a.handleExec(w, r, parts[0])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "rotate-token" {
+		a.handleRotateToken(w, r, parts[0])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "stats" {
+		a.handleStats(w, r, parts[0])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "upgrade" {
+		a.handleUpgrade(w, r, parts[0])
 		return
 	}
 	if len(parts) != 1 || !idPattern.MatchString(parts[0]) {
@@ -192,6 +240,7 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 		ID:               id,
 		Name:             req.Name,
 		Tier:             req.Tier,
+		Image:            a.cfg.Image,
 		TokenHash:        tokenHash(token),
 		CreatedAt:        a.now(),
 		ContainerAppName: containerAppName(id),
@@ -207,11 +256,17 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
 		return
 	}
+	if engine, ok := a.refreshEngine(r.Context(), in); ok {
+		in.Engine = engine
+		_ = a.store.Save(context.Background(), in)
+	}
 
 	writeJSON(w, http.StatusCreated, databaseResponse{
 		ID:        in.ID,
 		Name:      in.Name,
 		Tier:      in.Tier,
+		Image:     in.Image,
+		Engine:    in.Engine,
 		State:     "provisioning",
 		Endpoint:  endpoint,
 		Token:     token,
@@ -228,6 +283,13 @@ func (a *api) listDatabases(w http.ResponseWriter, r *http.Request) {
 	responses := make([]databaseResponse, 0, len(instances))
 	for _, in := range instances {
 		responses = append(responses, a.responseFor(r.Context(), in))
+	}
+	if includeStats(r) {
+		stats := a.fetchStatsForList(r.Context(), instances)
+		for i, in := range instances {
+			got := stats[in.ID]
+			responses[i].Stats = &got
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string][]databaseResponse{"databases": responses})
 }
@@ -264,6 +326,158 @@ func (a *api) deleteDatabase(w http.ResponseWriter, r *http.Request, id string) 
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id string) {
+	if !idPattern.MatchString(id) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	if !a.authorized(w, r) {
+		return
+	}
+
+	in, err := a.store.Get(r.Context(), id)
+	if errors.Is(err, errNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		return
+	}
+
+	token, err := generateAccessToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "generate access token", err.Error())
+		return
+	}
+
+	previous := in
+	in.TokenHash = tokenHash(token)
+	// Rotation is intentionally not idempotent: each successful call mints a
+	// different token and invalidates the previous one. We save the new hash
+	// before updating the app because the old plaintext token is unavailable;
+	// if Azure rejects the update, we restore the previous hash so failure
+	// leaves the old token working instead of returning a token the instance
+	// will not accept.
+	if err := a.store.Save(r.Context(), in); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
+		return
+	}
+	if err := a.provisioner.RotateToken(r.Context(), in, token); err != nil {
+		if restoreErr := a.store.Save(context.Background(), previous); restoreErr != nil {
+			writeError(w, http.StatusBadGateway, "bad_gateway", "rotate token failed and restoring metadata failed", err.Error()+"; restore: "+restoreErr.Error())
+			return
+		}
+		writeError(w, http.StatusBadGateway, "bad_gateway", "update instance token", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, rotateTokenResponse{
+		Token:   token,
+		Warning: "Token rotation restarts the instance and briefly interrupts active connections.",
+	})
+}
+
+func (a *api) handleStats(w http.ResponseWriter, r *http.Request, id string) {
+	if !idPattern.MatchString(id) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	if !a.authorized(w, r) {
+		return
+	}
+
+	in, err := a.store.Get(r.Context(), id)
+	if errors.Is(err, errNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, a.fetchStats(r.Context(), in))
+}
+
+func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
+	if !idPattern.MatchString(id) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	if !a.authorized(w, r) {
+		return
+	}
+
+	in, err := a.store.Get(r.Context(), id)
+	if errors.Is(err, errNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		return
+	}
+	if !a.upgradeAvailable(in) {
+		writeError(w, http.StatusConflict, "no_upgrade", "database already uses the current engine image", "")
+		return
+	}
+	if a.cfg.PlatformSecret == "" {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "platform credential is not configured", "")
+		return
+	}
+	if err := a.backupInstance(r.Context(), in); err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway", "backup failed; upgrade aborted", err.Error())
+		return
+	}
+
+	// This is intentionally not zero-downtime: the engine holds an exclusive
+	// lock and maxReplicas is 1, so the replacement can open the files only
+	// after the outgoing process lets go. We record the new image only after
+	// Azure reports the update done; a failed revision leaves metadata on the
+	// old image so the console still offers the upgrade.
+	if err := a.provisioner.UpgradeImage(r.Context(), in, a.cfg.Image); err != nil {
+		writeError(w, http.StatusBadGateway, "bad_gateway", "upgrade revision failed", err.Error())
+		return
+	}
+	in.Image = a.cfg.Image
+	if engine, ok := a.refreshEngine(r.Context(), in); ok {
+		in.Engine = engine
+	}
+	if err := a.store.Save(r.Context(), in); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
+		return
+	}
+	res := a.responseFor(r.Context(), in)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"database": res,
+		"warning":  "Upgrade restarts the instance and briefly interrupts active connections.",
+	})
 }
 
 func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
@@ -312,7 +526,7 @@ func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	upstreamURL := strings.TrimRight(a.provisioner.Endpoint(in), "/") + "/v1/exec"
+	upstreamURL := strings.TrimRight(a.provisioner.InternalEndpoint(in), "/") + "/v1/exec"
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "bad_gateway", "instance unreachable", err.Error())
@@ -352,20 +566,180 @@ func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (a *api) fetchStatsForList(ctx context.Context, instances []instance) map[string]statsResponse {
+	ctx, cancel := context.WithTimeout(ctx, statsListTimeout)
+	defer cancel()
+
+	type result struct {
+		id    string
+		stats statsResponse
+	}
+	stats := make(map[string]statsResponse, len(instances))
+	results := make(chan result, len(instances))
+	for _, in := range instances {
+		in := in
+		go func() {
+			results <- result{id: in.ID, stats: a.fetchStats(ctx, in)}
+		}()
+	}
+	for range instances {
+		select {
+		case got := <-results:
+			stats[got.id] = got.stats
+		case <-ctx.Done():
+			goto fillMissing
+		}
+	}
+fillMissing:
+	for _, in := range instances {
+		if _, ok := stats[in.ID]; !ok {
+			stats[in.ID] = unavailableStats("timeout")
+		}
+	}
+	return stats
+}
+
+func (a *api) fetchStats(ctx context.Context, in instance) statsResponse {
+	if a.cfg.PlatformSecret == "" {
+		return unavailableStats("platform_token_unconfigured")
+	}
+	// Deliberately check Azure state before touching /v1/stats: this dashboard
+	// is polled often, so an instance scaled to zero should show unavailable
+	// promptly rather than being cold-started just to draw a chart.
+	state, err := a.provisioner.GetState(ctx, in)
+	if err != nil {
+		return unavailableStats("state_unavailable")
+	}
+	if state.State != "running" {
+		return unavailableStats(state.State)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, statsRequestTimeout)
+	defer cancel()
+	upstreamURL := strings.TrimRight(a.provisioner.InternalEndpoint(in), "/") + "/v1/stats"
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, upstreamURL, nil)
+	if err != nil {
+		return unavailableStats("unavailable")
+	}
+	req.Header.Set("Authorization", "Bearer "+derivePlatformToken(a.cfg.PlatformSecret, in.ID))
+
+	resp, err := a.statsClient.Do(req)
+	if err != nil {
+		return unavailableStats("unavailable")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return unavailableStats("unavailable")
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil || !json.Valid(data) {
+		return unavailableStats("unavailable")
+	}
+	return statsResponse{Available: true, Stats: json.RawMessage(data)}
+}
+
+func (a *api) backupInstance(ctx context.Context, in instance) error {
+	reqCtx, cancel := context.WithTimeout(ctx, backupTimeout)
+	defer cancel()
+	body, err := json.Marshal(execRequest{Command: "BACKUP"})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(a.provisioner.InternalEndpoint(in), "/")+"/v1/exec", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+derivePlatformToken(a.cfg.PlatformSecret, in.ID))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("backup returned %s", resp.Status)
+	}
+	var out execResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	if !out.OK {
+		return fmt.Errorf("backup command failed")
+	}
+	return nil
+}
+
+func (a *api) refreshEngine(ctx context.Context, in instance) (string, bool) {
+	reqCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(a.provisioner.InternalEndpoint(in), "/")+"/health", nil)
+	if err != nil {
+		return "", false
+	}
+	resp, err := a.statsClient.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", false
+	}
+	var health healthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil || health.Engine == "" {
+		return "", false
+	}
+	return health.Engine, true
+}
+
+func unavailableStats(reason string) statsResponse {
+	if reason == "" {
+		reason = "unavailable"
+	}
+	return statsResponse{Available: false, Reason: reason}
+}
+
+func includeStats(r *http.Request) bool {
+	value := strings.ToLower(r.URL.Query().Get("include_stats"))
+	return value == "1" || value == "true" || value == "yes"
+}
+
+func (a *api) upgradeAvailable(in instance) bool {
+	return a.cfg.Image != "" && in.Image != "" && in.Image != a.cfg.Image
+}
+
 func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
 	state, err := a.provisioner.GetState(ctx, in)
 	if err != nil {
 		state = liveState{State: "failed", Error: err.Error()}
 	}
 	return databaseResponse{
-		ID:        in.ID,
-		Name:      in.Name,
-		Tier:      in.Tier,
-		State:     state.State,
-		Endpoint:  a.provisioner.Endpoint(in),
-		CreatedAt: in.CreatedAt.Format(time.RFC3339),
-		Error:     state.Error,
+		ID:               in.ID,
+		Name:             in.Name,
+		Tier:             in.Tier,
+		Image:            in.Image,
+		Engine:           in.Engine,
+		State:            state.State,
+		Endpoint:         a.provisioner.Endpoint(in),
+		CreatedAt:        in.CreatedAt.Format(time.RFC3339),
+		Error:            state.Error,
+		UpgradeAvailable: a.upgradeAvailable(in),
+		AvailableEngine:  engineLabelFromImage(a.cfg.Image),
+		AvailableImage:   a.cfg.Image,
 	}
+}
+
+func engineLabelFromImage(image string) string {
+	if image == "" {
+		return ""
+	}
+	if at := strings.IndexByte(image, '@'); at >= 0 {
+		return image[at+1:]
+	}
+	lastSlash := strings.LastIndexByte(image, '/')
+	if colon := strings.LastIndexByte(image, ':'); colon > lastSlash {
+		return image[colon+1:]
+	}
+	return image
 }
 
 func (a *api) authorized(w http.ResponseWriter, r *http.Request) bool {

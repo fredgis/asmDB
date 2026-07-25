@@ -12,11 +12,12 @@ import (
 )
 
 type config struct {
-	Bin   string
-	Data  string
-	Name  string
-	Token string
-	Port  string
+	Bin           string
+	Data          string
+	Name          string
+	Token         string
+	PlatformToken string
+	Port          string
 }
 
 func main() {
@@ -30,7 +31,7 @@ func main() {
 		logJSON("error", "engine_start_failed", map[string]any{"error": err.Error()})
 		os.Exit(1)
 	}
-	app := &api{engine: engine, token: cfg.Token}
+	app := &api{engine: engine, token: cfg.Token, platformToken: cfg.PlatformToken, started: time.Now()}
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           app.routes(),
@@ -58,11 +59,12 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		Bin:   getenv("ASMDB_BIN", "/app/asmdb"),
-		Data:  getenv("ASMDB_DATA", "/data"),
-		Name:  getenv("ASMDB_NAME", "main"),
-		Token: os.Getenv("ASMDB_TOKEN"),
-		Port:  getenv("PORT", "8080"),
+		Bin:           getenv("ASMDB_BIN", "/app/asmdb"),
+		Data:          getenv("ASMDB_DATA", "/data"),
+		Name:          getenv("ASMDB_NAME", "main"),
+		Token:         os.Getenv("ASMDB_TOKEN"),
+		PlatformToken: os.Getenv("ASMDB_PLATFORM_TOKEN"),
+		Port:          getenv("PORT", "8080"),
 	}
 	if cfg.Token == "" {
 		return cfg, errors.New("ASMDB_TOKEN is required")
