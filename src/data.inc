@@ -99,7 +99,12 @@ s_ok_backup:   db '[ OK ] backup written', 13, 10, 0
 s_ok_restore:  db '[ OK ] database restored from backup', 13, 10, 0
 s_err_bak_open: db '[ERR] cannot open backup file', 13, 10, 0
 s_err_bak_magic:db '[ERR] not an asmdb backup (bad magic)', 13, 10, 0
+s_err_bak_trunc:db '[ERR] backup is truncated or incompatible - nothing restored', 13, 10, 0
+s_err_bak_write:db '[ERR] backup failed - write error, file is incomplete', 13, 10, 0
 s_err_txn_busy: db '[ERR] finish the transaction first (COMMIT or ROLLBACK)', 13, 10, 0
+s_err_io:       db '[ERR] I/O failure on a durable write - aborting to avoid an inconsistent database', 13, 10, 0
+s_err_corrupt:  db '[ERR] database file is incomplete or corrupt - refusing to open (it was NOT reinitialized)', 13, 10, 0
+s_err_format:   db '[ERR] incompatible database format (version / record size / capacity)', 13, 10, 0
 s_det_id:      db '  id       : ', 0
 s_det_value:   db '  value    : ', 0
 s_det_tag:     db '  tag      : ', 0

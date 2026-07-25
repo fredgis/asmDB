@@ -70,19 +70,26 @@ token_eq:
     ret
 
 ; parse_u64() - parse decimal at rsi -> rax = value, rdx = 1 ok / 0 err, rsi advanced
+;   Rejects values that do not fit in 64 bits. Wrapping silently would be a
+;   correctness hole for a primary key: "18446744073709551617" would otherwise
+;   parse as id 1 and collide with a real row.
 parse_u64:
     xor  rax, rax
     xor  r9, r9
+    mov  r10, 0x1999999999999999     ; (2^64 - 1) / 10
 .loop:
     movzx ecx, byte [rsi]
     cmp  cl, '0'
     jb   .end
     cmp  cl, '9'
     ja   .end
+    cmp  rax, r10
+    ja   .err                        ; x10 would already overflow
     imul rax, rax, 10
     sub  cl, '0'
     movzx rcx, cl
     add  rax, rcx
+    jc   .err                        ; carry out of 64 bits
     inc  rsi
     inc  r9
     jmp  .loop
@@ -104,6 +111,9 @@ parse_i64:
     call parse_u64
     test rdx, rdx
     jz   .err
+    mov  rcx, 0x8000000000000000     ; |INT64_MIN|
+    cmp  rax, rcx
+    ja   .err                        ; magnitude too large to negate
     neg  rax
     mov  rdx, 1
     ret
@@ -610,6 +620,9 @@ cmd_delete:
 ;   In a transaction: each live row's before-image is captured in the undo log
 ;   so ROLLBACK restores the whole table; the change is applied to disk by
 ;   COMMIT. Rejected up front if that would exceed the per-txn undo capacity.
+;   Inside a transaction the capture runs as a SEPARATE first pass: if the undo
+;   log cannot hold every live row, the command fails having modified nothing,
+;   instead of leaving the table half-cleared with a stale row count.
 cmd_truncate:
     push rbp
     mov  rbp, rsp
@@ -623,6 +636,23 @@ cmd_truncate:
     add  rax, [rel g_undo_n]         ; existing undo + rows still to capture
     cmp  rax, UNDO_MAX
     ja   .toobig
+    ; pass 1 - capture every live row before touching any of them
+    xor  rbx, rbx
+.cap:
+    cmp  rbx, CAPACITY
+    jae  .go
+    mov  rax, rbx
+    shl  rax, REC_SHIFT
+    add  rax, [rel g_table]
+    cmp  byte [rax+REC_STATUS], ST_OCCUPIED
+    jne  .capnext
+    mov  rcx, rax
+    call txn_capture
+    test rax, rax
+    jz   .toobig                     ; nothing cleared yet - safe to abort
+.capnext:
+    inc  rbx
+    jmp  .cap
 .go:
     xor  rbx, rbx                    ; index
     mov  qword [rbp-32], 0           ; removed count
@@ -635,13 +665,6 @@ cmd_truncate:
     cmp  byte [rax+REC_STATUS], ST_OCCUPIED
     jne  .lnext
     mov  rdi, rax                    ; live slot
-    cmp  qword [rel g_in_txn], 0
-    je   .clear
-    mov  rcx, rdi
-    call txn_capture                 ; record before-image (undo)
-    test rax, rax
-    jz   .toobig                     ; safety net (precheck should prevent this)
-.clear:
     mov  byte [rdi+REC_STATUS], ST_DELETED
     inc  qword [rbp-32]
     cmp  qword [rel g_in_txn], 0
@@ -944,8 +967,12 @@ cmd_range:
     ret
 
 ; cmd_backup() - BACKUP <file> : snapshot the current database (header + full
-; slot region) to <file>. Rejected while a transaction is open. Reuses the
-; durable-write path by temporarily retargeting g_dat_handle at the backup file.
+; slot region) to <file>. Rejected while a transaction is open. Temporarily
+; retargets g_dat_handle at the backup file.
+;
+; Every transfer is checked. A failure here does NOT abort the process (the
+; live database was never touched) but it must never be reported as success,
+; so the backup path deliberately avoids db_write_header/db_flush, which abort.
 cmd_backup:
     push rbp
     mov  rbp, rsp
@@ -970,17 +997,43 @@ cmd_backup:
     mov  rax, [rel g_dat_handle]
     mov  [rbp-32], rax               ; saved live handle
     mov  [rel g_dat_handle], rbx
-    call db_write_header             ; 512-byte header at offset 0
+    ; build the header image exactly as db_write_header would
+    mov  rax, [rel g_count]
+    mov  [rel g_hdr+24], rax
+    lea  rdi, [rel g_hdr+HDR_TABLE]
+    lea  rsi, [rel g_tablename]
+    mov  rcx, TABLE_MAX
+    call strcpy_n
+    xor  rcx, rcx
+    lea  rdx, [rel g_hdr]
+    mov  r8, HDR_SIZE
+    call write_at                    ; 512-byte header at offset 0
+    cmp  rax, HDR_SIZE
+    jne  .wfail
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
     mov  r8, CAPACITY*REC_SIZE
     call write_at                    ; full slot region
-    call db_flush
+    mov  rdx, CAPACITY*REC_SIZE
+    cmp  rax, rdx
+    jne  .wfail
+    mov  rcx, [rel g_dat_handle]
+    call os_fsync
+    test rax, rax
+    jnz  .wfail
     mov  rax, [rbp-32]
     mov  [rel g_dat_handle], rax     ; restore live handle
     mov  rcx, rbx
     call os_close
     lea  rcx, [rel s_ok_backup]
+    call puts
+    jmp  .done
+.wfail:
+    mov  rax, [rbp-32]
+    mov  [rel g_dat_handle], rax     ; restore live handle before reporting
+    mov  rcx, rbx
+    call os_close
+    lea  rcx, [rel s_err_bak_write]
     call puts
     jmp  .done
 .openfail:
@@ -1005,6 +1058,11 @@ cmd_backup:
 ; cmd_restore() - RESTORE <file> : reload the database (header + slot region)
 ; from a backup written by BACKUP, then persist it to the live .dat. Rejected
 ; while a transaction is open.
+;
+; The backup is fully validated - magic, format fields, count, and the presence
+; of the LAST byte of the slot region - *before* a single byte of the live table
+; is overwritten. A truncated or foreign backup therefore leaves both the
+; in-memory table and the durable .dat exactly as they were.
 cmd_restore:
     push rbp
     mov  rbp, rsp
@@ -1034,24 +1092,40 @@ cmd_restore:
     mov  r8, HDR_SIZE
     call read_at
     cmp  rax, HDR_SIZE
-    jb   .badmagic
-    lea  rsi, [rel g_hdr_read]
-    lea  rdi, [rel s_magic]
-    mov  rcx, 5
-.magic:
-    mov  al, [rsi]
-    cmp  al, [rdi]
+    jne  .badmagic                   ; short read, or hard error (-1)
+    mov  rax, [rel g_hdr]            ; 8-byte magic from the header template
+    cmp  rax, [rel g_hdr_read]
     jne  .badmagic
-    inc  rsi
-    inc  rdi
-    dec  rcx
-    jnz  .magic
+    cmp  dword [rel g_hdr_read+8], DB_VERSION
+    jne  .badtrunc
+    cmp  dword [rel g_hdr_read+12], REC_SIZE
+    jne  .badtrunc
+    mov  rax, CAPACITY
+    cmp  [rel g_hdr_read+16], rax
+    jne  .badtrunc
+    mov  rax, [rel g_hdr_read+24]    ; live count
+    mov  rdx, CAPACITY
+    cmp  rax, rdx
+    ja   .badtrunc
+    mov  [rbp-40], rax               ; keep it: the probe reuses g_hdr_read
+    ; the backup must physically contain the last byte of the slot region
+    mov  rcx, rbx
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE - 1
+    lea  r8, [rel g_hdr_read]
+    mov  r9, 1
+    call os_pread
+    cmp  rax, 1
+    jne  .badtrunc                   ; truncated (or unreadable) backup
+    ; validated - now it is safe to overwrite the live table
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
     mov  r8, CAPACITY*REC_SIZE
-    call read_at                     ; load slots into the live table
-    mov  rax, [rel g_hdr_read+24]
-    mov  [rel g_count], rax           ; adopt restored live count
+    call read_at
+    mov  rdx, CAPACITY*REC_SIZE
+    cmp  rax, rdx
+    jne  io_fatal                    ; the table is half-loaded; do not go on
+    mov  rax, [rbp-40]
+    mov  [rel g_count], rax          ; adopt restored live count
     mov  rax, [rbp-32]
     mov  [rel g_dat_handle], rax     ; restore live handle
     mov  rcx, rbx
@@ -1061,6 +1135,9 @@ cmd_restore:
     mov  rdx, [rel g_table]
     mov  r8, CAPACITY*REC_SIZE
     call write_at
+    mov  rdx, CAPACITY*REC_SIZE
+    cmp  rax, rdx
+    jne  io_fatal
     call db_flush
     lea  rcx, [rel s_ok_restore]
     call puts
@@ -1071,6 +1148,14 @@ cmd_restore:
     mov  rcx, rbx
     call os_close
     lea  rcx, [rel s_err_bak_magic]
+    call puts
+    jmp  .done
+.badtrunc:
+    mov  rax, [rbp-32]
+    mov  [rel g_dat_handle], rax
+    mov  rcx, rbx
+    call os_close
+    lea  rcx, [rel s_err_bak_trunc]
     call puts
     jmp  .done
 .openfail:
@@ -1095,6 +1180,9 @@ cmd_restore:
 ; cmd_bench() - BENCH <n> : reset the table, insert n synthetic rows (timed in
 ; RAM), then checkpoint the whole table to disk + fsync (timed). This overwrites
 ; the current database with synthetic data - run it against a scratch db.
+; Rejected while a transaction is open: BENCH wipes the live table and
+; checkpoints it, which would strand the undo log against slots that no longer
+; hold the rows it captured (and BENCH is deliberately not transactional).
 cmd_bench:
     push rbp
     mov  rbp, rsp
@@ -1104,6 +1192,8 @@ cmd_bench:
     mov  [rbp-24], rdi
     mov  [rbp-32], r12
     mov  [rbp-40], r13
+    cmp  qword [rel g_in_txn], 0
+    jne  .busy
     call skip_spaces_rsi
     call parse_u64                   ; rax = n, rdx = ok flag
     test rdx, rdx
@@ -1178,6 +1268,9 @@ cmd_bench:
     mov  rdx, [rel g_table]
     mov  r8, CAPACITY*REC_SIZE
     call write_at
+    mov  rdx, CAPACITY*REC_SIZE
+    cmp  rax, rdx
+    jne  io_fatal
     call db_write_header
     call db_flush
     call os_perf_counter
@@ -1220,6 +1313,11 @@ cmd_bench:
     call put_u64
     lea  rcx, [rel s_bench_ms]
     call puts
+    jmp  .done
+.busy:
+    lea  rcx, [rel s_err_txn_busy]
+    call puts
+.done:
     mov  r13, [rbp-40]
     mov  r12, [rbp-32]
     mov  rdi, [rbp-24]

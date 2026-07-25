@@ -21,6 +21,7 @@ here instead of inlining the list.
 - **Backup:** [`BACKUP`](#backup) · [`RESTORE`](#restore)
 - **Session:** [`HELP`](#help) · [`EXIT` / `QUIT`](#exit--quit)
 - **[Why there is no `CREATE TABLE` / `DROP` / `ALTER`](#why-there-is-no-create-table--drop--alter)**
+- **[Error reference](#error-reference)**
 
 ---
 
@@ -28,7 +29,7 @@ here instead of inlining the list.
 
 | Placeholder | Meaning |
 |---|---|
-| `<id>` | primary key, an unsigned integer **≥ 1** (id `0` is reserved) |
+| `<id>` | primary key, an unsigned integer **≥ 1** and **< 2⁶⁴** (id `0` is reserved; a literal too large to fit is rejected as a syntax error, never wrapped) |
 | `<value>` / `<val>` | the 64-bit signed numeric cell (`i64`); may be interpreted as any narrower [type](#types) by the caller |
 | `<tag>` | a **single token** (no spaces), ≤ 40 bytes — a category / namespace |
 | `<text>` / `<content>` | the **rest of the line** (spaces allowed), ≤ 176 bytes |
@@ -262,6 +263,12 @@ asmdb transactions are backed by an **undo log** (for `ROLLBACK`) and a
 **write-ahead log** (for durable, crash-safe `COMMIT`). See the
 [engine spec](ENGINE.md) for the two-phase commit protocol.
 
+> **Undo capacity counts *rows*, not writes.** A slot is captured at most once
+> per transaction, so the 4096-entry undo log limits how many **distinct rows**
+> a transaction touches — not how many statements it runs. Updating the same row
+> a million times inside one transaction uses a single undo entry, and
+> `ROLLBACK` restores its *original* image.
+
 ### `BEGIN`
 
 ```
@@ -427,8 +434,9 @@ asmdb> BENCH 1000000
 [ OK ] benchmark complete
 ```
 
-> `BENCH` mutates the open database (it inserts real rows). Run it against a
-> scratch database name, or `TRUNCATE` afterwards.
+> `BENCH` mutates the open database (it replaces its contents with synthetic
+> rows). Run it against a scratch database name, or `TRUNCATE` afterwards.
+> It is **refused inside a transaction** — `COMMIT` or `ROLLBACK` first.
 
 ---
 
@@ -443,7 +451,11 @@ first).
 BACKUP <file>
 ```
 
-Write a consistent snapshot of the current database to `<file>`.
+Write a consistent snapshot of the current database to `<file>`. Every write and
+the final flush are checked: if any of them fails the command reports
+`[ERR] backup failed - write error, file is incomplete` and the partial file is
+never announced as a usable snapshot. The live database is not touched either
+way.
 
 ```text
 asmdb> BACKUP salesdb.bak
@@ -460,6 +472,13 @@ RESTORE <file>
 
 Replace the current database contents with a snapshot previously written by
 `BACKUP`. The live set after `RESTORE` matches the snapshot exactly.
+
+The snapshot is **fully validated before a single byte of the live table is
+overwritten** — magic, format fields, row count and the presence of the last
+byte of the record region. A foreign file is rejected with
+`[ERR] not an asmdb backup (bad magic)`; a truncated or incompatible one with
+`[ERR] backup is truncated or incompatible - nothing restored`. In both cases
+the current database is left exactly as it was, in memory and on disk.
 
 ```text
 asmdb> RESTORE salesdb.bak
@@ -521,3 +540,33 @@ So the full mutation surface is: create a row ([`INSERT`](#insert)), read
 ([`UPDATE`](#update)), and delete one ([`DELETE`](#delete)) or all
 ([`TRUNCATE`](#truncate)) rows — CRUD in full, minus DDL that a fixed-schema
 engine does not need.
+
+---
+
+## Error reference
+
+Every failure prints one `[ERR]` line and leaves the database unchanged. The
+engine never prints `[ OK ]` after a failed write.
+
+| Message | Meaning |
+|---|---|
+| `unknown command - type HELP` | the verb was not recognised |
+| `syntax error - type HELP` | missing/malformed argument, or a number that does not fit in 64 bits |
+| `constraint: id must be >= 1 (0 is reserved)` | id `0` is not a usable key |
+| `key already exists` | [`INSERT`](#insert) on a live key — use [`UPDATE`](#update) |
+| `key not found` | [`UPDATE`](#update) / [`DELETE`](#delete) / [`SELECT`](#select) on a missing key |
+| `table full` | no free slot remains at the current capacity |
+| `no active transaction` | [`COMMIT`](#commit) / [`ROLLBACK`](#rollback) outside a transaction |
+| `transaction already active` | nested [`BEGIN`](#begin) |
+| `transaction too large - COMMIT or ROLLBACK` | more than 4096 **distinct rows** touched in one transaction |
+| `finish the transaction first (COMMIT or ROLLBACK)` | [`BACKUP`](#backup), [`RESTORE`](#restore) or [`BENCH`](#bench) attempted inside a transaction |
+| `cannot open database file` | the `.dat`/`.wal` could not be opened |
+| `database is locked by another process (single-writer)` | another asmdb instance already holds the file |
+| `database file is incomplete or corrupt - refusing to open (it was NOT reinitialized)` | the `.dat` is non-empty but not a valid, complete asmdb file — it is **never** silently recreated |
+| `incompatible database format (version / record size / capacity)` | the `.dat` was written by a build with a different on-disk layout |
+| `cannot open backup file` | the [`BACKUP`](#backup)/[`RESTORE`](#restore) path could not be opened |
+| `not an asmdb backup (bad magic)` | the file given to [`RESTORE`](#restore) is not an asmdb snapshot |
+| `backup is truncated or incompatible - nothing restored` | the snapshot is short or from another layout; the live database is untouched |
+| `backup failed - write error, file is incomplete` | a [`BACKUP`](#backup) transfer or flush failed; the partial file is not a usable snapshot |
+| `I/O failure on a durable write - aborting to avoid an inconsistent database` | a durable write or `fsync` failed. asmdb **exits (status 1)** rather than continue with memory and disk out of sync |
+| `out of memory` | the startup allocations failed |

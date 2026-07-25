@@ -182,7 +182,8 @@ os_open_read:
     pop  rbp
     ret
 
-; os_pread(rcx = handle, rdx = offset, r8 = buf, r9 = len) -> rax = bytes read
+; os_pread(rcx = handle, rdx = offset, r8 = buf, r9 = len)
+;   -> rax = bytes read (0 = EOF), or -1 on error
 os_pread:
     push rbp
     mov  rbp, rsp
@@ -190,21 +191,31 @@ os_pread:
     mov  [rbp-8], rcx
     mov  [rbp-16], r8
     mov  [rbp-24], r9
+    mov  dword [rel g_io_dw], 0      ; never report a stale count
     xor  r8, r8                      ; SetFilePointerEx: lpNewFilePointer = NULL
     mov  r9d, FILE_BEGIN
     call [rel iat_SetFilePointerEx]  ; rcx = handle, rdx = offset
+    test eax, eax
+    jz   .fail                       ; seek failed - do NOT read at the old offset
     mov  rcx, [rbp-8]
     mov  rdx, [rbp-16]
     mov  r8, [rbp-24]
     lea  r9, [rel g_io_dw]
     mov  qword [rsp+0x20], 0
     call [rel iat_ReadFile]
+    test eax, eax
+    jz   .fail
     mov  eax, [rel g_io_dw]
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
     mov  rsp, rbp
     pop  rbp
     ret
 
 ; os_pwrite(rcx = handle, rdx = offset, r8 = buf, r9 = len)
+;   -> rax = bytes written, or -1 on error
 os_pwrite:
     push rbp
     mov  rbp, rsp
@@ -212,31 +223,48 @@ os_pwrite:
     mov  [rbp-8], rcx
     mov  [rbp-16], r8
     mov  [rbp-24], r9
+    mov  dword [rel g_io_dw], 0
     xor  r8, r8
     mov  r9d, FILE_BEGIN
     call [rel iat_SetFilePointerEx]
+    test eax, eax
+    jz   .fail                       ; seek failed - do NOT write at the old offset
     mov  rcx, [rbp-8]
     mov  rdx, [rbp-16]
     mov  r8, [rbp-24]
     lea  r9, [rel g_io_dw]
     mov  qword [rsp+0x20], 0
     call [rel iat_WriteFile]
+    test eax, eax
+    jz   .fail
     mov  eax, [rel g_io_dw]
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
     mov  rsp, rbp
     pop  rbp
     ret
 
-; os_fsync(rcx = handle)
+; os_fsync(rcx = handle) -> rax = 0 on success, -1 on failure
 os_fsync:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
     call [rel iat_FlushFileBuffers]
+    test eax, eax
+    jz   .fail
+    xor  rax, rax
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
     mov  rsp, rbp
     pop  rbp
     ret
 
 ; os_truncate(rcx = handle, rdx = size) - set the file length to `size`
+;   -> rax = 0 on success, -1 on failure
 os_truncate:
     push rbp
     mov  rbp, rsp
@@ -245,8 +273,17 @@ os_truncate:
     xor  r8, r8
     mov  r9d, FILE_BEGIN
     call [rel iat_SetFilePointerEx]  ; move pointer to `size`
+    test eax, eax
+    jz   .fail
     mov  rcx, [rbp-8]
     call [rel iat_SetEndOfFile]
+    test eax, eax
+    jz   .fail
+    xor  rax, rax
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
     mov  rsp, rbp
     pop  rbp
     ret

@@ -296,7 +296,8 @@ os_open_read:
     pop  rbp
     ret
 
-; os_pread(rcx = fd, rdx = offset, r8 = buf, r9 = len) -> rax = bytes read
+; os_pread(rcx = fd, rdx = offset, r8 = buf, r9 = len)
+;   -> rax = bytes read (0 = EOF), or -1 on error
 os_pread:
     push rbp
     mov  rbp, rsp
@@ -310,8 +311,8 @@ os_pread:
     mov  eax, SYS_pread64
     syscall
     test rax, rax
-    jns  .done
-    xor  eax, eax
+    jns  .done                       ; >= 0: byte count (0 = EOF)
+    mov  rax, -1                     ; -errno collapses to a single error code
 .done:
     mov  rdi, [rbp-16]
     mov  rsi, [rbp-8]
@@ -319,7 +320,8 @@ os_pread:
     pop  rbp
     ret
 
-; os_pwrite(rcx = fd, rdx = offset, r8 = buf, r9 = len) -> rax = bytes written
+; os_pwrite(rcx = fd, rdx = offset, r8 = buf, r9 = len)
+;   -> rax = bytes written, or -1 on error
 os_pwrite:
     push rbp
     mov  rbp, rsp
@@ -334,7 +336,7 @@ os_pwrite:
     syscall
     test rax, rax
     jns  .done
-    xor  eax, eax
+    mov  rax, -1
 .done:
     mov  rdi, [rbp-16]
     mov  rsi, [rbp-8]
@@ -342,7 +344,7 @@ os_pwrite:
     pop  rbp
     ret
 
-; os_fsync(rcx = fd)
+; os_fsync(rcx = fd) -> rax = 0 on success, -1 on failure
 os_fsync:
     push rbp
     mov  rbp, rsp
@@ -351,12 +353,20 @@ os_fsync:
     mov  rdi, rcx
     mov  eax, SYS_fsync
     syscall
+    test rax, rax
+    jns  .ok
+    mov  rax, -1
+    jmp  .done
+.ok:
+    xor  rax, rax
+.done:
     mov  rdi, [rbp-16]
     mov  rsp, rbp
     pop  rbp
     ret
 
 ; os_truncate(rcx = fd, rdx = size) - set the file length (extend or shrink)
+;   -> rax = 0 on success, -1 on failure
 os_truncate:
     push rbp
     mov  rbp, rsp
@@ -367,6 +377,13 @@ os_truncate:
     mov  rsi, rdx
     mov  eax, SYS_ftruncate
     syscall
+    test rax, rax
+    jns  .ok
+    mov  rax, -1
+    jmp  .done
+.ok:
+    xor  rax, rax
+.done:
     mov  rdi, [rbp-16]
     mov  rsi, [rbp-8]
     mov  rsp, rbp

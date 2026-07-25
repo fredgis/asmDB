@@ -36,20 +36,41 @@ wal_open:
     call os_exit
 
 ; wal_write(rcx = offset, rdx = buf, r8 = len)
+;   Loops over short writes. A WAL we failed to write in full is not a WAL we
+;   can commit from, so any failure aborts instead of returning quietly.
 wal_write:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x30
-    mov  r9, r8                      ; len
-    mov  r8, rdx                     ; buf
-    mov  rdx, rcx                    ; offset
-    mov  rcx, [rel g_wal_handle]     ; handle
+    sub  rsp, 0x50
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    mov  [rbp-32], r12
+    mov  rsi, rcx                    ; offset
+    mov  rdi, rdx                    ; buf
+    mov  r12, r8                     ; remaining
+.loop:
+    test r12, r12
+    jz   .done
+    mov  rcx, [rel g_wal_handle]
+    mov  rdx, rsi                    ; offset
+    mov  r8, rdi                     ; buf
+    mov  r9, r12                     ; len
     call os_pwrite
+    cmp  rax, 0
+    jle  io_fatal                    ; error or no progress
+    add  rsi, rax
+    add  rdi, rax
+    sub  r12, rax
+    jmp  .loop
+.done:
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
     mov  rsp, rbp
     pop  rbp
     ret
 
-; wal_read(rcx = offset, rdx = buf, r8 = len) -> rax = bytes read
+; wal_read(rcx = offset, rdx = buf, r8 = len) -> rax = bytes read, or -1
 wal_read:
     push rbp
     mov  rbp, rsp
@@ -63,13 +84,15 @@ wal_read:
     pop  rbp
     ret
 
-; wal_flush()
+; wal_flush() - fsync the WAL; aborts on failure
 wal_flush:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
     mov  rcx, [rel g_wal_handle]
     call os_fsync
+    test rax, rax
+    jnz  io_fatal
     mov  rsp, rbp
     pop  rbp
     ret
@@ -82,6 +105,8 @@ wal_truncate:
     mov  rcx, [rel g_wal_handle]
     xor  rdx, rdx
     call os_truncate
+    test rax, rax
+    jnz  io_fatal
     call wal_flush
     mov  rsp, rbp
     pop  rbp
@@ -101,6 +126,8 @@ wal_recover:
     mov  rdx, [rel g_walbuf]
     mov  r8, WAL_BUF_SIZE
     call wal_read                    ; rax = bytes read
+    test rax, rax
+    js   .clear                      ; unreadable WAL -> discard it
     mov  r12, rax                    ; bytes available
     cmp  r12, 24
     jb   .clear
@@ -124,6 +151,30 @@ wal_recover:
     add  rdx, rdi
     cmp  rax, [rdx]                  ; verify commit marker
     jne  .clear
+    ; every slot index must address a real slot. A corrupt frame could otherwise
+    ; make the redo below write REC_SIZE bytes at an arbitrary file offset,
+    ; growing the .dat past its region (and the redo aborts the process on the
+    ; failures that produces). Validate the whole frame before touching disk.
+    xor  r12, r12
+.chk:
+    cmp  r12, rsi
+    jae  .chk_done
+    mov  rax, r12
+    imul rax, rax, UNDO_ENTRY
+    add  rax, 24
+    add  rax, rbx                    ; entry ptr
+    mov  rdx, [rax]                  ; slot index
+    mov  rcx, CAPACITY
+    cmp  rdx, rcx
+    jae  .clear                      ; out of range -> discard the whole frame
+    inc  r12
+    jmp  .chk
+.chk_done:
+    ; also require the live count to be inside the table
+    mov  rax, [rbx+16]
+    mov  rcx, CAPACITY
+    cmp  rax, rcx
+    ja   .clear
     ; committed: apply after-images to asmdb.dat
     xor  r12, r12                    ; i
 .apply:
@@ -140,6 +191,8 @@ wal_recover:
     add  rcx, HDR_SIZE               ; file offset
     mov  r8, REC_SIZE
     call write_at
+    cmp  rax, REC_SIZE
+    jne  io_fatal                    ; recovery must be complete or not at all
     inc  r12
     jmp  .apply
 .apply_done:
@@ -170,6 +223,15 @@ wal_close:
 
 ; txn_capture(rcx = slot ptr) -> rax = 1 ok / 0 overflow
 ; Records the slot's current image in the undo log (no-op outside a txn).
+;
+; A slot is captured AT MOST ONCE per transaction. Re-capturing on every write
+; meant that updating one row N times burned N undo entries, produced N
+; identical after-images at COMMIT, and hit the UNDO_MAX ceiling after 4096
+; writes even when only a handful of distinct rows were touched. Keeping the
+; FIRST before-image is also what makes ROLLBACK restore the original row
+; rather than an intermediate value. A linear scan is enough: the log holds at
+; most UNDO_MAX entries and a transaction touching that many distinct rows is
+; already at its documented limit.
 txn_capture:
     push rbp
     mov  rbp, rsp
@@ -179,15 +241,26 @@ txn_capture:
     mov  [rbp-24], rdi
     cmp  qword [rel g_in_txn], 0
     je   .ok
+    mov  [rbp-32], rcx               ; slot ptr
+    call store_slot_index            ; rax = index (rcx = slot ptr)
+    mov  [rbp-40], rax               ; slot index
+    ; already captured in this transaction? then keep the existing image
+    mov  rbx, [rel g_undo]
+    xor  rsi, rsi
+.scan:
+    cmp  rsi, [rel g_undo_n]
+    jae  .append
+    cmp  [rbx], rax
+    je   .ok                         ; first before-image wins
+    add  rbx, UNDO_ENTRY
+    inc  rsi
+    jmp  .scan
+.append:
+    ; rbx now points at entry [g_undo_n]
     mov  rax, [rel g_undo_n]
     cmp  rax, UNDO_MAX
     jae  .overflow
-    mov  [rbp-32], rcx               ; slot ptr
-    mov  rbx, rax
-    imul rbx, rbx, UNDO_ENTRY
-    add  rbx, [rel g_undo]           ; entry ptr
-    mov  rcx, [rbp-32]
-    call store_slot_index            ; rax = index
+    mov  rax, [rbp-40]
     mov  [rbx], rax
     mov  rsi, [rbp-32]
     lea  rdi, [rbx+8]
@@ -313,6 +386,9 @@ cmd_commit:
     mov  rdx, rsi
     mov  r8, REC_SIZE
     call write_at
+    cmp  rax, REC_SIZE
+    jne  io_fatal                    ; the WAL is committed; the checkpoint must
+                                     ; not silently half-apply
     inc  r12
     jmp  .apply
 .applied:

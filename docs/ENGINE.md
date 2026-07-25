@@ -326,8 +326,10 @@ Two files per database, named from the DB base name: `<db>.dat` and `<db>.wal`.
 
 ```
 [ 512-byte header ]
-  +0    5   magic      "ASMDB"
-  ...       version / rec_size fields
+  +0    8   magic      "ASMDB\0\0\0"
+  +8    4   version    u32   DB_VERSION
+  +12   4   rec_size   u32   REC_SIZE (256)
+  +16   8   capacity   u64   CAPACITY (2^22)
   +24   8   count      u64   live record count
   +32   48  table      char[48]  logical table name (NUL-padded)
   ...       reserved (padding to 512)
@@ -347,6 +349,25 @@ Unwritten slots read back as zero and cost nothing on disk, so an empty database
 occupies a few kilobytes while still presenting the whole slot region to
 `ReadFile`. Individual `WriteFile`s (autocommit, `COMMIT`, `BENCH` checkpoint)
 lazily materialise only the slots they touch.
+
+#### Open-time validation
+
+Only a **0-byte** file is treated as a new database. Anything else must pass
+every check below, because silently "recreating" a file we failed to parse would
+destroy real data:
+
+| Condition | Outcome |
+|---|---|
+| file is 0 bytes | create a new database (sparse, header written) |
+| 1 .. 511 bytes | `[ERR] database file is incomplete or corrupt` — a partially written header |
+| magic ≠ `ASMDB\0\0\0` (all 8 bytes) | `[ERR] … incomplete or corrupt` |
+| `version`, `rec_size` or `capacity` ≠ this build | `[ERR] incompatible database format` |
+| `count > CAPACITY` | `[ERR] … incomplete or corrupt` |
+| slot region shorter than `CAPACITY*256` | `[ERR] … incomplete or corrupt` |
+
+Each of these exits with status 1 **without writing a byte**. The WAL is only
+opened and replayed *after* the header has been validated, so a corrupt `.dat`
+is never mutated by recovery.
 
 ### 6.2 `<db>.wal` — write-ahead log
 
@@ -382,8 +403,38 @@ snapshots the live `count`. While a transaction is open, every mutation:
    `ROLLBACK` can restore it. The undo log holds up to `UNDO_MAX = 4096`
    touched slots.
 
+`txn_capture` captures a slot **at most once per transaction**: it scans the
+existing entries for the slot index first and keeps the *first* pre-image it
+recorded. Three consequences follow, and all three matter:
+
+- the 4096-entry ceiling limits **distinct rows touched**, not statements
+  issued — a loop that rewrites one row a million times uses one entry;
+- `ROLLBACK` restores the row's **original** image rather than an intermediate
+  one;
+- `COMMIT` stages exactly one after-image per row, so the WAL frame stays
+  proportional to the working set instead of the write count.
+
+```asm
+; txn_capture(rcx = slot ptr) - dedup by slot index, keep the first image
+    call store_slot_index            ; rax = index of this slot
+    mov  rbx, [rel g_undo]
+    xor  rsi, rsi
+.scan:
+    cmp  rsi, [rel g_undo_n]
+    jae  .append
+    cmp  [rbx], rax                  ; already captured in this txn?
+    je   .ok                         ; yes - first pre-image wins
+    add  rbx, UNDO_ENTRY
+    inc  rsi
+    jmp  .scan
+```
+
 Mutations issued **outside** `BEGIN…COMMIT` are autocommitted — each is its own
 implicit single-statement transaction that writes through to `<db>.dat`.
+
+`BACKUP`, `RESTORE` and `BENCH` are refused while a transaction is open: each
+rewrites or replaces the whole table, which would strand the undo log against
+slots that no longer hold the rows it captured.
 
 ### 7.2 Commit protocol (two-phase flush)
 
@@ -426,16 +477,26 @@ written and flushed **only after** the data is already durable in the log:
 
 ### 7.3 Crash recovery
 
-`wal_recover` runs in `db_open`, after both files are open and *before* the
-table is read in:
+`wal_recover` runs in `db_open` — **after** the `.dat` header has been validated
+(§6.1), so a corrupt data file is never mutated by recovery — and *before* the
+table is read into RAM:
 
-1. Read the WAL frame. If it is shorter than the 24-byte header, or the magic
-   mismatches, or `N > UNDO_MAX`, or the `'COMMIT01'` marker is missing at
-   `24 + N*264` → **discard** (truncate) the WAL. An incomplete transaction
-   simply never existed.
-2. Otherwise the frame is committed: **redo** every after-image into
+1. Read the WAL frame. If it is unreadable, shorter than the 24-byte header, or
+   the magic mismatches, or `N > UNDO_MAX`, or the `'COMMIT01'` marker is
+   missing at `24 + N*264` → **discard** (truncate) the WAL. An incomplete
+   transaction simply never existed.
+2. Validate the frame's *contents* before touching disk: every entry's slot
+   index must be `< CAPACITY` and the stored `count` must be `<= CAPACITY`.
+   Otherwise redo would write a 256-byte record at an arbitrary file offset and
+   grow the `.dat` past its region, so the whole frame is discarded instead.
+3. Otherwise the frame is committed: **redo** every after-image into
    `<db>.dat`, publish the stored `count` into the header, flush, and truncate
-   the WAL.
+   the WAL. Every redo write is checked; a failure aborts (§7.5) rather than
+   leaving the checkpoint half-applied.
+
+Both open paths then read the slot region into RAM — including the path that
+*created* the `.dat`, because a committed WAL can predate the data file and its
+replayed rows must land in memory as well as on disk.
 
 The result is **atomicity** (all-or-nothing per transaction), **durability**
 (flush before acknowledging), and clean crash recovery with idempotent redo.
@@ -446,6 +507,40 @@ The result is **atomicity** (all-or-nothing per transaction), **durability**
 slot, restores the snapshotted `count`, truncates the WAL, and clears the
 transaction flag. Nothing durable was written, so there is nothing to undo on
 disk.
+
+### 7.5 I/O error propagation
+
+Durability is only as good as the error checking underneath it, so every layer
+reports failure explicitly rather than returning a plausible-looking number.
+
+| Layer | Contract |
+|---|---|
+| `os_pread` / `os_pwrite` | bytes transferred, or **`-1`** on error. On Windows both the `SetFilePointerEx` seek *and* the `ReadFile`/`WriteFile` are checked, and the byte counter is zeroed first so a failed call can never return a stale count. On Linux a negative `-errno` collapses to `-1`, which keeps it distinct from a `0` that means EOF. |
+| `os_fsync` / `os_truncate` | **`0`** on success, **`-1`** on failure. |
+| `read_at` | total bytes read, or `-1`. A short read means "the file really is that short" and is reported as such — callers compare against the length they asked for. |
+| `write_at` | total bytes written, or `-1`. An error **or a zero-byte write** (no forward progress, e.g. a full disk) is a failure: a partial write is never reported as success. |
+| `wal_write` | loops over short writes; any failure aborts. |
+
+On a durable path — `db_write_slot`, `db_write_header`, `db_flush`, the WAL
+writes and flushes, the `COMMIT` checkpoint, WAL redo, and the `BENCH`
+checkpoint — a failure calls `io_fatal`, which prints
+
+```
+[ERR] I/O failure on a durable write - aborting to avoid an inconsistent database
+```
+
+and exits with status 1. This is deliberate: once a durable write has failed,
+RAM and disk may disagree, and continuing to serve `[ OK ]` replies over a
+database we can no longer vouch for is worse than stopping. The engine **never
+prints `[ OK ] ` after a failed write.**
+
+`BACKUP` is the one exception that reports without aborting — it writes to a
+*separate* file and leaves the live database untouched, so a failure there is
+just `[ERR] backup failed - write error, file is incomplete`. `RESTORE`
+validates the snapshot completely (magic, format fields, count, and a probe for
+the **last byte** of the record region) *before* overwriting a single byte of
+the live table, so a truncated or foreign snapshot leaves both RAM and disk
+exactly as they were.
 
 ---
 
@@ -693,12 +788,12 @@ the hosted [SaaS layer](SAAS.md) rather than the single-node engine.
 | 1 | **Atomicity** | ✅ | `BEGIN`/`COMMIT`/`ROLLBACK` + undo log (§7) |
 | 2 | **Consistency** | ✅ | unique primary key, fixed-width typed columns (§4, §10), and `CHECK`-style domain validation (`id ≥ 1` reserved-key rule + bounded field lengths) enforced at write |
 | 3 | **Isolation** | ✅ | serial (serializable) execution — a single writer holds the DB exclusively, so no dirty / non-repeatable / phantom reads are possible; MVCC for concurrent readers is a throughput optimization on the roadmap |
-| 4 | **Durability** | ✅ | WAL + `FlushFileBuffers` (§6, §7) |
-| 5 | **Crash recovery** | ✅ | idempotent WAL redo with commit marker (§7); CRC32 frames → v1.0 |
+| 4 | **Durability** | ✅ | WAL + `FlushFileBuffers` (§6, §7); every durable write and flush is checked, and a failure aborts instead of acknowledging (§7.5) |
+| 5 | **Crash recovery** | ✅ | idempotent WAL redo with commit marker (§7); open-time header validation refuses a truncated/foreign/incompatible `.dat` instead of silently recreating it (§6.1); CRC32 frames → v1.0 |
 | 6 | **Concurrency control** | ✅ | exclusive database lock (single-writer): a second engine opening the same file is refused with a clear "locked" message; group commit / finer-grained locking → roadmap |
 | 7 | **Indexing & access paths** | ✅ | O(1) primary hash index (§5) plus full-scan (`SELECT *`), substring (`FIND`) and value-range (`RANGE`) access paths; index-accelerated secondary columns → v1.5 |
 | 8 | **Query & access interface** | ✅ | REPL grammar (§9), MCP CRUD tools (§11), Python/C#/C clients |
-| 9 | **Backup & restore / PITR** | ✅ | in-engine `BACKUP`/`RESTORE` snapshot commands (§9); WAL shipping + point-in-time recovery → [SaaS layer](SAAS.md) |
+| 9 | **Backup & restore / PITR** | ✅ | in-engine `BACKUP`/`RESTORE` snapshot commands (§9), with the snapshot fully validated before any live data is overwritten (§7.5); WAL shipping + point-in-time recovery → [SaaS layer](SAAS.md) |
 | 10 | **Security & observability** | 🗺️ | authz, encryption, audit, metrics → [SaaS layer](SAAS.md) (engine stays single-node) |
 
 The engine now delivers **nine of the ten** principles single-node: the full

@@ -40,11 +40,13 @@ strcpy_n:
 .d:
     ret
 
-; read_at(rcx = offset, rdx = buf, r8 = len) -> rax = total bytes read
-;   Loops over os_pread until the whole range is read or EOF/short-read stops
-;   it. A single ReadFile/pread is NOT guaranteed to transfer a large request
-;   in one call (the 1 GiB slot region routinely comes back short), so relying
-;   on one call silently dropped records whose hash slot lived past the prefix.
+; read_at(rcx = offset, rdx = buf, r8 = len) -> rax = total bytes read, or -1
+;   Loops over os_pread until the whole range is read or EOF stops it. A single
+;   ReadFile/pread is NOT guaranteed to transfer a large request in one call
+;   (the 1 GiB slot region routinely comes back short), so relying on one call
+;   silently dropped records whose hash slot lived past the prefix.
+;   A hard I/O error returns -1 so callers can tell it apart from a short read
+;   caused by a genuinely truncated file.
 read_at:
     push rbp
     mov  rbp, rsp
@@ -66,12 +68,15 @@ read_at:
     mov  r9, r12                     ; len
     call os_pread
     test rax, rax
-    jz   .done                       ; EOF or error - stop
+    js   .fail                       ; hard I/O error
+    jz   .done                       ; EOF - report the short count
     add  rbx, rax
     add  rsi, rax
     add  rdi, rax
     sub  r12, rax
     jmp  .loop
+.fail:
+    mov  rbx, -1
 .done:
     mov  rax, rbx
     mov  r12, [rbp-32]
@@ -82,8 +87,10 @@ read_at:
     pop  rbp
     ret
 
-; write_at(rcx = offset, rdx = buf, r8 = len) -> rax = total bytes written
-;   Loops over os_pwrite for the same short-transfer reason as read_at.
+; write_at(rcx = offset, rdx = buf, r8 = len) -> rax = total bytes written, or -1
+;   Loops over os_pwrite for the same short-transfer reason as read_at. An error
+;   OR a zero-byte write (no forward progress, e.g. a full disk) returns -1: a
+;   partial write must never be reported as success.
 write_at:
     push rbp
     mov  rbp, rsp
@@ -104,13 +111,15 @@ write_at:
     mov  r8, rdi                     ; buf
     mov  r9, r12                     ; len
     call os_pwrite
-    test rax, rax
-    jz   .done                       ; error - stop
+    cmp  rax, 0
+    jle  .fail                       ; error, or no progress -> short write
     add  rbx, rax
     add  rsi, rax
     add  rdi, rax
     sub  r12, rax
     jmp  .loop
+.fail:
+    mov  rbx, -1
 .done:
     mov  rax, rbx
     mov  r12, [rbp-32]
@@ -121,13 +130,31 @@ write_at:
     pop  rbp
     ret
 
-; db_flush()
+; io_fatal() - a durable write failed. Memory and disk may now disagree, so the
+;   only safe action is to report it loudly and stop, rather than keep printing
+;   [ OK ] over a database we can no longer guarantee. Never returns.
+;
+;   Reached by `jcc`/`jmp`, never by `call`, so the incoming rsp is NOT at the
+;   usual post-call alignment. Normalize it explicitly before calling anything:
+;   `and rsp,-16` then a 32-byte shadow area leaves rsp 16-byte aligned at the
+;   call, as the Win64 ABI requires. (Nothing needs the old stack: we exit.)
+io_fatal:
+    and  rsp, -16
+    sub  rsp, 0x20
+    lea  rcx, [rel s_err_io]
+    call puts
+    mov  ecx, 1
+    call os_exit
+
+; db_flush() - fsync the data file; aborts if the flush fails
 db_flush:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
     mov  rcx, [rel g_dat_handle]
     call os_fsync
+    test rax, rax
+    jnz  io_fatal
     mov  rsp, rbp
     pop  rbp
     ret
@@ -149,6 +176,8 @@ db_write_header:
     lea  rdx, [rel g_hdr]
     mov  r8, HDR_SIZE
     call write_at
+    cmp  rax, HDR_SIZE
+    jne  io_fatal
     mov  rdi, [rbp-16]
     mov  rsi, [rbp-8]
     mov  rsp, rbp
@@ -168,6 +197,8 @@ db_write_slot:
     mov  rdx, [rbp-8]
     mov  r8, REC_SIZE
     call write_at
+    cmp  rax, REC_SIZE
+    jne  io_fatal
     mov  rsp, rbp
     pop  rbp
     ret
@@ -300,7 +331,19 @@ db_init_names:
     pop  rbp
     ret
 
-; db_open() - open/create g_datname; load header + slots, or initialize a new file
+; db_open() - open g_datname and load it, or initialize a genuinely new file.
+;
+; Classification is strict, because silently "recreating" a database whose
+; header we failed to understand destroys real data:
+;   0 bytes                      -> brand-new database (create)
+;   1 .. HDR_SIZE-1 bytes        -> partially written header  -> refuse
+;   bad magic                    -> not an asmdb file         -> refuse
+;   version/REC_SIZE/CAPACITY    -> incompatible build        -> refuse
+;   count > CAPACITY             -> corrupt header            -> refuse
+;   slot region shorter than     -> truncated data region     -> refuse
+;   CAPACITY*REC_SIZE
+; The WAL is only opened and replayed once the header is known good, so a
+; corrupt .dat is never written to.
 db_open:
     push rbp
     mov  rbp, rsp
@@ -310,29 +353,33 @@ db_open:
     mov  [rel g_dat_handle], rax
     cmp  rax, INVALID_HANDLE
     je   .openfail
-    call wal_open
-    call wal_recover
-    ; read the header
+    ; ---- read and classify the header ----
     xor  rcx, rcx
     lea  rdx, [rel g_hdr_read]
     mov  r8, HDR_SIZE
     call read_at
+    test rax, rax
+    js   io_fatal                    ; hard I/O error
+    jz   .newfile                    ; empty file -> a genuinely new database
     cmp  rax, HDR_SIZE
-    jb   .newfile
-    ; validate magic (5 bytes)
-    lea  rsi, [rel g_hdr_read]
-    lea  rdi, [rel s_magic]
-    mov  rcx, 5
-.magic:
-    mov  al, [rsi]
-    cmp  al, [rdi]
-    jne  .newfile
-    inc  rsi
-    inc  rdi
-    dec  rcx
-    jnz  .magic
-    ; load count and slot region
+    jb   .corrupt                    ; non-empty but incomplete header
+    ; magic: compare all 8 bytes against the in-memory header template
+    mov  rax, [rel g_hdr]
+    cmp  rax, [rel g_hdr_read]
+    jne  .corrupt
+    ; on-disk layout must match this build exactly
+    cmp  dword [rel g_hdr_read+8], DB_VERSION
+    jne  .format
+    cmp  dword [rel g_hdr_read+12], REC_SIZE
+    jne  .format
+    mov  rax, CAPACITY
+    cmp  [rel g_hdr_read+16], rax
+    jne  .format
+    ; live count must be inside the table
     mov  rax, [rel g_hdr_read+24]
+    mov  rdx, CAPACITY
+    cmp  rax, rdx
+    ja   .corrupt
     mov  [rel g_count], rax
     ; resolve table name: CLI arg overrides, else header, else base
     cmp  dword [rel g_have_argtable], 0
@@ -355,11 +402,10 @@ db_open:
     call db_write_header
     call db_flush
 .name_done:
-    mov  rcx, HDR_SIZE
-    mov  rdx, [rel g_table]
-    mov  r8, CAPACITY*REC_SIZE
-    call read_at
-    jmp  .done
+    ; header is trustworthy: now replay a committed WAL, then load the slots
+    call wal_open
+    call wal_recover
+    jmp  .load
 .newfile:
     ; brand-new file: mark it sparse so unwritten slots cost no disk, then set
     ; the logical size to the full region without allocating/zeroing 1 GiB.
@@ -381,11 +427,39 @@ db_open:
     mov  rcx, [rel g_dat_handle]
     mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
     call os_truncate
+    test rax, rax
+    jnz  io_fatal
     call db_flush
+    call wal_open
+    call wal_recover                 ; a committed WAL may predate this file
+.load:
+    ; Both paths load the slot region here. The new-file path must do it too:
+    ; wal_recover writes recovered rows to the .dat and publishes their count,
+    ; but it does not populate g_table, so skipping this read would leave the
+    ; in-memory table empty while the header claimed rows existed.
+    mov  rcx, HDR_SIZE
+    mov  rdx, [rel g_table]
+    mov  r8, CAPACITY*REC_SIZE
+    call read_at
+    test rax, rax
+    js   io_fatal
+    mov  rdx, CAPACITY*REC_SIZE
+    cmp  rax, rdx
+    jb   .corrupt                    ; data region truncated
 .done:
     mov  rsp, rbp
     pop  rbp
     ret
+.corrupt:
+    lea  rcx, [rel s_err_corrupt]
+    call puts
+    mov  ecx, 1
+    call os_exit
+.format:
+    lea  rcx, [rel s_err_format]
+    call puts
+    mov  ecx, 1
+    call os_exit
 .openfail:
     cmp  qword [rel g_open_locked], 0
     je   .openfail_generic
