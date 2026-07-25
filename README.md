@@ -716,13 +716,20 @@ Two documents, deliberately kept in separate lanes:
 | Area | Status |
 |---|---|
 | **CRUD + transactions** | ✅ `INSERT`/`SELECT`/`UPDATE`/`DELETE`/`TRUNCATE`/`COUNT`, `BEGIN`/`COMMIT`/`ROLLBACK`, `FIND`, `RANGE` |
-| **Durability** | ✅ WAL with two-phase flush, **CRC-32 per frame**, idempotent crash recovery |
-| **Safety** | ✅ every read/write/flush checked; a failed durable write aborts instead of acknowledging; a corrupt or foreign `.dat` is refused, never silently recreated |
+| **Durability** | ✅ WAL with two-phase flush, **CRC-32 per frame**, idempotent crash recovery; the log carries the database lineage, so a stray `.wal` is refused rather than replayed |
+| **Whole-table operations** | ✅ `TRUNCATE`/`RESTORE`/`BENCH` are announced in the header before they start, so an interrupted one is finished on the next open |
+| **Change data capture** | ✅ `<db>.cdc`: one durable frame per committed transaction, dense sequences, `RESET` for global operations, and `CDCTRIM` for retention |
+| **Concurrency** | ✅ one writer plus **unlimited `--reader` sessions**, each command isolated by the commit-sequence fence |
+| **Integrity** | ✅ `VERIFY` re-checks the store's own invariants — status bytes, reserved keys, content lengths, probe reachability, duplicate keys, row count |
+| **Safety** | ✅ every read/write/flush checked; a failed durable write aborts instead of acknowledging; a corrupt or foreign `.dat` is refused, never silently recreated; `BACKUP` refuses to target a live file |
 | **Startup & memory** | ✅ the store is **mapped copy-on-write**: opening a database is ~80 ms whatever its size (was ~600 ms), and a 1 M-row database peaks at **~5 MB** of RAM (was ~1 029 MB) |
+| **Snapshots** | ✅ written a chunk at a time with empty chunks left as holes — a three-row backup allocates 3.2 MiB, not 1 GiB |
+| **Machine interface** | ✅ `FORMAT TSV` + `PAGE` — full-fidelity rows, never truncated, for clients that must not parse a picture |
 | **Portability** | ✅ Windows PE64 + Linux ELF64 from one source, behind a thin `os_*` layer |
 | **Integration** | ✅ MCP server (generic CRUD tools) + Python / C# / C stdio clients |
+| **Security** | ⚠️ no auth, no encryption, no audit log; the binary is a single RWX image at a fixed address — see [`SECURITY.md`](SECURITY.md) |
 | **Tests** | ✅ 151 checks on Windows and the same battery on Linux, plus 24 for the MCP server — fault-injected I/O failures, crash windows, format fuzzing |
-| **Next up** | 🔜 **persisted status directory** (see below), then incremental checkpoint, secondary indexes, SIMD scans |
+| **Next up** | 🔜 **persisted status directory** (see below), then secondary indexes, SIMD scans, and multi-writer MVCC |
 
 **The roadmap is driven by measurement, not intuition.** The last milestone came
 from noticing that opening a database cost **~600 ms regardless of its
