@@ -560,22 +560,48 @@ shipping; premium = ≤5 s RPO + warm replica (§10).
 
 ## 14. Pricing & packaging
 
-Consumption-based, with tiers layered on the same per-instance engine:
+Three tiers ship today, priced from Azure list rates at **15 % margin on run**.
+The derivation — every rate, every assumption, and what would break the model —
+is in [`COST.md`](COST.md).
 
-| Tier | Isolation | Compute | Durability/HA | Price model |
-|------|-----------|---------|---------------|-------------|
-| **Free** | container, scale-to-zero | hibernated when idle | daily snapshot | $0 up to small ops/storage cap |
-| **Standard** | container | scale-to-zero + burst | ≤60 s RPO WAL shipping | pay-as-you-go: per-1M ops + vCPU-s + GB-month |
-| **Premium** | container | reserved / always-warm | read replica, ≤5 s RPO | usage + reserved capacity |
-| **Enterprise** | Firecracker micro-VM, dedicated nodes | reserved | warm standby, residency, SSO, audit export | annual contract + usage |
+| Tier | Price | Size | Behaviour | Cap |
+|---|---|---|---|---|
+| **Free** | $0 | 0.25 vCPU / 0.5 GiB | sleeps when idle | 3 per account |
+| **Standard** | $15/mo | 0.5 vCPU / 1 GiB | sleeps when idle | 20 per account |
+| **Premium** | $49/mo | 1 vCPU / 2 GiB | always warm, no cold start | 100 per account |
 
-**Cost narrative.** A fixed 256-byte record + one hash probe + one WAL append
-per op means **predictable, low unit cost**, and scale-to-zero means idle
-databases are nearly free — so pay-as-you-go can undercut always-on managed
-Postgres/Redis for small transactional workloads while keeping margin. Ground
-any latency/throughput marketing in the honest
-[README benchmark](../README.md#performance) numbers; don't over-promise the
-bulk-durable path until incremental checkpoint (engine v1.0) lands.
+Every tier runs the identical engine, with the same 4 194 304-row ceiling and
+the same durability. Tiers buy **latency and headroom, not features** — there is
+no paid feature flag in the codebase and there is not meant to be one.
+
+The sizes are not free choices. Container Apps Consumption accepts only fixed
+vCPU/memory pairs at a 1:2 ratio and **0.25 vCPU / 0.5 GiB is the floor**, so
+there is nothing smaller to sell; the only lever below it is not running, which
+is what scale-to-zero does.
+
+`Premium` costs 3.6× `Standard` for 2× the CPU because it never scales to zero.
+About $21/month of its cost is a replica sitting idle so the first request does
+not wait. That is the product.
+
+Two economics worth stating plainly:
+
+- **The free tier is not free to run.** About $1.08/month each, funded by the
+  paying tiers. The three-instance cap is a pricing control, not a technical
+  limit.
+- **This is a volume model.** Fixed platform cost is ~$161/month regardless of
+  customers, so it stops dominating at roughly **150 databases**. Below that the
+  standard tier loses money.
+
+### Later tiers, not yet built
+
+| Tier | Isolation | Durability/HA | Price model |
+|---|---|---|---|
+| **Premium+** | container, read replica | ≤5 s RPO | usage + reserved capacity |
+| **Enterprise** | Firecracker micro-VM, dedicated nodes | warm standby, residency, SSO, audit export | annual contract + usage |
+
+Ground any latency or throughput claim in the measured
+[README benchmark](../README.md#performance) numbers, and don't promise the
+bulk-durable path until incremental checkpointing lands.
 
 ---
 

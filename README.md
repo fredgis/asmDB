@@ -99,18 +99,25 @@ A [`FIND`](docs/COMMANDS.md#find) or
 asmdb Cloud is the same engine run as a managed service, with **asmdb.cloud** as
 the intended public domain. You create a database and get a real isolated asmdb
 instance, reachable through the REST data API, an MCP endpoint for AI agents and
-a CLI. The free, standard and premium tiers are planned to buy latency and
-headroom, not features, because every tier runs the identical engine.
+a CLI. Every tier runs the identical engine, so tiers buy latency and headroom,
+not features.
 
 <p align="center">
   <img src="docs/assets/asmdb-cloud-home.png" alt="asmdb Cloud homepage" width="90%">
 </p>
 
-The service is not generally available yet, and pricing is not set; the site
-intentionally says "pricing at GA". The full design is in
-[`docs/SAAS.md`](docs/SAAS.md): provisioning, instance isolation, the
-HTTP/MCP/CLI access layer, metering, backups, security boundaries, operations
-and the rollout plan.
+| Tier | Price | Size | Behaviour |
+|---|---|---|---|
+| Free | $0 | 0.25 vCPU / 0.5 GiB | sleeps when idle, 3 per account |
+| Standard | $15/mo | 0.5 vCPU / 1 GiB | sleeps when idle |
+| Premium | $49/mo | 1 vCPU / 2 GiB | always warm, no cold start |
+
+The service is not generally available yet. Prices are derived in
+[`docs/COST.md`](docs/COST.md) from Azure list rates at 15 % margin on run,
+with the assumptions and the ways the model breaks written down beside them.
+The full design is in [`docs/SAAS.md`](docs/SAAS.md): provisioning, instance
+isolation, the HTTP/MCP/CLI access layer, metering, backups, security
+boundaries, operations and the rollout plan.
 
 ## Table of contents
 

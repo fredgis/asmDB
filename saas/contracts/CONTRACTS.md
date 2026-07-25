@@ -219,13 +219,22 @@ Every non-2xx from either plane:
 
 ## 6. Tiers
 
-Capabilities are real. **Prices are not set** — the site says "pricing at GA".
+Capabilities are real. Prices are derived in [`docs/COST.md`](../../docs/COST.md)
+from Azure list rates, at **15 % margin on run**.
 
-| tier | CPU | memory | scale-to-zero | max instances / account |
-|---|---|---|---|---|
-| `free` | 0.25 | 0.5Gi | yes (idle 5 min) | 3 |
-| `standard` | 0.5 | 1Gi | yes (idle 30 min) | 20 |
-| `premium` | 1.0 | 2Gi | no (always warm) | 100 |
+| tier | price | CPU | memory | scale-to-zero | max instances / account |
+|---|---|---|---|---|---|
+| `free` | $0 | 0.25 | 0.5Gi | yes (idle 5 min) | 3 |
+| `standard` | $15/mo | 0.5 | 1Gi | yes (idle 30 min) | 20 |
+| `premium` | $49/mo | 1.0 | 2Gi | no (always warm) | 100 |
+
+The sizes are not free choices: Container Apps Consumption accepts only fixed
+vCPU/memory pairs at a 1:2 ratio, and **0.25 / 0.5Gi is the floor** — there is
+nothing smaller to sell.
+
+The three-instance cap on `free` is a **pricing control**, not a technical
+limit: a free database still costs about $1.08/month to run and is funded by the
+paying tiers.
 
 Every tier gets the same engine, the same 4 194 304-row ceiling, the same
 durability. Tiers buy **latency and headroom**, not features.
