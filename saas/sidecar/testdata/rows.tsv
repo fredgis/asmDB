@@ -1,0 +1,5 @@
+R	2	7	1785004851547	1785004851547	utf	café
+R	1	-5	1785004851543	1785004851543	tag	hello world
+R	3	8	1785004851551	1785004851551	esc	a\tline\nnext
+[ OK ] 3 row(s)
+[ERR] key not found

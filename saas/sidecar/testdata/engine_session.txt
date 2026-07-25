@@ -1,0 +1,22 @@
+    ____
+    ____ __________ ___  ____/ / /_
+   / __ `/ ___/ __ `__ \/ __  / __ \
+  / /_/ (__  ) / / / / / /_/ / /_/ /
+  \__,_/____/_/ /_/ /_/\__,_/_.___/
+
+  a minimalist transactional database engine, in x86-64 assembly
+  nasm -f bin  .  no linker  .  no CRT  .  WAL-durable  .  Windows + Linux  .  v1.5.0
+
+  type HELP for commands, or QUIT to exit
+
+asmdb> [ OK ] format tsv
+asmdb> [ OK ] 1 row inserted
+asmdb> [ OK ] 1 row inserted
+asmdb> [ OK ] 1 row inserted
+asmdb> R	2	7	1785004851547	1785004851547	utf	café
+R	1	-5	1785004851543	1785004851543	tag	hello world
+R	3	8	1785004851551	1785004851551	esc	a\tline
+[ OK ] 3 row(s)
+asmdb> [ OK ] 3 row(s)
+asmdb> [ERR] key not found
+asmdb>

@@ -1,0 +1,24 @@
+# The ACR build context is the repository root, because the instance image has
+# to assemble the engine from src/. Everything that is not needed for that or
+# for the Go builds is excluded — a 1 GiB sparse .dat uploaded by accident would
+# turn a 20-second build into a very long one.
+
+.git
+.github
+.hallmark
+build/
+poc/
+examples/
+tests/
+clients/
+mcp/node_modules
+docs/assets
+site/assets/*.png
+*.dat
+*.wal
+*.cdc
+*.bak
+*.part
+*.exe
+*.pdb
+*.log

@@ -1,0 +1,81 @@
+/* Hallmark · macrostructure: Stat-Led · tone: technical/austere · anchor hue: cyan→violet
+ * theme: custom (vibe: "assembly-grade, dark, instrument-panel precision"
+ *        paper oklch(13% 0.028 265) · accent oklch(82% 0.145 205) cool
+ *        display Space Grotesk + body Inter + mono JetBrains Mono)
+ * axes: paper-band=dark · display-style=grotesk-sans · accent-hue=cool
+ * nav: N8 terminal-command · footer: Ft4 dense-typographic
+ * pre-emit critique: P5 H5 E5 S5 R4 V5
+ */
+
+:root {
+  /* ---- paper & ink ------------------------------------------------------ */
+  --color-paper:      oklch(13% 0.028 265);
+  --color-paper-2:    oklch(16.5% 0.032 265);
+  --color-paper-3:    oklch(21% 0.038 265);
+  --color-paper-4:    oklch(26% 0.042 265);
+  --color-ink:        oklch(96% 0.008 265);
+  --color-ink-2:      oklch(74% 0.018 265);
+  --color-ink-3:      oklch(58% 0.022 265);
+  --color-ink-4:      oklch(45% 0.024 265);
+
+  /* ---- accent ----------------------------------------------------------- */
+  --color-accent:     oklch(82% 0.145 205);
+  --color-accent-2:   oklch(70% 0.19 292);
+  --color-accent-dim: oklch(55% 0.10 205);
+  --color-focus:      oklch(88% 0.14 205);
+  --color-warn:       oklch(82% 0.13 85);
+  --color-ok:         oklch(78% 0.15 155);
+
+  /* ---- rules ------------------------------------------------------------ */
+  --color-rule:       oklch(26% 0.03 265);
+  --color-rule-2:     oklch(34% 0.035 265);
+
+  /* ---- type ------------------------------------------------------------- */
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-body:    "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --text-xs:   0.75rem;
+  --text-sm:   0.8125rem;
+  --text-base: 0.9375rem;
+  --text-md:   1.0625rem;
+  --text-lg:   1.1875rem;
+  --text-xl:   1.5rem;
+  --text-2xl:  1.875rem;
+  --text-3xl:  2.375rem;
+  --text-4xl:  3rem;
+  --text-display-s: 3.5rem;
+  --text-display:   clamp(2.5rem, 4.4vw, 4.25rem);
+  --text-mega:      clamp(3.25rem, 11vw, 9.5rem);
+
+  /* ---- space (4pt) ------------------------------------------------------ */
+  --space-2xs: 0.25rem;
+  --space-xs:  0.5rem;
+  --space-sm:  0.75rem;
+  --space-md:  1rem;
+  --space-lg:  1.5rem;
+  --space-xl:  2rem;
+  --space-2xl: 3rem;
+  --space-3xl: 4.5rem;
+  --space-4xl: 7rem;
+  --space-5xl: 10rem;
+
+  /* ---- motion ----------------------------------------------------------- */
+  --ease-out:    cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in:     cubic-bezier(0.55, 0, 1, 0.45);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-fast:   120ms;
+  --dur-mid:    240ms;
+  --dur-slow:   420ms;
+
+  /* ---- radius ----------------------------------------------------------- */
+  --radius-none: 0;
+  --radius-sm:   3px;
+  --radius-md:   6px;
+
+  /* ---- measure ---------------------------------------------------------- */
+  --measure:       64ch;
+  --measure-tight: 50ch;
+  --shell:         74rem;
+  --shell-wide:    88rem;
+}

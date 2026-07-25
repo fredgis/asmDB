@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>asmdb Cloud — a transactional database engine written in x86-64 assembly</title>
+<meta name="description" content="A 42 KB transactional database engine written from scratch in x86-64 assembly. No linker, no C runtime, no dependencies. Provision one over HTTP, drive it from a CLI, a driver, or an MCP client.">
+<link rel="icon" href="assets/logo.png" type="image/png">
+<meta property="og:title" content="asmdb Cloud">
+<meta property="og:description" content="A 42 KB transactional database engine in x86-64 assembly. Provision one in seconds — CLI, REST, or MCP.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="assets/hero.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/site.css">
+</head>
+<body>
+
+<!-- ============================ N8 terminal nav ========================= -->
+<nav class="nav">
+  <div class="shell shell-wide nav__in">
+    <a class="nav__brand" href="#top">
+      <img class="nav__logo" src="assets/logo.png" alt="" width="26" height="26">
+      <span class="nav__word">asmdb</span>
+    </a>
+    <span class="nav__ver mono">v1.5.0</span>
+    <div class="nav__links">
+      <a href="#engine">engine</a>
+      <a href="#mcp">mcp</a>
+      <a href="#tiers">tiers</a>
+      <a href="https://github.com/fredgis/asmDB">source</a>
+      <a class="nav__cta nav__keep" href="#create">create a database</a>
+    </div>
+  </div>
+</nav>
+
+<!-- =============================== hero ================================= -->
+<header class="hero" id="top">
+  <div class="shell hero__in">
+    <div class="hero__grid">
+      <div>
+        <p class="hero__eyebrow mono"><span class="dot" aria-hidden="true"></span> engine 1.5.0 · storage format 2 · 151 tests green</p>
+
+        <h1 class="hero__h">Forty kilobytes.<br>A real database.</h1>
+
+        <p class="hero__lede">
+          asmdb is a transactional database engine written from scratch in
+          <strong>x86-64 assembly</strong>. NASM emits the executable directly — no
+          linker, no C runtime, no libraries. It is fast because it does far less:
+          one fixed-shape row, one hash-indexed table, no parser, no planner.
+        </p>
+
+        <div class="hero__actions">
+          <a class="btn btn--primary" href="#create">Create a database →</a>
+          <a class="btn btn--ghost" href="#mcp">Use it from an AI agent</a>
+        </div>
+      </div>
+
+      <figure class="hero__fig">
+        <img src="assets/logo.png" alt="The asmdb mark: a database cylinder at the centre of a circuit die" width="512" height="512" fetchpriority="high">
+      </figure>
+    </div>
+  </div>
+</header>
+
+<!-- ============================== stat strip ============================ -->
+<section class="stats" aria-label="Measured facts">
+  <div class="shell shell-wide stats__grid">
+    <div class="stat">
+      <p class="stat__n">11,959,261</p>
+      <p class="stat__l">rows per second, inserted in RAM.<br>Measured, one core.</p>
+    </div>
+    <div class="stat">
+      <p class="stat__n">42,733<span> B</span></p>
+      <p class="stat__l">the entire engine, PE64.<br>51,205 B as ELF64.</p>
+    </div>
+    <div class="stat">
+      <p class="stat__n">0</p>
+      <p class="stat__l">third-party dependencies.<br>No linker. No C runtime.</p>
+    </div>
+    <div class="stat">
+      <p class="stat__n">4,194,304</p>
+      <p class="stat__l">rows per instance.<br>256 bytes each, fixed.</p>
+    </div>
+    <div class="stat">
+      <p class="stat__n">~104<span> ms</span></p>
+      <p class="stat__l">to open a one-million-row<br>database. 5 MB resident.</p>
+    </div>
+  </div>
+</section>
+
+<!-- =============================== engine =============================== -->
+<section class="sec" id="engine">
+  <div class="shell">
+    <div class="sec__head">
+      <p class="sec__kicker">The engine</p>
+      <h2 class="sec__title">A database is a table. That is the whole model.</h2>
+      <p class="sec__sub">
+        One file holds one table. That same file is simultaneously the unit of
+        durability, of locking, of transactions, of backup and of change capture.
+        There is no catalogue to learn and nothing to configure — which is why it
+        fits in forty kilobytes.
+      </p>
+    </div>
+
+    <div class="split">
+      <div>
+        <table class="spec">
+          <caption>One row · 256 bytes · fixed at build time</caption>
+          <tbody>
+            <tr><th><code>id</code></th><td>u64 — primary key, unique, ≥ 1 <span class="note">O(1) lookup through a hash index</span></td></tr>
+            <tr><th><code>value</code></th><td>i64 — the numeric column <span class="note">the only column <code>RANGE</code> can filter on</span></td></tr>
+            <tr><th><code>tag</code></th><td>39 bytes — one token, no spaces <span class="note">longer input is refused, never truncated</span></td></tr>
+            <tr><th><code>content</code></th><td>175 bytes — free text <span class="note">UTF-8 preserved byte for byte</span></td></tr>
+            <tr><th><code>created</code> · <code>updated</code></th><td>i64 — unix epoch milliseconds <span class="note">set by the engine, not the caller</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div>
+        <figure>
+          <pre class="code"><span class="c">$</span> asmdb notes
+<span class="c">asmdb&gt;</span> <span class="k">INSERT</span> 1001 5 project asmdb is written in assembly
+<span class="ok">[ OK ]</span> 1 row inserted
+<span class="c">asmdb&gt;</span> <span class="k">BEGIN</span>
+<span class="ok">[ OK ]</span> transaction started
+<span class="c">asmdb&gt;</span> <span class="k">UPDATE</span> 1001 9 project revised note
+<span class="ok">[ OK ]</span> 1 row updated
+<span class="c">asmdb&gt;</span> <span class="k">COMMIT</span>
+<span class="ok">[ OK ]</span> transaction committed
+<span class="c">asmdb&gt;</span> <span class="k">VERIFY</span>
+<span class="ok">[ OK ]</span> verify: 1 row(s) checked, no problem found</pre>
+          <figcaption>Real output. <code>FORMAT TSV</code> switches the same commands to a machine-readable stream.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="rows" style="margin-top: var(--space-2xl)">
+      <div class="row">
+        <p class="row__k">durability</p>
+        <div>
+          <h3 class="row__t">Committed means committed</h3>
+          <p class="row__b">
+            Every transaction goes through a write-ahead log: the changes are staged and
+            flushed, a commit marker and its CRC-32 are flushed, a change frame is
+            appended and flushed, and only then is the data file touched. A crash
+            resumes from the log. Whole-table operations are announced in the header
+            before they start, so an interrupted <code>TRUNCATE</code> finishes on the
+            next open instead of leaving half a table.
+          </p>
+        </div>
+      </div>
+      <div class="row">
+        <p class="row__k">capture</p>
+        <div>
+          <h3 class="row__t">A durable log of every change</h3>
+          <p class="row__b">
+            Each committed transaction appends one frame to an append-only change log —
+            a total order, a dense sequence, and enough identity to refuse a log that
+            belongs to a different database. Anything downstream can follow the database
+            exactly, and <code>CDCTRIM</code> reclaims what has been acknowledged.
+          </p>
+        </div>
+      </div>
+      <div class="row">
+        <p class="row__k">concurrency</p>
+        <div>
+          <h3 class="row__t">One writer, unlimited readers</h3>
+          <p class="row__b">
+            Reader sessions take no lock at all and run beside the writer. Each command is
+            bracketed by the commit sequence, so a reader never observes a half-applied
+            transaction. Writes do not scale within one instance — that is a real limit,
+            and it is the reason the unit of scale here is the instance.
+          </p>
+        </div>
+      </div>
+      <div class="row">
+        <p class="row__k">honesty</p>
+        <div>
+          <h3 class="row__t">What it will not do</h3>
+          <p class="row__b">
+            No SQL, no joins, no query planner, no secondary indexes — a <code>FIND</code>
+            scans the whole slot region. No authentication, no encryption and no audit log
+            inside the engine; that is the platform's job, and it is written down rather
+            than implied.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================ MCP ================================= -->
+<section class="sec mcp" id="mcp">
+  <div class="shell">
+    <div class="sec__head">
+      <p class="sec__kicker">Model Context Protocol</p>
+      <h2 class="sec__title">A front door built for agents, not bolted on.</h2>
+      <p class="sec__sub">
+        Every instance speaks MCP over HTTP with the same tools as the local stdio
+        server. Point a Model Context Protocol client at the endpoint and an agent has
+        durable, transactional memory — with real timestamps, real transactions and a
+        change log, instead of a vector blob it cannot audit.
+      </p>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="tools">
+          <div class="tool"><p class="tool__n">db_insert</p><p class="tool__d">store a row by key or numeric id</p></div>
+          <div class="tool"><p class="tool__n">db_get</p><p class="tool__d">read one row, whole and untruncated</p></div>
+          <div class="tool"><p class="tool__n">db_update</p><p class="tool__d">overwrite, bumping <code>updated</code></p></div>
+          <div class="tool"><p class="tool__n">db_delete</p><p class="tool__d">remove one row by key</p></div>
+          <div class="tool"><p class="tool__n">db_find</p><p class="tool__d">substring search, paginated</p></div>
+          <div class="tool"><p class="tool__n">db_list</p><p class="tool__d">page through every row</p></div>
+          <div class="tool"><p class="tool__n">db_count</p><p class="tool__d">how many rows are live</p></div>
+        </div>
+        <p class="sec__sub" style="font-size: var(--text-base)">
+          Identifiers and values cross the wire as <strong>decimal strings</strong> — a
+          u64 key and an i64 value do not survive a JavaScript number, and silently
+          rounding someone's primary key is not a trade-off worth making.
+        </p>
+      </div>
+
+      <div>
+        <figure>
+          <pre class="code"><span class="c">// claude_desktop_config.json — or any MCP client</span>
+{
+  <span class="p">"mcpServers"</span>: {
+    <span class="p">"asmdb"</span>: {
+      <span class="p">"url"</span>: <span class="s">"https://db-xxxx.swedencentral.azurecontainerapps.io/mcp"</span>,
+      <span class="p">"headers"</span>: {
+        <span class="p">"Authorization"</span>: <span class="s">"Bearer &lt;your token&gt;"</span>
+      }
+    }
+  }
+}</pre>
+          <figcaption>The endpoint and token are returned when you create the database.</figcaption>
+        </figure>
+
+        <figure style="margin-top: var(--space-lg)">
+          <pre class="code"><span class="c"># or run it locally against a file, no cloud at all</span>
+<span class="k">npx</span> asmdb-mcp <span class="c">--db</span> ./memory</pre>
+          <figcaption>The same tools, the same engine, over stdio.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== access ================================ -->
+<section class="sec" id="access">
+  <div class="shell">
+    <div class="sec__head">
+      <p class="sec__kicker">Three ways in</p>
+      <h2 class="sec__title">CLI, HTTP, or your language of choice.</h2>
+    </div>
+
+    <div class="split">
+      <figure>
+        <pre class="code"><span class="c"># REST — every field is a string, on purpose</span>
+<span class="k">curl</span> -X POST https://db-xxxx.../v1/rows \
+  -H <span class="s">"Authorization: Bearer $TOKEN"</span> \
+  -d <span class="s">'{"id":"1001","value":"5",
+       "tag":"project","content":"hello"}'</span>
+
+<span class="k">curl</span> https://db-xxxx.../v1/rows?limit=100 \
+  -H <span class="s">"Authorization: Bearer $TOKEN"</span></pre>
+        <figcaption>Bounded by default — <code>limit</code> caps at 1000.</figcaption>
+      </figure>
+
+      <figure>
+        <pre class="code"><span class="c"># Python — the client speaks the engine's own protocol</span>
+<span class="k">from</span> asmdb <span class="k">import</span> Client
+
+db = Client(url, token)
+db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<span class="s">"project"</span>,
+          content=<span class="s">"asmdb in assembly"</span>)
+
+<span class="k">for</span> row <span class="k">in</span> db.find(<span class="s">"assembly"</span>, limit=<span class="s">50</span>):
+    print(row.id, row.content)</pre>
+        <figcaption>Python, C# and C clients ship in the repository.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- =============================== tiers ================================ -->
+<section class="sec" id="tiers">
+  <div class="shell">
+    <div class="sec__head">
+      <p class="sec__kicker">Tiers</p>
+      <h2 class="sec__title">Every tier is the same engine.</h2>
+      <p class="sec__sub">
+        Tiers buy latency and headroom — never features. The row ceiling, the
+        durability guarantees and the change log are identical on all three, because
+        they are properties of the engine, not of a price list.
+      </p>
+    </div>
+
+    <div class="tiers">
+      <div class="tier">
+        <p class="tier__n">Free</p>
+        <p class="tier__p">—<small>pricing at general availability</small></p>
+        <ul class="tier__list">
+          <li>0.25 vCPU · 0.5 GiB</li>
+          <li>Sleeps after 5 minutes idle</li>
+          <li>3 databases</li>
+          <li>CLI · REST · MCP</li>
+          <li>4,194,304 rows</li>
+        </ul>
+        <div class="tier__cta"><button class="btn btn--ghost" data-tier="free" type="button">Create free database</button></div>
+      </div>
+
+      <div class="tier tier--featured">
+        <p class="tier__n">Standard</p>
+        <p class="tier__p">—<small>pricing at general availability</small></p>
+        <ul class="tier__list">
+          <li>0.5 vCPU · 1 GiB</li>
+          <li>Sleeps after 30 minutes idle</li>
+          <li>20 databases</li>
+          <li>CLI · REST · MCP</li>
+          <li>Change log retention control</li>
+        </ul>
+        <div class="tier__cta"><button class="btn btn--primary" data-tier="standard" type="button">Create standard database</button></div>
+      </div>
+
+      <div class="tier">
+        <p class="tier__n">Premium</p>
+        <p class="tier__p">—<small>pricing at general availability</small></p>
+        <ul class="tier__list">
+          <li>1 vCPU · 2 GiB</li>
+          <li>Always warm, never sleeps</li>
+          <li>100 databases</li>
+          <li>CLI · REST · MCP</li>
+          <li>Priority on new engine builds</li>
+        </ul>
+        <div class="tier__cta"><button class="btn btn--ghost" data-tier="premium" type="button">Create premium database</button></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== console =============================== -->
+<section class="sec" id="create">
+  <div class="shell">
+    <div class="sec__head">
+      <p class="sec__kicker">Provision</p>
+      <h2 class="sec__title">Create a database. It is a real container.</h2>
+      <p class="sec__sub">
+        This calls the control plane, which creates an Azure Container App running the
+        assembly engine and returns a live endpoint and a bearer token. The token is
+        shown once and never stored in plaintext — copy it before you leave the page.
+      </p>
+    </div>
+
+    <div class="split">
+      <div class="console">
+        <div class="field">
+          <label for="db-name">name</label>
+          <input id="db-name" type="text" value="my-notes" maxlength="40"
+                 pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" autocomplete="off" spellcheck="false">
+          <span class="hint">lowercase letters, digits and hyphens</span>
+        </div>
+        <div class="field">
+          <label for="db-tier">tier</label>
+          <select id="db-tier">
+            <option value="free">free — 0.25 vCPU · sleeps after 5 min</option>
+            <option value="standard" selected>standard — 0.5 vCPU · sleeps after 30 min</option>
+            <option value="premium">premium — 1 vCPU · always warm</option>
+          </select>
+        </div>
+        <div class="hero__actions" style="margin-top: 0">
+          <button class="btn btn--primary" id="db-create" type="button">Create database</button>
+          <button class="btn btn--ghost" id="db-list" type="button">List mine</button>
+        </div>
+        <div class="out mono" id="db-out" role="status" aria-live="polite">Ready. Pick a tier and press create.</div>
+      </div>
+
+      <div>
+        <figure>
+          <pre class="code"><span class="c"># the same thing, from a terminal</span>
+<span class="k">curl</span> -X POST https://&lt;control-plane&gt;/api/v1/databases \
+  -H <span class="s">"content-type: application/json"</span> \
+  -d <span class="s">'{"name":"my-notes","tier":"standard"}'</span>
+
+<span class="c"># -&gt; { "id": "db_...", "endpoint": "https://db-....io",
+#      "token": "shown once", "state": "provisioning" }</span></pre>
+          <figcaption>Provisioning returns immediately; the container is warm within seconds.</figcaption>
+        </figure>
+        <p class="sec__sub" style="font-size: var(--text-base)">
+          One instance is one engine process holding one table, with its own write-ahead
+          log, its own change log and its own single-writer lock. Nothing is shared with
+          anyone else's data — isolation is a container boundary, not a tenant column.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- =============================== Ft4 footer =========================== -->
+<footer class="foot">
+  <div class="shell shell-wide">
+    <div class="foot__grid">
+      <div>
+        <a class="nav__brand" href="#top">
+          <img class="nav__logo" src="assets/logo.png" alt="" width="26" height="26">
+          <span class="nav__word">asmdb</span>
+        </a>
+        <p class="foot__blurb">
+          A transactional database engine in x86-64 assembly. Built in the open,
+          measured rather than claimed.
+        </p>
+      </div>
+      <div>
+        <h4>Engine</h4>
+        <ul>
+          <li><a href="https://github.com/fredgis/asmDB/blob/main/docs/ENGINE.md">Specification</a></li>
+          <li><a href="https://github.com/fredgis/asmDB/blob/main/docs/COMMANDS.md">Command reference</a></li>
+          <li><a href="https://github.com/fredgis/asmDB/blob/main/docs/CDC.md">Change data capture</a></li>
+          <li><a href="https://github.com/fredgis/asmDB/blob/main/SECURITY.md">Security model</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Interfaces</h4>
+        <ul>
+          <li><a href="#mcp">MCP server</a></li>
+          <li><a href="#access">REST API</a></li>
+          <li><a href="https://github.com/fredgis/asmDB/tree/main/clients">Clients</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/fredgis/asmDB">Source</a></li>
+          <li><a href="https://github.com/fredgis/asmDB/blob/main/docs/SAAS.md">Platform plan</a></li>
+          <li><a href="https://github.com/fredgis/asmDB/blob/main/README.md#changelog">Changelog</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot__base">
+      <span>Engine 1.5.0 · storage format 2 · MIT licence</span>
+      <span>Numbers on this page are measured on one machine and reproducible from the repository.</span>
+    </div>
+  </div>
+</footer>
+
+<script src="js/console.js"></script>
+</body>
+</html>
