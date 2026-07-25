@@ -574,6 +574,37 @@ else
     echo "  [FAIL] torn change-log header kept"; fail=$((fail+1))
 fi
 
+# the change log can be trimmed once a consumer has acknowledged a watermark:
+# the frames go, the sequence stays dense from the new base
+if command -v python3 > /dev/null 2>&1; then
+    printf '%s\n' 'INSERT 1 1 a one' 'INSERT 2 2 b two' 'INSERT 3 3 c three' \
+        'INSERT 4 4 d four' 'INSERT 5 5 e five' 'EXIT' | ./asmdb trim1 > /dev/null
+    tr_before="$(wc -c < trim1.cdc)"
+    rt2="$(printf '%s\n' 'CDCTRIM 3' 'EXIT' | ./asmdb trim1 2>&1)"
+    tr_after="$(wc -c < trim1.cdc)"
+    tr_dump="$(python3 "$root/tests/cdc_dump.py" trim1.cdc --quiet)"; tr_code=$?
+    check 'CDCTRIM acknowledged'  'change log trimmed up to sequence 3'  "$rt2"
+    if [[ "$tr_after" -lt "$tr_before" ]]; then
+        echo "  [PASS] CDCTRIM shrank the log"
+    else
+        echo "  [FAIL] CDCTRIM shrank the log"; fail=$((fail+1))
+    fi
+    check 'CDCTRIM kept the later frames' 'frames=2 last_seq=5'          "$tr_dump"
+    if [[ $tr_code -eq 0 ]]; then
+        echo "  [PASS] trimmed log still validates"
+    else
+        echo "  [FAIL] trimmed log still validates"; fail=$((fail+1))
+    fi
+    rt3="$(printf '%s\n' 'INSERT 6 6 f six' 'VERIFY' 'EXIT' | ./asmdb trim1 2>&1)"
+    tr_dump2="$(python3 "$root/tests/cdc_dump.py" trim1.cdc --quiet)"
+    check 'sequence continues after a trim'   'frames=3 last_seq=6'      "$tr_dump2"
+    check 'database still sound after a trim' 'no problem found'         "$rt3"
+    rt4="$(printf '%s\n' 'CDCTRIM 99' 'EXIT' | ./asmdb trim1 2>&1)"
+    check 'CDCTRIM past the last commit refused' 'above the last published commit' "$rt4"
+    rt5="$(printf '%s\n' 'CDCTRIM 1' 'EXIT' | ./asmdb trim1 2>&1)"
+    check 'CDCTRIM below the base refused'       'below the log base'    "$rt5"
+fi
+
 # A whole-table operation is crash-atomic. TRUNCATE clears the slots one write
 # at a time, so a crash used to leave some rows deleted, some not, and a row
 # count matching neither. It is announced in the header before it starts, and

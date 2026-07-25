@@ -43,18 +43,9 @@ a short `tag`, and a free-text `content` field — suits many workloads;
 **durable long-term memory for an AI agent is one example use case**, not the
 only one.
 
-```text
-asmdb> INSERT 1001 5 project asmdb is a database engine written in x86-64 assembly
-[ OK ] 1 row inserted
-asmdb> SELECT *
-+----------+------------------+------------+------------------------------------------+
-| id       | tag              | value      | content                                  |
-+----------+------------------+------------+------------------------------------------+
-| 1001     | project          | 5          | asmdb is a database engine written in ~  |
-+----------+------------------+------------+------------------------------------------+
-asmdb> FIND assembly
-  1 match
-```
+<p align="center">
+  <img src="docs/assets/asmdb-quick.png" alt="asmdb REPL: INSERT, SELECT * rendering a table, FIND matching on content" width="88%">
+</p>
 
 Because the engine does one thing — fixed-shape rows in a single hash-indexed
 table — it does that one thing at speeds a general-purpose SQL database cannot
@@ -202,7 +193,14 @@ Windows↔Linux syscall mapping.
 ## Commands
 
 asmdb speaks a small, line-oriented grammar — full CRUD over a fixed-schema table,
-real transactions, a catalog, and backup/restore. The essentials:
+real transactions, a catalog, and backup/restore. `HELP` prints the whole
+reference in the REPL:
+
+<p align="center">
+  <img src="docs/assets/asmdb-help.png" alt="asmdb REPL: startup banner and the built-in HELP command reference" width="85%">
+</p>
+
+The essentials:
 
 | Command | Description |
 |---|---|
@@ -723,7 +721,7 @@ Two documents, deliberately kept in separate lanes:
 | **Startup & memory** | ✅ the store is **mapped copy-on-write**: opening a database is ~80 ms whatever its size (was ~600 ms), and a 1 M-row database peaks at **~5 MB** of RAM (was ~1 029 MB) |
 | **Portability** | ✅ Windows PE64 + Linux ELF64 from one source, behind a thin `os_*` layer |
 | **Integration** | ✅ MCP server (generic CRUD tools) + Python / C# / C stdio clients |
-| **Tests** | ✅ 143 checks on Windows and the same battery on Linux, plus 24 for the MCP server — fault-injected I/O failures, crash windows, format fuzzing |
+| **Tests** | ✅ 151 checks on Windows and the same battery on Linux, plus 24 for the MCP server — fault-injected I/O failures, crash windows, format fuzzing |
 | **Next up** | 🔜 **persisted status directory** (see below), then incremental checkpoint, secondary indexes, SIMD scans |
 
 **The roadmap is driven by measurement, not intuition.** The last milestone came
@@ -753,7 +751,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.4.0 · 1.3.1 · 1.3.0 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.5.0 · 1.4.0 · 1.3.1 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -772,6 +770,39 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+<summary><b>1.5.0</b> — change-log retention, and a command line that survives a space</summary>
+
+**`CDCTRIM <seq>` gives the change log a retention policy.** `<db>.cdc` was
+append-only with no way to reclaim anything: it grew for the life of the
+database and was re-read and re-checksummed in full at every open, so start-up
+eventually became a function of history rather than of data. Once a consumer has
+acknowledged a watermark, `CDCTRIM` drops everything up to it.
+
+It is not a truncation. A replacement log is built beside the old one carrying
+the same lineage and a `base_seq` of `<seq>`, so a reader still sees a dense,
+verifiable sequence starting at `<seq> + 1` — the same rule that already applied
+to a log recreated after an operator deleted it. The old file is replaced only
+once the new one is complete and flushed, so a crash leaves either the whole old
+log or the whole new one. A watermark below the log's base or above the last
+published commit is refused rather than guessed at.
+
+**A Linux argument containing a space no longer splits in two.** The engine
+rebuilds a single command-line string from `argv` so that one parser serves both
+platforms, and it joined the arguments with spaces — the shell had already
+removed the quotes, so `asmdb "my db"` opened a database called `my`. Arguments
+containing whitespace are now re-quoted on the way in.
+
+Documentation: the capacity card is rebuilt around the project logo and speaks
+database — columns, types, sizes, constraints, access paths — and the README's
+opening example is now a rendering of the engine's *actual* output rather than a
+hand-written block that had drifted (it still claimed `FIND` printed
+`1 match`). `HELP` is shown as a real terminal capture.
+
+Tests: 143 → 151 checks on Windows, mirrored on Linux.
+
+</details>
 
 <details>
 <summary><b>1.4.0</b> — the write-ahead log names its database, whole-table operations survive a crash, and a snapshot stops costing a gigabyte</summary>

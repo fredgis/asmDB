@@ -1807,6 +1807,163 @@ cmd_restore:
     pop  rbp
     ret
 
+; cmd_cdctrim() - CDCTRIM <seq> : drop change frames up to and including <seq>.
+;
+; The change log is append-only and had no retention policy at all: it grew for
+; the life of the database and was re-read in full at every open, so start-up
+; time eventually became a function of history rather than of data. Once a
+; consumer has acknowledged everything up to <seq> out-of-band, those frames are
+; dead weight.
+;
+; Trimming is not a truncation. A new log is built beside the old one, carrying
+; the same lineage and a base_seq of <seq>, so a reader still sees a dense,
+; verifiable sequence starting at <seq>+1 - the same rule that already applies
+; to a log recreated after an operator removed it. The old file is replaced only
+; once the new one is complete and flushed, so a crash leaves either the whole
+; old log or the whole new one.
+cmd_cdctrim:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x70
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    cmp  qword [rel g_in_txn], 0
+    jne  .busy
+    call skip_spaces_rsi
+    call parse_u64
+    test rdx, rdx
+    jz   .syntax
+    mov  [rbp-32], rax               ; requested watermark
+    cmp  rax, [rel g_cdc_base]
+    jb   .range                      ; already trimmed past that point
+    cmp  rax, [rel g_seq]
+    ja   .range                      ; cannot discard what was never published
+    ; ---- find the first frame to keep ----
+    mov  rbx, CDCH_SIZE
+    cmp  qword [rel g_cdc_legacy], 0
+    je   .scan
+    xor  rbx, rbx                    ; a pre-1.1 log has no file header
+.scan:
+    cmp  rbx, [rel g_cdc_end]
+    jae  .found
+    mov  rcx, rbx
+    lea  rdx, [rel g_hdr_read]
+    mov  r8, CDC_HDR_SIZE
+    call cdc_read
+    cmp  rax, CDC_HDR_SIZE
+    jne  io_fatal_read
+    mov  rax, [rel g_hdr_read+16]    ; commit_seq
+    cmp  rax, [rbp-32]
+    ja   .found                      ; first frame past the watermark
+    add  rbx, [rel g_hdr_read+8]     ; frame_size
+    jmp  .scan
+.found:
+    mov  [rbp-40], rbx               ; cut offset in the old log
+    ; ---- build the replacement beside it ----
+    lea  rdi, [rel g_tmpname]
+    lea  rsi, [rel g_cdcname]
+    call strcpy_z
+    lea  rsi, [rel s_part_suffix]
+    call strcpy_z
+    lea  rcx, [rel g_tmpname]
+    call os_create_new
+    cmp  rax, INVALID_HANDLE
+    je   .partfail
+    mov  [rbp-48], rax               ; new handle
+    mov  rax, [rel g_cdc_handle]
+    mov  [rbp-56], rax               ; old handle
+    mov  rax, [rel g_cdc_base]
+    mov  [rbp-64], rax               ; old base, for the failure path
+    mov  rax, [rbp-48]
+    mov  [rel g_cdc_handle], rax
+    mov  rax, [rbp-32]
+    mov  [rel g_cdc_base], rax
+    mov  qword [rel g_cdc_legacy], 0 ; the replacement always has a header
+    call cdc_hdr_write
+    ; ---- copy the frames worth keeping ----
+    mov  rbx, [rbp-40]               ; source cursor
+    mov  qword [rbp-72], CDCH_SIZE   ; destination cursor
+.copy:
+    mov  rax, [rel g_cdc_end]
+    sub  rax, rbx
+    jbe  .copied
+    mov  rdx, WAL_BUF_SIZE
+    cmp  rax, rdx
+    jbe  .have
+    mov  rax, rdx
+.have:
+    mov  [rbp-80], rax               ; chunk length
+    mov  rcx, [rbp-56]
+    mov  rdx, rbx
+    mov  r8, [rel g_walbuf]
+    mov  r9, rax
+    call os_pread
+    cmp  rax, [rbp-80]
+    jne  io_fatal_read
+    mov  rcx, [rbp-48]
+    mov  rdx, [rbp-72]
+    mov  r8, [rel g_walbuf]
+    mov  r9, [rbp-80]
+    call cdc_write_all
+    mov  rax, [rbp-80]
+    add  rbx, rax
+    add  [rbp-72], rax
+    jmp  .copy
+.copied:
+    mov  rcx, [rbp-48]
+    call os_fsync
+    test rax, rax
+    jnz  io_fatal
+    mov  rcx, [rbp-48]
+    call os_close
+    mov  rcx, [rbp-56]
+    call os_close                    ; the old log must be closed to be replaced
+    lea  rcx, [rel g_tmpname]
+    lea  rdx, [rel g_cdcname]
+    call os_rename
+    test rax, rax
+    jnz  .renamefail
+    mov  qword [rel g_cdc_handle], 0
+    call cdc_open                    ; re-open and re-validate what we just wrote
+    call cdc_check_aligned
+    lea  rcx, [rel s_cdctrim_ok]
+    call puts
+    mov  rcx, [rbp-32]
+    call put_u64
+    lea  rcx, [rel s_cdctrim_post]
+    call puts
+    jmp  .done
+.renamefail:
+    ; Both handles are closed and the old log is still on disk untouched; the
+    ; replacement is left as <db>.cdc.part for inspection rather than deleted.
+    lea  rcx, [rel s_err_cdctrim]
+    call puts
+    mov  ecx, 1
+    call os_exit
+.partfail:
+    lea  rcx, [rel s_err_cdctrim_part]
+    call puts
+    jmp  .done
+.range:
+    lea  rcx, [rel s_err_cdctrim_range]
+    call puts
+    jmp  .done
+.busy:
+    lea  rcx, [rel s_err_txn_busy]
+    call puts
+    jmp  .done
+.syntax:
+    lea  rcx, [rel s_err_syntax]
+    call puts
+.done:
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; cmd_bench() - BENCH <n> : reset the table, insert n synthetic rows (timed in
 ; RAM), then checkpoint the whole table to disk + fsync (timed). This overwrites
 ; the current database with synthetic data - run it against a scratch db.
@@ -2054,6 +2211,9 @@ cmd_help:
     call help_row
     lea  rcx, [rel hc_verify]
     lea  rdx, [rel hd_verify]
+    call help_row
+    lea  rcx, [rel hc_cdctrim]
+    lea  rdx, [rel hd_cdctrim]
     call help_row
     call crlf
     lea  rcx, [rel h_g_sess]
@@ -2529,6 +2689,10 @@ dispatch:
     call token_eq
     test rax, rax
     jnz  .verify
+    lea  rdi, [rel kw_cdctrim]
+    call token_eq
+    test rax, rax
+    jnz  .cdctrim
     lea  rcx, [rel s_unknown]
     call puts
     jmp  .ok0
@@ -2611,6 +2775,10 @@ dispatch:
     jmp  .ok0
 .verify:
     call cmd_verify
+    jmp  .ok0
+.cdctrim:
+    call advance_token
+    call cmd_cdctrim
     jmp  .ok0
 .exit:
     mov  rax, CMD_EXIT

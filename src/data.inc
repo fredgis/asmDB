@@ -177,6 +177,11 @@ s_err_bak_rename: db '[ERR] backup written but could not be moved into place', 1
 s_upg_nospace: db '[ERR] upgrade: no free slot for a source row - migration refused', 13, 10, 0
 s_upg_lost:   db '[ERR] upgrade: migrated row count does not match the source: ', 0
 s_err_readonly: db '[ERR] read-only session (--reader) - this command would modify the database', 13, 10, 0
+s_cdctrim_ok:  db '[ OK ] change log trimmed up to sequence ', 0
+s_cdctrim_post: db 13, 10, 0
+s_err_cdctrim: db '[ERR] could not replace the change log - the old one is intact, the new one is <db>.cdc.part', 13, 10, 0
+s_err_cdctrim_part: db '[ERR] cannot create the replacement change log (<db>.cdc.part already exists?)', 13, 10, 0
+s_err_cdctrim_range: db '[ERR] sequence is below the log base or above the last published commit', 13, 10, 0
 s_bulk_resume: db '[ OK ] finishing a whole-table operation interrupted by a crash', 13, 10, 0
 s_bulk_done:  db '[ OK ] table operation completed', 13, 10, 0
 s_err_bulk_src: db '[ERR] cannot finish the interrupted RESTORE - snapshot unusable: ', 0
@@ -350,6 +355,8 @@ hc_restore: db 'RESTORE <file>', 0
 hd_restore: db 'reload this database from <file>', 0
 hc_verify:  db 'VERIFY', 0
 hd_verify:  db 'full logical integrity scan of the store', 0
+hc_cdctrim: db 'CDCTRIM <seq>', 0
+hd_cdctrim: db 'drop change frames up to <seq>', 0
 
 hc_format:  db 'FORMAT TABLE|TSV', 0
 hd_format:  db 'human table, or machine-readable rows', 0
@@ -454,3 +461,4 @@ kw_page:       db 'PAGE', 0
 kw_tsv:        db 'TSV', 0
 kw_table:      db 'TABLE', 0
 kw_verify:     db 'VERIFY', 0
+kw_cdctrim:    db 'CDCTRIM', 0

@@ -92,6 +92,7 @@ see different states, but neither will ever see half of one.
 | [`BENCH <n>`](#bench) | insert *n* synthetic rows and report engine rows/sec || [`BACKUP <file>`](#backup) | snapshot this database to `<file>` |
 | [`RESTORE <file>`](#restore) | reload this database from a snapshot |
 | [`VERIFY`](#verify) | full logical integrity scan of the store |
+| [`CDCTRIM <seq>`](#cdctrim) | drop change frames up to and including `<seq>` |
 | [`FORMAT TABLE\|TSV`](#format) | human table (default) or machine-readable rows |
 | [`PAGE <limit> <offset>`](#page) | bound what the listing commands return |
 | [`HELP`](#help) | in-app command reference |
@@ -593,6 +594,36 @@ asmdb> VERIFY
 ```
 
 `VERIFY` is read-only. It never repairs anything.
+
+---
+
+### `CDCTRIM`
+
+```
+CDCTRIM <seq>
+```
+
+Drop change frames up to and including `<seq>`. Use it once a consumer has
+acknowledged that watermark out-of-band: `<db>.cdc` is append-only and is
+re-read in full at every open, so without a retention policy start-up time
+eventually becomes a function of history rather than of data.
+
+This is **not** a truncation. A replacement log is built beside the old one with
+the same lineage and a `base_seq` of `<seq>`, so a reader still sees a dense,
+verifiable sequence starting at `<seq> + 1`. The old file is replaced only once
+the new one is complete and flushed, so a crash leaves either the whole old log
+or the whole new one. Refused inside a transaction.
+
+`<seq>` must be at least the log's current base and at most the last published
+commit; anything else is refused rather than guessed at.
+
+```text
+asmdb> CDCTRIM 4210
+[ OK ] change log trimmed up to sequence 4210
+```
+
+A consumer that is behind that watermark must re-bootstrap from a `BACKUP`, as
+described in [docs/CDC.md](CDC.md).
 
 ---
 

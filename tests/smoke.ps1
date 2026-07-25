@@ -610,6 +610,31 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
     Check 'torn change-log header refused' ($rt -match 'change log header is damaged')
     Check 'torn change-log header kept'    ((Get-Item $tp).Length -eq 30)
 
+    # the change log can be trimmed once a consumer has acknowledged a
+    # watermark: the frames go, the sequence stays dense from the new base
+    if ($py) {
+        (@('INSERT 1 1 a one', 'INSERT 2 2 b two', 'INSERT 3 3 c three',
+           'INSERT 4 4 d four', 'INSERT 5 5 e five', 'EXIT') -join "`n") | .\asmdb.exe trim1 | Out-Null
+        $before = (Get-Item (Join-Path $work 'trim1.cdc')).Length
+        $rt2 = ((@('CDCTRIM 3', 'EXIT') -join "`n") | .\asmdb.exe trim1 2>&1) -join "`n"
+        $after = (Get-Item (Join-Path $work 'trim1.cdc')).Length
+        $trDump = (& python $dump (Join-Path $work 'trim1.cdc') --quiet) -join "`n"
+        $trCode = $LASTEXITCODE
+        Write-Host ("DIAG rt2=[" + ($rt2 -replace '\s+',' ') + "]") -ForegroundColor Magenta
+        Check 'CDCTRIM acknowledged'        ($rt2 -match 'change log trimmed up to sequence 3')
+        Check 'CDCTRIM shrank the log'      ($after -lt $before)
+        Check 'CDCTRIM kept the later frames' ($trDump -match 'frames=2 last_seq=5')
+        Check 'trimmed log still validates' ($trCode -eq 0)
+        $rt3 = ((@('INSERT 6 6 f six', 'VERIFY', 'EXIT') -join "`n") | .\asmdb.exe trim1 2>&1) -join "`n"
+        $trDump2 = (& python $dump (Join-Path $work 'trim1.cdc') --quiet) -join "`n"
+        Check 'sequence continues after a trim' ($trDump2 -match 'frames=3 last_seq=6')
+        Check 'database still sound after a trim' ($rt3 -match 'no problem found')
+        $rt4 = ((@('CDCTRIM 99', 'EXIT') -join "`n") | .\asmdb.exe trim1 2>&1) -join "`n"
+        Check 'CDCTRIM past the last commit refused' ($rt4 -match 'above the last published commit')
+        $rt5 = ((@('CDCTRIM 1', 'EXIT') -join "`n") | .\asmdb.exe trim1 2>&1) -join "`n"
+        Check 'CDCTRIM below the base refused' ($rt5 -match 'below the log base')
+    }
+
     # ---------------------------------------------------------------------
     # Run 17b: a whole-table operation is crash-atomic. TRUNCATE clears four
     # million slots one write at a time, so a crash used to leave some rows

@@ -99,6 +99,11 @@ os_exit:
 ; os_cmdline() -> rax = joined "argv0 argv1 ..." command-line string
 ;   Reconstructs a single string (like Win32 GetCommandLineA) from the argv
 ;   vector the kernel left on the stack at _start, so db_init_names is shared.
+;
+;   An argument containing a space is wrapped in double quotes on the way in.
+;   Joining raw would turn `asmdb "my db"` into two tokens and open a database
+;   called "my" - the shell had already removed the quotes, and the shared
+;   parser has no way to recover the boundary the user actually wrote.
 os_cmdline:
     push rbp
     mov  rbp, rsp
@@ -117,6 +122,28 @@ os_cmdline:
     mov  rax, [rsi]                  ; argv[i]
     test rax, rax
     jz   .end
+    ; does this argument contain a space or a tab?
+    mov  r8, rax
+    xor  r9, r9                      ; 1 = needs quoting
+.scan:
+    mov  dl, [r8]
+    test dl, dl
+    jz   .scanned
+    cmp  dl, ' '
+    je   .needq
+    cmp  dl, 9
+    je   .needq
+    inc  r8
+    jmp  .scan
+.needq:
+    mov  r9, 1
+.scanned:
+    test r9, r9
+    jz   .ch
+    cmp  rdi, rcx
+    jae  .end
+    mov  byte [rdi], '"'
+    inc  rdi
 .ch:
     mov  dl, [rax]
     test dl, dl
@@ -128,6 +155,13 @@ os_cmdline:
     inc  rax
     jmp  .ch
 .argend:
+    test r9, r9
+    jz   .sep
+    cmp  rdi, rcx
+    jae  .end
+    mov  byte [rdi], '"'
+    inc  rdi
+.sep:
     cmp  rdi, rcx
     jae  .end
     mov  byte [rdi], ' '
