@@ -89,7 +89,7 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **~24 KB PE64** whose only dependency is
+- The result is a single self-contained **~27 KB PE64** whose only dependency is
   `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the exe —
   it is obtained from `VirtualAlloc` at startup.
 
@@ -400,8 +400,43 @@ makes one container per instance realistic (see [SAAS.md](SAAS.md)). Closing
 that gap is the next roadmap item: a **persisted dense status directory**, so a
 scan streams a few MiB instead of touching the whole region.
 
-#### Open-time validation
+#### Versioning and upgrades
 
+Two numbers, deliberately independent:
+
+| | Where | Moves when | Governs |
+|---|---|---|---|
+| **Engine version** (`ENGINE_MAJOR/MINOR/PATCH`) | `asmdb.inc`, shown by the banner and `VERSION` | every release | nothing at runtime — it is *reported*, never *enforced* |
+| **Storage format** (`DB_VERSION`) | header `+8` | only when the bytes in `<db>.dat` change meaning | whether a file opens at all |
+
+Pre-1.0 the rule is: while `MAJOR` is `0`, `MINOR` marks a milestone or a
+behaviour change and `PATCH` marks fixes, performance and docs. 1.0 is declared
+deliberately.
+
+The header carries the engine version that last wrote the file at
+`HDR_ENGINE (+80)`, purely for diagnostics — `VERSION` prints it, and it never
+influences whether the database can be opened. Files written before 0.9.0 have
+zero there and are reported as unstamped.
+
+**The upgrade path.** `db_open` refuses anything it does not fully understand
+(above), which is safe but leaves the operator stuck. `asmdb <db> --upgrade`
+(`db_upgrade`) is the escape hatch:
+
+1. Open the source **read-only** and read its header.
+2. If `version`, `rec_size` and `capacity` all match this build → nothing to do.
+3. If `version` or `rec_size` differ → refuse. There is no migration path for
+   those in this build, and guessing at a record layout would destroy data.
+4. If only `capacity` differs → the records themselves are unchanged but they
+   hash to different slots, so create `<db>.upgraded.dat`, map it, stream the
+   source region in `WAL_BUF_SIZE` chunks, and re-insert every live row through
+   `store_locate`. The logical table name is carried over.
+
+The source is never written to, and the result is a *new* file the operator
+swaps in. That is the whole safety argument: a migration that goes wrong costs
+nothing, so it can be attempted freely. A future format change adds a step 3
+branch rather than a new mechanism.
+
+#### Open-time validation
 Only a **0-byte** file is treated as a new database. Anything else must pass
 every check below, because silently "recreating" a file we failed to parse would
 destroy real data:

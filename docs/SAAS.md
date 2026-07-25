@@ -52,7 +52,7 @@ compute time. Idle instances **scale to zero** and cost almost nothing.
 
 Why this can win:
 
-- **The engine is tiny and starts instantly.** `asmdb` is ~24 KB, has no
+- **The engine is tiny and starts instantly.** `asmdb` is ~27 KB, has no
   runtime to warm up, and maps its record region **copy-on-write** from a
   **sparse** file — so an idle instance's data file costs kilobytes on disk
   *and* its process costs a few MB of RAM rather than a gigabyte. Measured on a
@@ -99,7 +99,7 @@ object storage) and **resumed on first request** in milliseconds, so we bill
 compute only while an instance is actually serving.
 
 > **Why the Linux build is the natural container image.** The engine ships a
-> native **ELF64 binary** (~33 KB) that depends on nothing but the kernel — no
+> native **ELF64 binary** (~36 KB) that depends on nothing but the kernel — no
 > libc, no runtime, no shared objects. It runs on a **`FROM scratch`** image
 > that contains literally two files (the engine + the sidecar), so a per-instance
 > container is a few tens of kilobytes, cold-starts in milliseconds, and has a
@@ -180,7 +180,7 @@ flowchart TB
   pipeline** (collects metering events for billing). Metadata (instances, keys,
   placement) lives in a managed store (e.g. Postgres).
 - **Data plane**: one **micro-container per database instance**. The image is a
-  `FROM scratch` bundle of the **Linux ELF64 engine** (~33 KB, zero shared-library
+  `FROM scratch` bundle of the **Linux ELF64 engine** (~36 KB, zero shared-library
   dependencies) plus a small **sidecar** (Rust/Go) that supervises the `asmdb`
   process, speaks the engine's protocol on one side and HTTP/gRPC/MCP on the
   other, ships WAL/snapshots to object storage, and emits per-op usage events.

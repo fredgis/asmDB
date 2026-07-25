@@ -17,7 +17,7 @@ here instead of inlining the list.
 - **[Quick reference](#quick-reference)**
 - **Data:** [`INSERT`](#insert) · [`SELECT`](#select) · [`UPDATE`](#update) · [`DELETE`](#delete) · [`TRUNCATE`](#truncate) · [`FIND`](#find) · [`RANGE`](#range) · [`COUNT`](#count)
 - **Transactions:** [`BEGIN`](#begin) · [`COMMIT`](#commit) · [`ROLLBACK`](#rollback)
-- **Catalog:** [`TABLES`](#tables) · [`DATABASES`](#databases) · [`SCHEMA`](#schema) · [`TYPES`](#types) · [`BENCH`](#bench)
+- **Catalog:** [`TABLES`](#tables) · [`DATABASES`](#databases) · [`SCHEMA`](#schema) · [`TYPES`](#types) · [`VERSION`](#version) · [`BENCH`](#bench)
 - **Backup:** [`BACKUP`](#backup) · [`RESTORE`](#restore)
 - **Session:** [`HELP`](#help) · [`EXIT` / `QUIT`](#exit--quit)
 - **[Why there is no `CREATE TABLE` / `DROP` / `ALTER`](#why-there-is-no-create-table--drop--alter)**
@@ -67,8 +67,8 @@ Rules that apply everywhere:
 | [`DATABASES`](#databases) | list `*.dat` databases in the current folder |
 | [`SCHEMA`](#schema) | show the fixed record layout |
 | [`TYPES`](#types) | supported logical column types |
-| [`BENCH <n>`](#bench) | insert *n* synthetic rows and report engine rows/sec |
-| [`BACKUP <file>`](#backup) | snapshot this database to `<file>` |
+| [`VERSION`](#version) | engine build, storage format, and the writing engine's stamp |
+| [`BENCH <n>`](#bench) | insert *n* synthetic rows and report engine rows/sec || [`BACKUP <file>`](#backup) | snapshot this database to `<file>` |
 | [`RESTORE <file>`](#restore) | reload this database from a snapshot |
 | [`HELP`](#help) | in-app command reference |
 | [`EXIT` / `QUIT`](#exit--quit) | leave asmdb |
@@ -416,6 +416,35 @@ asmdb> TYPES
 
 ---
 
+### `VERSION`
+
+```
+VERSION
+```
+
+Report the engine build, the on-disk storage format, and which engine last wrote
+the open database. The two numbers are deliberately separate: the **engine
+version** moves with every release, the **storage format** only when the bytes in
+`<db>.dat` change meaning — and it is the format number that decides whether a
+file can be opened.
+
+```text
+asmdb> VERSION
+  asmdb 0.9.0   (pre-1.0: the on-disk format may still change)
+  storage format : 1
+  record size    : 256 bytes
+  capacity       : 4194304 slots
+  platform       : Windows PE64 (kernel32)
+  written by     : engine 0.9.0
+```
+
+`written by` reads a stamp in the file header. Databases written before 0.9.0
+carry no stamp and are reported as such.
+
+To move a database between incompatible builds, see the `--upgrade` flag below.
+
+---
+
 ### `BENCH`
 
 ```
@@ -572,3 +601,46 @@ engine never prints `[ OK ]` after a failed write.
 | `I/O failure on a durable write - aborting to avoid an inconsistent database` | a durable write or `fsync` failed. asmdb **exits (status 1)** rather than continue with memory and disk out of sync |
 | `I/O failure while reading - aborting rather than serving partial data` | a read failed. Nothing durable is at risk, but the in-memory table would be incomplete, so asmdb exits instead of serving half-loaded rows |
 | `out of memory` | the startup allocations failed |
+
+---
+
+## Command-line flags
+
+```
+asmdb [<database>] [<table>] [--upgrade]
+```
+
+| Argument | Meaning |
+|---|---|
+| `<database>` | base name; the engine uses `<database>.dat` and `<database>.wal`. Defaults to `asmdb` |
+| `<table>` | logical table name, stored in the header. Defaults to the header's value, else the database name |
+| `--upgrade` | migrate the database to this build's storage format instead of opening a session |
+
+### `--upgrade`
+
+Migrates a `.dat` this build would otherwise refuse — today, one written when
+the table had a different capacity, which is what produces
+`[ERR] incompatible database format`.
+
+```text
+> asmdb sales --upgrade
+  asmdb upgrade
+  source   : sales.dat
+  found    : format 1, record 256 B, capacity 262144 slots
+  this build expects format 1, record 256 B, capacity 4194304 slots
+  writing   : sales.upgraded.dat
+[ OK ] migrated 3 row(s)
+  The original was NOT modified. Check the new file, then swap them:
+    rename <db>.dat to <db>.dat.old, then <db>.upgraded.dat to <db>.dat
+```
+
+Every live row is rehashed into the new slot count and the logical table name is
+preserved. The source is opened **read-only and never modified**, so a failed
+migration costs nothing — you inspect the result and swap the files yourself.
+
+| Situation | Outcome | Exit |
+|---|---|--:|
+| already in this build's format | nothing written | 0 |
+| capacity differs | migrated to `<db>.upgraded.dat` | 0 |
+| storage format or record size differs | `[ERR] no automatic migration from that format in this build` | 1 |
+| no such database | `[ERR] no database file to upgrade` | 1 |

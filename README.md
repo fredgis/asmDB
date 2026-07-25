@@ -7,7 +7,7 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). ~24 KB. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). ~27 KB. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -17,7 +17,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-~24%20KB%20PE%20%2F%20~33%20KB%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-~27%20KB%20PE%20%2F%20~36%20KB%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -79,6 +79,7 @@ writing a database in assembly.
 - [Engine specification](#engine-specification)
 - [Roadmap & SaaS plan](#roadmap--saas-plan)
 - [Changelog](#changelog) — what changed, newest first
+- [Upgrading a database](#upgrading-a-database) — `--upgrade` between engine versions
 - [Project layout](#project-layout)
 
 ## Why it's interesting
@@ -138,8 +139,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~24 KB</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~33 KB</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~27 KB</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~36 KB</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -312,7 +313,7 @@ flowchart LR
 
 ### The deep dive
 
-How ~24 KB of assembly becomes a durable database.
+How ~27 KB of assembly becomes a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -325,7 +326,7 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the binaries stay ~24 KB (PE) / ~33 KB (ELF) on disk — and why a
+which is why the binaries stay ~27 KB (PE) / ~36 KB (ELF) on disk — and why a
 million-row database needs only a few MB of RAM.
 
 #### The record store — four cache lines per row
@@ -664,10 +665,67 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 
 ## Changelog
 
+Versions follow `MAJOR.MINOR.PATCH`. **While `MAJOR` is `0` the engine is
+pre-1.0**: `MINOR` marks a milestone or a behaviour change, `PATCH` marks fixes,
+performance and docs. 1.0 is declared deliberately, not reached automatically —
+until then the on-disk format may still change.
+
+Two numbers are tracked separately and should not be confused:
+
+| | What it is | How often it moves | Effect |
+|---|---|---|---|
+| **Engine version** | the software (`0.9.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
+| **Storage format** | the byte layout of `<db>.dat` (`1`) | almost never | decides whether a file can be opened at all, and what `--upgrade` has to migrate |
+
+Run `VERSION` inside the REPL to see both, plus which engine last wrote the open
+database. To move a database written by an incompatible build, see
+[Upgrading a database](#upgrading-a-database).
+
 Newest first. Every entry is collapsed — click one to expand it.
 
 <details>
-<summary><b>Copy-on-write store mapping</b> — open 7–9× faster, 200× less memory <code>867844c</code></summary>
+<summary><b>0.9.0</b> — crash-atomic autocommit, WAL read safety, versioning &amp; <code>--upgrade</code></summary>
+
+**Two correctness bugs fixed.**
+
+- **Autocommit was not crash-atomic.** `INSERT`/`UPDATE`/`DELETE` outside a
+  transaction wrote the record, then the header, then flushed — with nothing
+  ordering the two writes. A crash in between left a row present but uncounted
+  (or deleted but still counted). Reproduced with fault injection: the old
+  binary reported `COUNT = 1` while listing 2 rows. Single-statement mutations
+  now commit through the **same WAL path** as explicit transactions, so they are
+  atomic by construction. The old non-atomic helper was deleted outright so it
+  cannot come back. Verified by crashing at all four durable writes: count and
+  rows agree every time.
+- **A WAL read error could delete the WAL.** A negative return from the log read
+  fell into the discard path, which truncates — destroying what may have been a
+  committed, acknowledged transaction. A read error now aborts instead.
+  `wal_read` also looped only once, so a short read could be mistaken for an
+  incomplete frame; it now loops like every other read path.
+
+**Versioning.** The engine version is shown in the launch banner and by the new
+`VERSION` command, and is stamped into each database's header, so you can always
+tell which build last wrote a file. The storage-format number is reported next
+to it and kept deliberately separate.
+
+**`--upgrade`.** `asmdb <db> --upgrade` migrates a database whose layout differs
+from what this build expects — today, a `.dat` written when the table had a
+different capacity, which is exactly the case that produced a bare
+`[ERR] incompatible database format`. It rehashes every live row into a **new**
+file (`<db>.upgraded.dat`), preserves the logical table name, and **never
+touches the original**; you inspect the result and swap the files yourself. A
+format with no migration path is refused rather than guessed at.
+
+**Cost, stated plainly:** autocommit went from ~650 to ~250 rows/s, because
+atomicity means three flushes (log frame, commit marker, checkpoint) instead of
+one. Transactions are unaffected — batching in `BEGIN … COMMIT` was already the
+right call and now matters more. Group commit is the roadmap answer.
+
+Tests: 61 → 77 checks per platform.
+</details>
+
+<details>
+<summary><b>0.8.0</b> — copy-on-write store mapping: open 7–9× faster, 200× less memory <code>867844c</code></summary>
 
 The slot region is no longer a 1 GiB allocation that gets read from disk before
 the first command. It is **mapped copy-on-write** from the `.dat`
@@ -703,7 +761,7 @@ this deep in the storage path.
 </details>
 
 <details>
-<summary><b>WAL frame checksums, a tested abort path, better open diagnostics</b> <code>09946f2</code></summary>
+<summary><b>0.7.0</b> — WAL frame checksums, a tested abort path, better open diagnostics <code>09946f2</code></summary>
 
 - **CRC-32 on every WAL frame.** Table-driven CRC-32 (IEEE, reflected, poly
   `0xEDB88320`) built once at startup and verified byte-for-byte against
@@ -730,7 +788,7 @@ this deep in the storage path.
 </details>
 
 <details>
-<summary><b>I/O error propagation, file validation, undo de-duplication</b> <code>3996800</code></summary>
+<summary><b>0.6.0</b> — I/O error propagation, file validation, undo de-duplication <code>3996800</code></summary>
 
 A reliability pass over the whole engine. No new features, no schema change,
 no new dependencies.
@@ -765,7 +823,7 @@ no new dependencies.
 </details>
 
 <details>
-<summary><b>Linux ELF64 port, <code>TRUNCATE</code>, and the stdin BOM fixes</b> <code>09ce053</code> · <code>8598a1f</code> · <code>0ddaf12</code> · <code>4c52647</code></summary>
+<summary><b>0.5.0</b> — Linux ELF64 port, <code>TRUNCATE</code>, and the stdin BOM fixes <code>09ce053</code> · <code>8598a1f</code> · <code>0ddaf12</code> · <code>4c52647</code></summary>
 
 - **Linux ELF64 port.** A hand-built ELF header and a raw-`syscall` backend sit
   behind a thin `os_*` platform layer, so one source builds both a Windows PE64
@@ -782,7 +840,7 @@ no new dependencies.
 </details>
 
 <details>
-<summary><b>Transactional-database principles, 2M-row scale, SaaS repositioning</b> <code>4493be7</code> · <code>7061530</code> · <code>7993439</code></summary>
+<summary><b>0.4.0</b> — transactional-database principles, 2M-row scale, SaaS repositioning <code>4493be7</code> · <code>7061530</code> · <code>7993439</code></summary>
 
 - Repositioned asmdb as a **general-purpose transactional database** that
   happens to expose an MCP server — agent memory is one example workload, not
@@ -798,7 +856,7 @@ no new dependencies.
 </details>
 
 <details>
-<summary><b>MCP server, agent-memory schema, engine spec &amp; SaaS plan</b> <code>d97bbe2</code> · <code>f6352e7</code></summary>
+<summary><b>0.3.0</b> — MCP server, 256-byte record schema, engine spec &amp; SaaS plan <code>d97bbe2</code> · <code>f6352e7</code></summary>
 
 - **MCP server** (Node) exposing the engine as a set of generic CRUD tools, plus
   Python / C# / C stdio client examples.
@@ -810,7 +868,7 @@ no new dependencies.
 </details>
 
 <details>
-<summary><b>Benchmarks, catalog commands, and the visual identity</b> <code>bc9237a</code> · <code>afd9293</code> · <code>cd866ed</code></summary>
+<summary><b>0.2.0</b> — benchmarks, catalog commands, and the visual identity <code>bc9237a</code> · <code>afd9293</code> · <code>cd866ed</code></summary>
 
 - **`BENCH`** command timing the engine from the inside with
   `QueryPerformanceCounter`, plus a harness that compares the same workloads
@@ -821,13 +879,55 @@ no new dependencies.
 </details>
 
 <details>
-<summary><b>The engine itself</b> <code>e594842</code></summary>
+<summary><b>0.1.0</b> — the engine itself <code>e594842</code></summary>
 
 The first working database: PE64 emitted by NASM alone (no linker, no CRT), a
 REPL over stdin/stdout with ASCII-art presentation, an open-addressing hash
 store over fixed 256-byte records, disk persistence, a write-ahead log with
 `BEGIN`/`COMMIT`/`ROLLBACK`, and idempotent crash recovery at startup.
 </details>
+
+## Upgrading a database
+
+asmdb refuses to open a `.dat` it does not fully understand rather than
+reinterpreting or silently recreating it — so an engine upgrade can leave you
+holding a file the new binary declines:
+
+```text
+[ERR] incompatible database format - refusing to open sales.dat
+      this build : version 1, record 256 B, capacity 4194304 slots
+      that file  : version 1, record 256 B, capacity 262144 slots
+```
+
+Migrate it with:
+
+```powershell
+asmdb sales --upgrade
+```
+
+This rehashes every live row into **`sales.upgraded.dat`** under the current
+format, keeping the logical table name, and reports how many rows moved. The
+original file is opened **read-only and never modified** — you check the result
+and swap the files yourself:
+
+```text
+  asmdb upgrade
+  source   : sales.dat
+  found    : format 1, record 256 B, capacity 262144 slots
+  this build expects format 1, record 256 B, capacity 4194304 slots
+  writing   : sales.upgraded.dat
+[ OK ] migrated 3 row(s)
+```
+
+Rules:
+
+- **Already current** → nothing is written, exit 0.
+- **A capacity that differs** → migrated, as above.
+- **A storage format or record size with no migration path in this build** →
+  refused (`[ERR] no automatic migration from that format in this build`), so a
+  guess never destroys data.
+- Run `VERSION` to see the engine build, the storage format, and which engine
+  last wrote the open database.
 
 ## Project layout
 

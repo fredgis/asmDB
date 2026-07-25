@@ -79,11 +79,32 @@
 %define FIND_NAME     44
 %define FIND_STRUCT   592
 
+; ---- Versioning ----
+; TWO independent numbers, deliberately kept apart:
+;
+;   ENGINE_VERSION  the software. Moves often. Pre-1.0 rule: while MAJOR is 0,
+;                   MINOR marks a milestone or a behaviour change and PATCH
+;                   marks fixes, perf and docs. 1.0 is declared by the project
+;                   owner, not reached automatically.
+;   DB_VERSION      the on-disk layout. Moves almost never, and ONLY when the
+;                   bytes in <db>.dat change meaning. This is the number that
+;                   governs whether a file can be opened, and the one an
+;                   upgrade path would migrate.
+;
+; The engine version that last wrote a file is stamped into the header at
+; HDR_ENGINE purely for diagnostics: it tells you which build touched a
+; database, without ever affecting whether it can be opened.
+%define ENGINE_MAJOR 0
+%define ENGINE_MINOR 9
+%define ENGINE_PATCH 0
+%define ENGINE_VERSION ((ENGINE_MAJOR << 16) | (ENGINE_MINOR << 8) | ENGINE_PATCH)
+
 ; ---- On-disk ----
 %define HDR_SIZE   512
 %define DB_VERSION 1
 %define HDR_TABLE  32         ; table-name field offset in the header
 %define TABLE_MAX  48         ; max table-name length
+%define HDR_ENGINE 80         ; u32: engine version that last wrote this file
 
 ; ---- WAL record tags ----
 %define WAL_BEGIN  1

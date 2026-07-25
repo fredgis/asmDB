@@ -223,11 +223,91 @@ PY
         r11b="$(printf '%s\n' 'COUNT' 'SELECT 2' 'EXIT' | ./asmdb fi)"
         check 'engine-written WAL replays' 'content[[:space:]]+:[[:space:]]+committed but not checkpointed' "$r11b"
         check 'recovered count is right'   '\[ OK \] 2 row\(s\)'               "$r11b"
+
+        # Run 12: autocommit is crash-atomic. A single-statement INSERT commits
+        # through the same WAL path as an explicit transaction, so a crash at ANY
+        # durable write must leave the count and the rows agreeing. Before that,
+        # a crash between the slot and header writes left a row present but
+        # uncounted.
+        for n in 1 2 3 4; do
+            ( cd "$root/src" && nasm -f bin -dLINUX -dFAULT_INJECT=$n main.asm -o "$work/fa$n" )
+            chmod +x "$work/fa$n"
+            printf '%s\n' 'INSERT 1 100 base seed row' 'EXIT' | ./asmdb "atom$n" > /dev/null
+            printf '%s\n' 'INSERT 2 200 crash row that crashes' 'EXIT' | "./fa$n" "atom$n" > /dev/null 2>&1
+            after="$(printf '%s\n' 'COUNT' 'SELECT *' 'EXIT' | ./asmdb "atom$n")"
+            declared="$(grep -oE '\[ OK \] [0-9]+ row\(s\)' <<< "$after" | head -1 | grep -oE '[0-9]+')"
+            listed="$(grep -cE '^\|[[:space:]]+[0-9]' <<< "$after" || true)"
+            if [[ "$declared" == "$listed" && "${declared:-0}" -ge 1 ]]; then
+                echo "  [PASS] autocommit atomic at durable write #$n (count=$declared, rows=$listed)"
+            else
+                echo "  [FAIL] autocommit atomic at durable write #$n (count=$declared, rows=$listed)"
+                fail=$((fail+1))
+            fi
+        done
     else
         echo "  [SKIP] fault-injection checks (nasm not found)"
     fi
 else
     echo "  [SKIP] WAL recovery checks (python3 not found)"
+fi
+
+# Run 13: engine version is reported, and stamped into the database
+r13="$(printf '%s\n' 'INSERT 1 1 a x' 'VERSION' 'EXIT' | ./asmdb verdb)"
+check 'VERSION reports the engine' 'asmdb[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+'          "$r13"
+check 'VERSION reports the format' 'storage format[[:space:]]+:[[:space:]]+1'         "$r13"
+check 'VERSION stamps the writer'  'written by[[:space:]]+:[[:space:]]+engine[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' "$r13"
+check 'banner shows the version'   'v[0-9]+\.[0-9]+\.[0-9]+'                          "$r13"
+r13b="$(printf '%s\n' 'VERSION' 'EXIT' | ./asmdb verdb)"
+check 'writer stamp survives reopen' 'written by[[:space:]]+:[[:space:]]+engine'      "$r13b"
+
+# Run 14: --upgrade migrates a database whose capacity predates this build, into
+# a NEW file, leaving the original byte-for-byte untouched.
+if command -v python3 >/dev/null 2>&1; then
+    python3 - legacy.dat <<'PY'
+import struct, sys
+CAP_OLD = 262144; REC = 256; HDR = 512
+GOLDEN = 0x9E3779B97F4A7C15; shift = 64 - 18
+def slot(k): return ((k * GOLDEN) & 0xFFFFFFFFFFFFFFFF) >> shift
+hdr = bytearray(HDR); hdr[0:8] = b'ASMDB\0\0\0'
+struct.pack_into('<I', hdr, 8, 1); struct.pack_into('<I', hdr, 12, REC)
+struct.pack_into('<Q', hdr, 16, CAP_OLD); struct.pack_into('<Q', hdr, 24, 3)
+hdr[32:39] = b'oldtbl\0'
+data = bytearray(CAP_OLD * REC)
+for rid, val, tag, txt in [(1,10,'alpha','ligne un'),(2,20,'beta','ligne deux'),(3,30,'gamma','ligne trois')]:
+    i = slot(rid); off = i * REC
+    while data[off+8] != 0:
+        i = (i + 1) % CAP_OLD; off = i * REC
+    struct.pack_into('<Q', data, off, rid); data[off+8] = 1
+    struct.pack_into('<I', data, off+12, len(txt))
+    struct.pack_into('<q', data, off+16, 1); struct.pack_into('<q', data, off+24, 1)
+    struct.pack_into('<q', data, off+32, val)
+    tb = tag.encode(); data[off+40:off+40+len(tb)] = tb
+    cb = txt.encode(); data[off+80:off+80+len(cb)] = cb
+open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
+PY
+    size_before="$(stat -c%s legacy.dat)"
+    refused="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb legacy 2>&1)"; rc=$?
+    if [[ $rc -ne 0 ]] && grep -q 'incompatible database format' <<< "$refused"; then
+        echo "  [PASS] legacy capacity refused normally"
+    else
+        echo "  [FAIL] legacy capacity refused normally"; fail=$((fail+1))
+    fi
+    up="$(./asmdb legacy --upgrade 2>&1)"
+    check 'upgrade reports migrated rows' 'migrated 3 row'                            "$up"
+    if [[ "$(stat -c%s legacy.dat)" == "$size_before" ]]; then
+        echo "  [PASS] upgrade left the original alone"
+    else
+        echo "  [FAIL] upgrade left the original alone"; fail=$((fail+1))
+    fi
+    cp legacy.upgraded.dat migrated.dat
+    mg="$(printf '%s\n' 'COUNT' 'SELECT 2' 'TABLES' 'EXIT' | ./asmdb migrated)"
+    check 'migrated rows are all there' '\[ OK \] 3 row\(s\)'                         "$mg"
+    check 'migrated content intact'     'content[[:space:]]+:[[:space:]]+ligne deux'  "$mg"
+    check 'migrated table name kept'    'oldtbl'                                      "$mg"
+    noop="$(./asmdb migrated --upgrade 2>&1)"
+    check 'upgrade no-ops when current' 'already in the current format'               "$noop"
+else
+    echo "  [SKIP] upgrade checks (python3 not found)"
 fi
 
 if [[ $fail -gt 0 ]]; then echo; echo "$fail check(s) failed."; exit 1; fi

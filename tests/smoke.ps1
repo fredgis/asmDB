@@ -263,6 +263,27 @@ try {
                 $r11b = $r11b -join "`n"
                 Check 'engine-written WAL replays'     ($r11b -match 'content\s+:\s+committed but not checkpointed')
                 Check 'recovered count is right'       ($r11b -match '\[ OK \] 2 row\(s\)')
+
+                # Run 12: autocommit is crash-atomic. A single-statement INSERT
+                # goes through the same WAL commit as an explicit transaction, so
+                # a crash at ANY durable write must leave the row count and the
+                # rows themselves agreeing. Before that change, a crash between
+                # the slot write and the header write left a row present but
+                # uncounted.
+                foreach ($n in 1, 2, 3, 4) {
+                    $fx = Join-Path $work "faulty$n.exe"
+                    Push-Location (Join-Path $root 'src')
+                    & $nasm -f bin "-dFAULT_INJECT=$n" main.asm -o $fx 2>&1 | Out-Null
+                    Pop-Location
+                    $db = "atom$n"
+                    (@('INSERT 1 100 base seed row', 'EXIT') -join "`n") | .\asmdb.exe $db | Out-Null
+                    (@('INSERT 2 200 crash row that crashes', 'EXIT') -join "`n") | & $fx $db 2>&1 | Out-Null
+                    $after = (@('COUNT', 'SELECT *', 'EXIT') -join "`n") | .\asmdb.exe $db
+                    $after = $after -join "`n"
+                    $declared = if ($after -match '\[ OK \] (\d+) row\(s\)') { [int]$Matches[1] } else { -1 }
+                    $listed = ([regex]::Matches($after, '(?m)^\|\s+\d')).Count
+                    Check "autocommit atomic at durable write #$n (count=$declared, rows=$listed)" ($declared -eq $listed -and $declared -ge 1)
+                }
             } else {
                 Write-Host "  [SKIP] fault-injection checks (nasm build failed)" -ForegroundColor Yellow
             }
@@ -271,6 +292,60 @@ try {
         }
     } else {
         Write-Host "  [SKIP] WAL recovery checks (python not found)" -ForegroundColor Yellow
+    }
+
+    # Run 13: engine version is reported, and stamped into the database
+    $r13 = (@('INSERT 1 1 a x', 'VERSION', 'EXIT') -join "`n") | .\asmdb.exe verdb
+    $r13 = $r13 -join "`n"
+    Check 'VERSION reports the engine'   ($r13 -match 'asmdb\s+\d+\.\d+\.\d+')
+    Check 'VERSION reports the format'   ($r13 -match 'storage format\s+:\s+1')
+    Check 'VERSION stamps the writer'    ($r13 -match 'written by\s+:\s+engine\s+\d+\.\d+\.\d+')
+    Check 'banner shows the version'     ($r13 -match 'v\d+\.\d+\.\d+')
+    $r13b = (@('VERSION', 'EXIT') -join "`n") | .\asmdb.exe verdb
+    Check 'writer stamp survives reopen' (($r13b -join "`n") -match 'written by\s+:\s+engine\s+\d+\.\d+\.\d+')
+
+    # Run 14: --upgrade migrates a database whose capacity predates this build,
+    # into a NEW file, leaving the original byte-for-byte untouched.
+    if ($py) {
+        $mk = Join-Path $work 'mklegacy.py'
+        Set-Content -Path $mk -Encoding ASCII -Value @'
+import struct, sys
+CAP_OLD = 262144; REC = 256; HDR = 512
+GOLDEN = 0x9E3779B97F4A7C15; shift = 64 - 18
+def slot(k): return ((k * GOLDEN) & 0xFFFFFFFFFFFFFFFF) >> shift
+hdr = bytearray(HDR); hdr[0:8] = b'ASMDB\0\0\0'
+struct.pack_into('<I', hdr, 8, 1); struct.pack_into('<I', hdr, 12, REC)
+struct.pack_into('<Q', hdr, 16, CAP_OLD); struct.pack_into('<Q', hdr, 24, 3)
+hdr[32:39] = b'oldtbl\0'
+data = bytearray(CAP_OLD * REC)
+for rid, val, tag, txt in [(1,10,'alpha','ligne un'),(2,20,'beta','ligne deux'),(3,30,'gamma','ligne trois')]:
+    i = slot(rid); off = i * REC
+    while data[off+8] != 0:
+        i = (i + 1) % CAP_OLD; off = i * REC
+    struct.pack_into('<Q', data, off, rid); data[off+8] = 1
+    struct.pack_into('<I', data, off+12, len(txt))
+    struct.pack_into('<q', data, off+16, 1); struct.pack_into('<q', data, off+24, 1)
+    struct.pack_into('<q', data, off+32, val)
+    tb = tag.encode(); data[off+40:off+40+len(tb)] = tb
+    cb = txt.encode(); data[off+80:off+80+len(cb)] = cb
+open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
+'@
+        & python $mk (Join-Path $work 'legacy.dat') | Out-Null
+        $sizeBefore = (Get-Item (Join-Path $work 'legacy.dat')).Length
+        $refused = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe legacy 2>&1
+        Check 'legacy capacity refused normally' ($LASTEXITCODE -ne 0 -and ($refused -join "`n") -match 'incompatible database format')
+        $up = (& .\asmdb.exe legacy --upgrade 2>&1) -join "`n"
+        Check 'upgrade reports migrated rows'   ($up -match 'migrated 3 row')
+        Check 'upgrade left the original alone' ((Get-Item (Join-Path $work 'legacy.dat')).Length -eq $sizeBefore)
+        Copy-Item (Join-Path $work 'legacy.upgraded.dat') (Join-Path $work 'migrated.dat') -Force
+        $mg = ((@('COUNT', 'SELECT 2', 'TABLES', 'EXIT') -join "`n") | .\asmdb.exe migrated) -join "`n"
+        Check 'migrated rows are all there' ($mg -match '\[ OK \] 3 row\(s\)')
+        Check 'migrated content intact'     ($mg -match 'content\s+:\s+ligne deux')
+        Check 'migrated table name kept'    ($mg -match 'oldtbl')
+        $noop = (& .\asmdb.exe migrated --upgrade 2>&1) -join "`n"
+        Check 'upgrade no-ops when current' ($noop -match 'already in the current format')
+    } else {
+        Write-Host "  [SKIP] upgrade checks (python not found)" -ForegroundColor Yellow
     }
 }
 finally {

@@ -298,6 +298,11 @@ print_banner:
     lea  rcx, [rel s_meta]
     lea  rdx, [rel c_dim]
     call puts_col
+    lea  rcx, [rel s_bnr_ver]
+    lea  rdx, [rel c_dim]
+    call puts_col
+    mov  ecx, ENGINE_VERSION
+    call put_ver
     call crlf
     call crlf
     lea  rcx, [rel s_hint_a]

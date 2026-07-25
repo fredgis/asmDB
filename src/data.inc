@@ -16,6 +16,9 @@ g_count:       dq 0
 g_dat_handle:  dq 0
 g_wal_handle:  dq 0
 g_in_txn:      dq 0
+g_auto_txn:    dq 0                  ; 1 = the open transaction is implicit
+g_writer_ver:  dq 0                  ; engine version that last wrote the open db
+g_upgrade:     dq 0                  ; 1 = --upgrade was passed on the command line
 g_undo:        dq 0
 g_undo_n:      dq 0
 g_count_snap:  dq 0
@@ -56,7 +59,9 @@ g_hdr:
     dd REC_SIZE                      ; +12
     dq CAPACITY                      ; +16
     dq 0                             ; +24 live count (rewritten at runtime)
-    times HDR_SIZE-32 db 0           ; pad to 512
+    times HDR_ENGINE-32 db 0         ; +32 table name (rewritten at runtime)
+    dd ENGINE_VERSION                ; +80 engine that last wrote this file
+    times HDR_SIZE-(HDR_ENGINE+4) db 0   ; pad to 512
 
 ; ------------------------------- strings ------------------------------------
 ; ANSI SGR colors (emitted only when stdout is a real console).
@@ -123,6 +128,40 @@ s_fmt_slots:    db ' slots', 13, 10, 0
 s_fmt_hint:     db '      Written by a different build of asmdb. Open another database name', 13, 10
                 db '      (asmdb <name>), or move/remove the file if you no longer need it.', 13, 10, 0
 s_nl:           db 13, 10, 0
+s_ver_pre:      db '  asmdb ', 0
+s_ver_pre10:    db '   (pre-1.0: the on-disk format may still change)', 13, 10, 0
+s_ver_fmt:      db '  storage format : ', 0
+s_ver_rec:      db '  record size    : ', 0
+s_ver_recb:     db ' bytes', 13, 10, 0
+s_ver_cap:      db '  capacity       : ', 0
+s_ver_slots:    db ' slots', 13, 10, 0
+s_ver_plat:     db '  platform       : ', 0
+%ifdef LINUX
+s_ver_platname: db 'Linux ELF64 (raw syscalls)', 13, 10, 0
+%else
+s_ver_platname: db 'Windows PE64 (kernel32)', 13, 10, 0
+%endif
+s_ver_writer:   db '  written by     : engine ', 0
+s_ver_older:    db '  written by     : an engine older than 0.9 (no stamp)', 13, 10, 0
+s_verdot:       db '.', 0
+s_bnr_ver:      db '  .  v', 0
+s_flag_upgrade: db '--upgrade', 0
+s_upg_suffix:   db '.upgraded.dat', 0
+s_upg_head:     db '  asmdb upgrade', 13, 10, 0
+s_upg_src:      db '  source   : ', 0
+s_upg_srcfmt:   db '  found    : format ', 0
+s_upg_curfmt:   db '  this build expects format ', 0
+s_upg_recs:     db ', record ', 0
+s_upg_caps:     db ' B, capacity ', 0
+s_upg_slots:    db ' slots', 13, 10, 0
+s_upg_already:  db '[ OK ] already in the current format - nothing to do', 13, 10, 0
+s_upg_cant:     db '[ERR] no automatic migration from that format in this build', 13, 10, 0
+s_upg_nosrc:    db '[ERR] no database file to upgrade', 13, 10, 0
+s_upg_dest:     db '  writing   : ', 0
+s_upg_ok:       db '[ OK ] migrated ', 0
+s_upg_rows:     db ' row(s)', 13, 10, 0
+s_upg_swap:     db '  The original was NOT modified. Check the new file, then swap them:', 13, 10
+                db '    rename <db>.dat to <db>.dat.old, then <db>.upgraded.dat to <db>.dat', 13, 10, 0
 s_err_walcrc:   db '[ERR] write-ahead log is corrupt (checksum mismatch) - refusing to open ', 0
 s_walcrc_hint:  db '      A committed transaction cannot be replayed safely from a damaged log.', 13, 10
                 db '      Restore from a backup, or delete the .wal file to discard that', 13, 10
@@ -203,6 +242,8 @@ hc_schema:  db 'SCHEMA', 0
 hd_schema:  db 'show the record layout', 0
 hc_types:   db 'TYPES', 0
 hd_types:   db 'supported column types', 0
+hc_version: db 'VERSION', 0
+hd_version: db 'engine build, storage format, writer stamp', 0
 hc_bench:   db 'BENCH <n>', 0
 hd_bench:   db 'insert n synthetic rows, report rows/sec', 0
 
@@ -298,6 +339,7 @@ kw_rollback:   db 'ROLLBACK', 0
 kw_tables:     db 'TABLES', 0
 kw_databases:  db 'DATABASES', 0
 kw_schema:     db 'SCHEMA', 0
+kw_version:    db 'VERSION', 0
 kw_types:      db 'TYPES', 0
 kw_bench:      db 'BENCH', 0
 kw_find:       db 'FIND', 0

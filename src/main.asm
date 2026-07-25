@@ -120,6 +120,8 @@ entry:
     call crc32_init                  ; WAL frame checksums
 
     call db_init_names
+    cmp  qword [rel g_upgrade], 0
+    jne  .upgrade
     call db_open
 
     call print_banner
@@ -128,6 +130,10 @@ entry:
 
     call db_close
     xor  ecx, ecx
+    call os_exit
+.upgrade:
+    call db_upgrade                  ; migrate in place of the normal session
+    mov  ecx, eax
     call os_exit
 
 ; ----------------------------- REPL loop ------------------------------------

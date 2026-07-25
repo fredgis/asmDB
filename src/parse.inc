@@ -423,8 +423,9 @@ cmd_insert:
     test rdx, rdx
     jz   .full
     mov  rbx, rdx                    ; target slot (preserved across calls)
+    call auto_begin                  ; implicit txn unless already inside one
     mov  rcx, rbx
-    call txn_capture                 ; record undo image (no-op outside a txn)
+    call txn_capture                 ; record undo image
     test rax, rax
     jz   .toobig
     mov  rax, [rbp-32]
@@ -447,11 +448,7 @@ cmd_insert:
     mov  rcx, CONTENT_MAX
     rep  movsb
     inc  qword [rel g_count]
-    cmp  qword [rel g_in_txn], 0
-    jne  .deferred
-    mov  rcx, rbx
-    call db_persist_slot
-.deferred:
+    call auto_commit                 ; durable through the WAL; no-op in a txn
     lea  rcx, [rel s_ok_ins]
     call puts
     jmp  .done
@@ -517,6 +514,7 @@ cmd_update:
     test rax, rax
     jz   .notfound
     mov  rbx, rax                    ; slot (preserved)
+    call auto_begin
     mov  rcx, rbx
     call txn_capture
     test rax, rax
@@ -535,11 +533,7 @@ cmd_update:
     lea  rdi, [rbx+REC_CONTENT]
     mov  rcx, CONTENT_MAX
     rep  movsb
-    cmp  qword [rel g_in_txn], 0
-    jne  .deferred
-    mov  rcx, rbx
-    call db_persist_slot
-.deferred:
+    call auto_commit
     lea  rcx, [rel s_ok_upd]
     call puts
     jmp  .done
@@ -582,17 +576,14 @@ cmd_delete:
     test rax, rax
     jz   .notfound
     mov  rdi, rax
+    call auto_begin
     mov  rcx, rdi
     call txn_capture
     test rax, rax
     jz   .toobig
     mov  byte [rdi+REC_STATUS], ST_DELETED
     dec  qword [rel g_count]
-    cmp  qword [rel g_in_txn], 0
-    jne  .deferred
-    mov  rcx, rdi
-    call db_persist_slot
-.deferred:
+    call auto_commit
     lea  rcx, [rel s_ok_del]
     call puts
     jmp  .done
@@ -1399,6 +1390,9 @@ cmd_help:
     lea  rcx, [rel hc_types]
     lea  rdx, [rel hd_types]
     call help_row
+    lea  rcx, [rel hc_version]
+    lea  rdx, [rel hd_version]
+    call help_row
     lea  rcx, [rel hc_bench]
     lea  rdx, [rel hd_bench]
     call help_row
@@ -1425,6 +1419,94 @@ cmd_help:
     lea  rdx, [rel hd_exit]
     call help_row
     call crlf
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; put_ver(rcx = packed version) - print "major.minor.patch"
+put_ver:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rbx
+    mov  rbx, rcx
+    mov  rcx, rbx
+    shr  rcx, 16
+    and  rcx, 0xFF
+    call put_u64
+    lea  rcx, [rel s_verdot]
+    call puts
+    mov  rcx, rbx
+    shr  rcx, 8
+    and  rcx, 0xFF
+    call put_u64
+    lea  rcx, [rel s_verdot]
+    call puts
+    mov  rcx, rbx
+    and  rcx, 0xFF
+    call put_u64
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_version() - VERSION : engine build, on-disk format, and which engine last
+;   wrote the open database. The engine number and the format number are
+;   deliberately separate: the first moves with every release, the second only
+;   when the bytes on disk change meaning.
+cmd_version:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    lea  rcx, [rel s_ver_pre]
+    call puts
+    mov  ecx, ENGINE_VERSION
+    call put_ver
+%if ENGINE_MAJOR == 0
+    lea  rcx, [rel s_ver_pre10]
+    call puts
+%else
+    lea  rcx, [rel s_nl]
+    call puts
+%endif
+    lea  rcx, [rel s_ver_fmt]
+    call puts
+    mov  ecx, DB_VERSION
+    call put_u64
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel s_ver_rec]
+    call puts
+    mov  ecx, REC_SIZE
+    call put_u64
+    lea  rcx, [rel s_ver_recb]
+    call puts
+    lea  rcx, [rel s_ver_cap]
+    call puts
+    mov  ecx, CAPACITY
+    call put_u64
+    lea  rcx, [rel s_ver_slots]
+    call puts
+    lea  rcx, [rel s_ver_plat]
+    call puts
+    lea  rcx, [rel s_ver_platname]
+    call puts
+    ; which engine last wrote this database (0 = predates the stamp)
+    mov  rax, [rel g_writer_ver]
+    test rax, rax
+    jz   .nostamp
+    mov  [rbp-16], rax
+    lea  rcx, [rel s_ver_writer]
+    call puts
+    mov  rcx, [rbp-16]
+    call put_ver
+    lea  rcx, [rel s_nl]
+    call puts
+    jmp  .done
+.nostamp:
+    lea  rcx, [rel s_ver_older]
+    call puts
+.done:
     mov  rsp, rbp
     pop  rbp
     ret
@@ -1670,6 +1752,10 @@ dispatch:
     call token_eq
     test rax, rax
     jnz  .schema
+    lea  rdi, [rel kw_version]
+    call token_eq
+    test rax, rax
+    jnz  .version
     lea  rdi, [rel kw_types]
     call token_eq
     test rax, rax
@@ -1739,6 +1825,9 @@ dispatch:
     jmp  .ok0
 .schema:
     call cmd_schema
+    jmp  .ok0
+.version:
+    call cmd_version
     jmp  .ok0
 .types:
     call cmd_types

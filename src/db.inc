@@ -226,14 +226,45 @@ db_write_slot:
     pop  rbp
     ret
 
-; db_persist_slot(rcx = slot ptr) - slot + header + flush (durable autocommit)
-db_persist_slot:
+; NOTE: there is deliberately no "write the slot, then the header, then fsync"
+; helper any more. That sequence was the old autocommit path and it was not
+; crash-atomic: a crash between the two writes left the record on disk with a
+; stale count (a row present but uncounted, or deleted but still counted), and
+; nothing ordered the two writes anyway. Single-statement mutations now go
+; through the same WAL commit as explicit transactions - see auto_begin /
+; auto_commit / txn_flush in wal.inc.
+
+; scan_upgrade(rsi = command line) - set g_upgrade if "--upgrade" appears
+scan_upgrade:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
-    call db_write_slot               ; rcx = slot ptr
-    call db_write_header
-    call db_flush
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  rbx, rsi
+.outer:
+    cmp  byte [rbx], 0
+    je   .done
+    lea  rsi, [rel s_flag_upgrade]
+    mov  rcx, rbx
+.inner:
+    mov  dl, [rsi]
+    test dl, dl
+    jz   .found
+    mov  al, [rcx]
+    cmp  al, dl
+    jne  .next
+    inc  rsi
+    inc  rcx
+    jmp  .inner
+.next:
+    inc  rbx
+    jmp  .outer
+.found:
+    mov  qword [rel g_upgrade], 1
+.done:
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret
@@ -247,6 +278,7 @@ db_init_names:
     mov  [rbp-24], rdi
     call os_cmdline
     mov  rsi, rax
+    call scan_upgrade                ; sets g_upgrade if --upgrade is present
     ; skip program name (handle quoted path)
     mov  al, [rsi]
     cmp  al, '"'
@@ -297,6 +329,8 @@ db_init_names:
     mov  byte [rdi+rcx], 0
     test rcx, rcx
     jz   .default
+    cmp  byte [rdi], '-'             ; a flag, not a database name
+    je   .default
     ; optional 2nd arg = table name
     mov  al, [rsi]
     cmp  al, '"'
@@ -331,6 +365,8 @@ db_init_names:
     mov  byte [rdi+rcx], 0
     test rcx, rcx
     jz   .build
+    cmp  byte [rdi], '-'             ; a flag, not a table name
+    je   .build
     mov  dword [rel g_have_argtable], 1
     jmp  .build
 .default:
@@ -404,6 +440,9 @@ db_open:
     cmp  rax, rdx
     ja   .corrupt
     mov  [rel g_count], rax
+    ; remember which engine last wrote this file (0 = predates the stamp)
+    mov  eax, [rel g_hdr_read+HDR_ENGINE]
+    mov  [rel g_writer_ver], rax
     ; resolve table name: CLI arg overrides, else header, else base
     cmp  dword [rel g_have_argtable], 0
     jne  .name_arg
@@ -435,6 +474,7 @@ db_open:
     mov  rcx, [rel g_dat_handle]
     call os_set_sparse
     mov  qword [rel g_count], 0
+    mov  qword [rel g_writer_ver], ENGINE_VERSION   ; we are creating it
     cmp  dword [rel g_have_argtable], 0
     jne  .nf_arg
     lea  rsi, [rel g_base]
@@ -555,6 +595,247 @@ db_open:
     call puts
     mov  ecx, 1
     call os_exit
+
+; db_upgrade() - migrate <db>.dat into <db>.upgraded.dat under the format this
+;   build expects, then report. The source file is opened READ-ONLY and is never
+;   modified: the operator inspects the result and swaps the files. That is the
+;   whole safety story - an upgrade that goes wrong costs nothing.
+;
+;   Today the only migratable difference is a changed CAPACITY (the records
+;   themselves are unchanged, but they hash to different slots, so every live
+;   row is re-inserted). A different DB_VERSION or REC_SIZE has no migration
+;   path in this build and is refused rather than guessed at.
+db_upgrade:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x90
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    mov  [rbp-32], r12
+    mov  [rbp-40], r13
+    mov  [rbp-48], r14
+    lea  rcx, [rel s_upg_head]
+    call puts
+    lea  rcx, [rel s_upg_src]
+    call puts
+    lea  rcx, [rel g_datname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    ; ---- open the source read-only ----
+    lea  rcx, [rel g_datname]
+    call os_open_read
+    cmp  rax, INVALID_HANDLE
+    je   .nosrc
+    mov  r14, rax
+    mov  rcx, r14
+    xor  rdx, rdx
+    lea  r8, [rel g_hdr_read]
+    mov  r9, HDR_SIZE
+    call os_pread
+    cmp  rax, HDR_SIZE
+    jne  .badsrc
+    mov  rax, [rel g_hdr]
+    cmp  rax, [rel g_hdr_read]       ; 8-byte magic
+    jne  .badsrc
+    ; ---- report what we found ----
+    lea  rcx, [rel s_upg_srcfmt]
+    call puts
+    mov  ecx, [rel g_hdr_read+8]
+    call put_u64
+    lea  rcx, [rel s_upg_recs]
+    call puts
+    mov  ecx, [rel g_hdr_read+12]
+    call put_u64
+    lea  rcx, [rel s_upg_caps]
+    call puts
+    mov  rcx, [rel g_hdr_read+16]
+    call put_u64
+    lea  rcx, [rel s_upg_slots]
+    call puts
+    lea  rcx, [rel s_upg_curfmt]
+    call puts
+    mov  ecx, DB_VERSION
+    call put_u64
+    lea  rcx, [rel s_upg_recs]
+    call puts
+    mov  ecx, REC_SIZE
+    call put_u64
+    lea  rcx, [rel s_upg_caps]
+    call puts
+    mov  ecx, CAPACITY
+    call put_u64
+    lea  rcx, [rel s_upg_slots]
+    call puts
+    ; ---- classify ----
+    cmp  dword [rel g_hdr_read+8], DB_VERSION
+    jne  .cant
+    cmp  dword [rel g_hdr_read+12], REC_SIZE
+    jne  .cant
+    mov  rax, CAPACITY
+    cmp  [rel g_hdr_read+16], rax
+    je   .already
+    mov  r13, [rel g_hdr_read+16]    ; old capacity
+    ; ---- create the destination ----
+    lea  rdi, [rel g_bakname]
+    lea  rsi, [rel g_base]
+    call strcpy_z
+    lea  rsi, [rel s_upg_suffix]
+    call strcpy_z
+    lea  rcx, [rel s_upg_dest]
+    call puts
+    lea  rcx, [rel g_bakname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    lea  rcx, [rel g_bakname]
+    call os_create
+    cmp  rax, INVALID_HANDLE
+    je   .nodest
+    mov  [rel g_dat_handle], rax
+    mov  rcx, rax
+    call os_set_sparse
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    call os_truncate
+    test rax, rax
+    jnz  io_fatal
+    ; keep the source's logical table name
+    lea  rdi, [rel g_tablename]
+    lea  rsi, [rel g_hdr_read+HDR_TABLE]
+    mov  rcx, TABLE_MAX
+    call strcpy_n
+    mov  qword [rel g_count], 0
+    call db_write_header
+    ; map the destination as the live store and rehash into it
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    call os_map_cow
+    test rax, rax
+    jz   .nodest
+    add  rax, HDR_SIZE
+    mov  [rel g_table], rax
+    ; ---- stream the source region in WAL_BUF_SIZE chunks ----
+    mov  rax, r13
+    shl  rax, REC_SHIFT
+    mov  [rbp-56], rax               ; source region length
+    xor  r12, r12                    ; offset within it
+.chunk:
+    mov  rax, [rbp-56]
+    cmp  r12, rax
+    jae  .streamed
+    mov  rbx, rax
+    sub  rbx, r12
+    mov  rax, WAL_BUF_SIZE
+    cmp  rbx, rax
+    jbe  .haveln
+    mov  rbx, rax
+.haveln:
+    mov  rcx, r14
+    mov  rdx, r12
+    add  rdx, HDR_SIZE
+    mov  r8, [rel g_walbuf]
+    mov  r9, rbx
+    call os_pread
+    cmp  rax, 0
+    jle  .streamed                   ; EOF or error - stop with what we have
+    mov  rbx, rax
+    xor  rsi, rsi                    ; offset inside the chunk
+.rec:
+    mov  rax, rsi
+    add  rax, REC_SIZE
+    cmp  rax, rbx
+    ja   .chunkdone
+    mov  rdi, [rel g_walbuf]
+    add  rdi, rsi
+    cmp  byte [rdi+REC_STATUS], ST_OCCUPIED
+    jne  .recnext
+    mov  [rbp-64], rdi
+    mov  rcx, [rdi+REC_ID]
+    call store_locate                ; rdx = insertable slot in the NEW table
+    test rdx, rdx
+    jz   .recnext                    ; no room - cannot happen below 0.75 load
+    mov  [rbp-72], rsi
+    mov  rsi, [rbp-64]
+    mov  rdi, rdx
+    mov  rcx, REC_SIZE
+    rep  movsb
+    mov  rsi, [rbp-72]
+    inc  qword [rel g_count]
+.recnext:
+    add  rsi, REC_SIZE
+    jmp  .rec
+.chunkdone:
+    add  r12, rbx
+    jmp  .chunk
+.streamed:
+    ; ---- persist the rebuilt table ----
+    mov  rcx, HDR_SIZE
+    mov  rdx, [rel g_table]
+    mov  r8, CAPACITY*REC_SIZE
+    call write_at
+    mov  rdx, CAPACITY*REC_SIZE
+    cmp  rax, rdx
+    jne  io_fatal
+    call db_write_header
+    call db_flush
+    mov  rcx, r14
+    call os_close
+    lea  rcx, [rel s_upg_ok]
+    call puts
+    mov  rcx, [rel g_count]
+    call put_u64
+    lea  rcx, [rel s_upg_rows]
+    call puts
+    lea  rcx, [rel s_upg_swap]
+    call puts
+    xor  eax, eax
+    jmp  .ret
+.already:
+    mov  rcx, r14
+    call os_close
+    lea  rcx, [rel s_upg_already]
+    call puts
+    xor  eax, eax
+    jmp  .ret
+.cant:
+    mov  rcx, r14
+    call os_close
+    lea  rcx, [rel s_upg_cant]
+    call puts
+    mov  eax, 1
+    jmp  .ret
+.badsrc:
+    mov  rcx, r14
+    call os_close
+    lea  rcx, [rel s_err_corrupt]
+    call puts
+    lea  rcx, [rel g_datname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    mov  eax, 1
+    jmp  .ret
+.nodest:
+    lea  rcx, [rel s_err_bak_open]
+    call puts
+    mov  eax, 1
+    jmp  .ret
+.nosrc:
+    lea  rcx, [rel s_upg_nosrc]
+    call puts
+    mov  eax, 1
+.ret:
+    mov  r14, [rbp-48]
+    mov  r13, [rbp-40]
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
 
 ; db_close()
 db_close:

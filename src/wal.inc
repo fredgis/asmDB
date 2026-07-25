@@ -70,16 +70,46 @@ wal_write:
     pop  rbp
     ret
 
-; wal_read(rcx = offset, rdx = buf, r8 = len) -> rax = bytes read, or -1
+; wal_read(rcx = offset, rdx = buf, r8 = len) -> rax = total bytes read, or -1
+;   Loops like read_at: a single pread is not guaranteed to satisfy a large
+;   request, and treating a short transfer as "the frame is incomplete" would
+;   hand a committed transaction to the discard path.
 wal_read:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x30
-    mov  r9, r8                      ; len
-    mov  r8, rdx                     ; buf
-    mov  rdx, rcx                    ; offset
-    mov  rcx, [rel g_wal_handle]     ; handle
+    sub  rsp, 0x50
+    mov  [rbp-8], rbx                ; total
+    mov  [rbp-16], rsi               ; offset
+    mov  [rbp-24], rdi               ; buffer
+    mov  [rbp-32], r12               ; remaining
+    xor  rbx, rbx
+    mov  rsi, rcx
+    mov  rdi, rdx
+    mov  r12, r8
+.loop:
+    test r12, r12
+    jz   .done
+    mov  rcx, [rel g_wal_handle]
+    mov  rdx, rsi                    ; offset
+    mov  r8, rdi                     ; buf
+    mov  r9, r12                     ; len
     call os_pread
+    test rax, rax
+    js   .fail                       ; hard I/O error
+    jz   .done                       ; EOF - report what we actually got
+    add  rbx, rax
+    add  rsi, rax
+    add  rdi, rax
+    sub  r12, rax
+    jmp  .loop
+.fail:
+    mov  rbx, -1
+.done:
+    mov  rax, rbx
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret
@@ -98,6 +128,14 @@ wal_flush:
     ret
 
 ; wal_truncate() - reset the WAL to empty (removes any commit marker)
+;   The flush is NOT redundant, even though replaying an already-applied frame
+;   would be idempotent. Without it, a crash can leave the old frame's bytes on
+;   disk beyond a shorter frame written later; if that leftover happens to place
+;   'COMMIT01' exactly where the new frame's marker belongs - a row containing
+;   that literal text is enough - recovery would read a marker whose checksum
+;   cannot match and refuse to open a database that was merely mid-commit.
+;   Emptying the log durably is what makes "the log is empty" a fact rather than
+;   a hope, so it stays.
 wal_truncate:
     push rbp
     mov  rbp, rsp
@@ -127,7 +165,9 @@ wal_recover:
     mov  r8, WAL_BUF_SIZE
     call wal_read                    ; rax = bytes read
     test rax, rax
-    js   .clear                      ; unreadable WAL -> discard it
+    js   io_fatal_read               ; a READ ERROR is not an absent transaction:
+                                     ; discarding here would destroy a WAL that
+                                     ; may hold a committed, acknowledged commit
     mov  r12, rax                    ; bytes available
     cmp  r12, 24
     jb   .clear
@@ -346,8 +386,14 @@ cmd_begin:
     pop  rbp
     ret
 
-; cmd_commit() - COMMIT
-cmd_commit:
+; txn_flush() - make the open transaction durable and checkpoint it into the
+;   .dat: stage after-images into the WAL, flush, write the commit marker plus
+;   its checksum, flush again (the transaction is committed at that instant),
+;   then apply the images, publish the count and truncate the log.
+;   Shared by the explicit COMMIT and by autocommit, so a single-statement
+;   mutation gets exactly the same crash guarantees as a multi-statement one.
+;   Clears g_in_txn / g_undo_n. Prints nothing.
+txn_flush:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x60
@@ -355,8 +401,6 @@ cmd_commit:
     mov  [rbp-16], rsi
     mov  [rbp-24], rdi
     mov  [rbp-32], r12
-    cmp  qword [rel g_in_txn], 0
-    je   .none
     mov  rbx, [rel g_walbuf]
     mov  rax, [rel wal_magic2]
     mov  [rbx], rax                  ; +0 magic
@@ -442,6 +486,52 @@ cmd_commit:
     call wal_truncate                ; checkpoint complete
     mov  qword [rel g_in_txn], 0
     mov  qword [rel g_undo_n], 0
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; auto_begin() - open an implicit single-statement transaction when the caller
+;   is not already inside an explicit one. Call it only once the statement is
+;   certain to mutate, so no error path can leave a transaction dangling.
+auto_begin:
+    cmp  qword [rel g_in_txn], 0
+    jne  .already
+    mov  qword [rel g_in_txn], 1
+    mov  qword [rel g_auto_txn], 1
+    mov  qword [rel g_undo_n], 0
+    mov  rax, [rel g_count]
+    mov  [rel g_count_snap], rax
+.already:
+    ret
+
+; auto_commit() - make an implicit transaction durable. A no-op inside an
+;   explicit transaction, where COMMIT decides when the changes land.
+auto_commit:
+    cmp  qword [rel g_auto_txn], 0
+    je   .nothing
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call txn_flush
+    mov  qword [rel g_auto_txn], 0
+    mov  rsp, rbp
+    pop  rbp
+.nothing:
+    ret
+
+; cmd_commit() - COMMIT
+cmd_commit:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    cmp  qword [rel g_in_txn], 0
+    je   .none
+    call txn_flush
+    mov  qword [rel g_auto_txn], 0
     lea  rcx, [rel s_txn_commit]
     call puts
     jmp  .done
@@ -449,10 +539,6 @@ cmd_commit:
     lea  rcx, [rel s_txn_none]
     call puts
 .done:
-    mov  r12, [rbp-32]
-    mov  rdi, [rbp-24]
-    mov  rsi, [rbp-16]
-    mov  rbx, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret
@@ -490,6 +576,7 @@ cmd_rollback:
     mov  rax, [rel g_count_snap]
     mov  [rel g_count], rax
     mov  qword [rel g_in_txn], 0
+    mov  qword [rel g_auto_txn], 0
     mov  qword [rel g_undo_n], 0
     call wal_truncate
     lea  rcx, [rel s_txn_rollback]
