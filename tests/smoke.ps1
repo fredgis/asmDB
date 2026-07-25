@@ -539,6 +539,57 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
     } else {
         Write-Host "  [SKIP] CDC checks (python not found)" -ForegroundColor Yellow
     }
+
+    # ---------------------------------------------------------------------
+    # Run 16: safety of the destructive paths, strict parsing, machine format
+    # ---------------------------------------------------------------------
+    $long = 'x' * 600
+    $big  = 'C' * 175
+    $r16 = (@(
+        'INSERT 1 5 tag short',
+        "INSERT 2 6 tag $big",
+        'BACKUP saf.dat',            # the live database itself
+        'BACKUP saf.cdc',            # the live change log
+        'BACKUP saf.wal',            # the live write-ahead log
+        'COUNT',
+        'DELETE 42junk',             # trailing junk glued to the number
+        'INSERT 9 9223372036854775808 t overflow',
+        "INSERT 8 8 t $long",        # over-long line
+        'FORMAT TSV',
+        'SELECT 2',
+        'PAGE 1 0',
+        'SELECT *',
+        'PAGE 0 0',
+        'FORMAT TABLE',
+        'VERIFY',
+        'EXIT'
+    ) -join "`n") | .\asmdb.exe saf
+    $r16 = $r16 -join "`n"
+
+    Check 'BACKUP onto the live .dat refused' ($r16 -match 'that path IS one of the live database files')
+    Check 'BACKUP refuses all three live files' (([regex]::Matches($r16, 'live database files')).Count -eq 3)
+    Check 'refused backup left the rows alone' ($r16 -match '\[ OK \] 2 row\(s\)')
+    Check 'no .part left behind'          (-not (Test-Path (Join-Path $work 'saf.dat.part')))
+    Check 'trailing junk is a syntax error' (([regex]::Matches($r16, 'syntax error')).Count -ge 2)
+    Check 'over-long line refused'        ($r16 -match 'line too long')
+    Check 'TSV row is not truncated'      ($r16 -match "R`t2`t6`t\d+`t\d+`ttag`t$big")
+    Check 'PAGE bounds the result set'    ($r16 -match '\[ OK \] 1 row\(s\)')
+    Check 'VERIFY passes on a sound file' ($r16 -match 'verify: 2 row\(s\) checked, no problem found')
+
+    # a real backup still works, and lands atomically
+    (@('BACKUP good.bak', 'EXIT') -join "`n") | .\asmdb.exe saf | Out-Null
+    Check 'BACKUP to a fresh path works'  (Test-Path (Join-Path $work 'good.bak'))
+    Check 'BACKUP leaves no temporary'    (-not (Test-Path (Join-Path $work 'good.bak.part')))
+
+    # VERIFY must notice a hand-edited status byte
+    $vf = Join-Path $work 'saf.dat'
+    $fs = [IO.File]::Open($vf, 'Open', 'ReadWrite')
+    $fs.Position = 512 + 8            # REC_STATUS of slot 0
+    $fs.WriteByte(9)                  # not one of the three defined values
+    $fs.Close()
+    $r17 = (@('VERIFY', 'EXIT') -join "`n") | .\asmdb.exe saf
+    $r17 = $r17 -join "`n"
+    Check 'VERIFY reports a damaged file' ($r17 -match 'verify: \d+ problem\(s\) found')
 }
 finally {
     Pop-Location

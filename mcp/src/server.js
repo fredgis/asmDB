@@ -1,125 +1,285 @@
 #!/usr/bin/env node
 // server.js - Model Context Protocol server backed by asmdb.
-//
-// Exposes the asmdb transactional engine over MCP as a generic CRUD store:
-// db_insert / db_update / db_get / db_delete / db_find / db_list / db_count.
-// Rows are addressed by a numeric `id` (u64) or a string `key` that the server
-// hashes to the id with FNV-1a, so the engine stays a pure id-keyed store with
-// no secondary string index. tag = category/namespace, value = numeric
-// payload/score, content = free text; created/updated timestamps are automatic.
-//
-// Agent memory is one example use case (key = memory name, tag = namespace,
-// content = the remembered text) - not the only one.
-//
-// Configuration (environment variables):
-//   ASMDB_EXE  path to asmdb.exe      (default: ../../build/asmdb.exe)
-//   ASMDB_DIR  directory for data     (default: ~/.asmdb)
-//   ASMDB_DB   database base name     (default: asmdb)
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { existsSync, mkdirSync } from "node:fs";
 
 import {
   AsmdbSession,
+  I64_MAX,
+  I64_MIN,
+  U64_MAX,
+  engineError,
   keyToId,
-  sanitizeTag,
-  sanitizeContent,
-  parseTable,
-  parseDetail,
+  okStatus,
+  parseDecimalInRange,
+  parseTsvRows,
 } from "./asmdb.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const EXE =
-  process.env.ASMDB_EXE || resolve(__dirname, "..", "..", "build", "asmdb.exe");
+const ENGINE_NAME = platform() === "win32" ? "asmdb.exe" : "asmdb";
+const EXE = process.env.ASMDB_EXE || resolve(__dirname, "..", "..", "build", ENGINE_NAME);
 const DIR = process.env.ASMDB_DIR || join(homedir(), ".asmdb");
 const DB = process.env.ASMDB_DB || "asmdb";
+const SERVER_VERSION = "1.1.0";
+const TAG_MAX_BYTES = 40;
+const CONTENT_MAX_BYTES = 176;
+const KEY_PREFIX = "\\asmdb-key:";
+const KEY_DELIM = ";";
 
 if (!existsSync(EXE)) {
   console.error(`[asmdb-mcp] engine not found at ${EXE}`);
-  console.error("[asmdb-mcp] build it first: powershell -File build.ps1");
+  const buildHint =
+    platform() === "win32"
+      ? "build it first: powershell -ExecutionPolicy Bypass -File build.ps1"
+      : "build it first from the repository root (for example: ./build.sh or make)";
+  console.error(`[asmdb-mcp] ${buildHint}`);
   process.exit(1);
 }
 if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true });
 
 const session = new AsmdbSession(EXE, DB, DIR);
-await session.ready; // consume the banner
+await session.ready;
+const formatOut = await session.command("FORMAT TSV");
+if (engineError(formatOut)) {
+  console.error(`[asmdb-mcp] warning: engine did not accept FORMAT TSV: ${engineError(formatOut)}`);
+}
 
 const ok = (text) => ({ content: [{ type: "text", text }] });
 const json = (obj) => ok(JSON.stringify(obj, null, 2));
+const fail = (errorKind, error, extra = {}) => json({ ok: false, errorKind, error, ...extra });
+const success = (obj) => json({ ok: true, ...obj });
 
-const server = new McpServer({ name: "asmdb", version: "1.0.0" });
+const server = new McpServer({ name: "asmdb", version: SERVER_VERSION });
 
-// Resolve a record id from either an explicit numeric `id` (u64) or a string
-// `key` hashed with FNV-1a. Returns { id } (decimal string) or { error }.
-function resolveId({ id, key }) {
-  if (id !== undefined && id !== null && `${id}`.trim() !== "") {
-    const s = `${id}`.trim();
-    if (!/^\d+$/.test(s)) {
-      return { error: `invalid id "${s}" - expected a non-negative integer (use \`key\` for huge/string ids)` };
-    }
-    const n = BigInt(s);
-    if (n === 0n) return { error: "id 0 is reserved - use id >= 1 or a string key" };
-    if (n >= 1n << 64n) return { error: `id "${s}" exceeds the u64 range` };
-    return { id: s };
-  }
-  if (key !== undefined && key !== null && `${key}` !== "") {
-    return { id: keyToId(key) };
-  }
-  return { error: "provide either `id` (integer) or `key` (string)" };
+function hasInvalidUtf16(s) {
+  return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(s);
 }
 
-// Shared id/key selector for every record-addressed tool.
+function validateUtf8Text(value, label, maxBytes, { token = false, allowEmpty = true } = {}) {
+  const s = String(value ?? "");
+  if (!allowEmpty && s.length === 0) throw new Error(`${label} must not be empty`);
+  if (hasInvalidUtf16(s)) throw new Error(`${label} must be valid UTF-8 text`);
+  if (/[\0\r\n\t]/.test(s)) throw new Error(`${label} must not contain NUL, TAB, LF or CR`);
+  if (token && /\s/u.test(s)) throw new Error(`${label} must not contain whitespace`);
+  if (maxBytes !== undefined) {
+    const bytes = Buffer.byteLength(s, "utf8");
+    if (bytes > maxBytes) throw new Error(`${label} is ${bytes} bytes; limit is ${maxBytes} UTF-8 bytes`);
+  }
+  return s;
+}
+
+function cleanTag(tag) {
+  return validateUtf8Text(tag ?? "-", "tag", TAG_MAX_BYTES, { token: true, allowEmpty: false });
+}
+
+function cleanContent(content) {
+  return validateUtf8Text(content ?? "", "content", CONTENT_MAX_BYTES);
+}
+
+function base64url(s) {
+  return Buffer.from(s, "utf8").toString("base64url");
+}
+
+function unbase64url(s) {
+  return Buffer.from(s, "base64url").toString("utf8");
+}
+
+function makeStoredContent(content, key) {
+  if (key === undefined || key === null) return content;
+  const prefix = `${KEY_PREFIX}${base64url(String(key))}${KEY_DELIM}`;
+  const stored = prefix + content;
+  const bytes = Buffer.byteLength(stored, "utf8");
+  if (bytes > CONTENT_MAX_BYTES) {
+    throw new Error(
+      `content plus key metadata is ${bytes} bytes; keyed rows are limited to ${CONTENT_MAX_BYTES} UTF-8 bytes in the engine`
+    );
+  }
+  return stored;
+}
+
+function decodeStoredContent(content) {
+  if (!content.startsWith(KEY_PREFIX)) return { content };
+  const end = content.indexOf(KEY_DELIM, KEY_PREFIX.length);
+  if (end === -1) return { content };
+  const encoded = content.slice(KEY_PREFIX.length, end);
+  try {
+    return { key: unbase64url(encoded), content: content.slice(end + KEY_DELIM.length) };
+  } catch {
+    return { content };
+  }
+}
+
+function presentRow(row) {
+  const decoded = decodeStoredContent(row.content);
+  return { ...row, content: decoded.content };
+}
+
+function verifyKey(row, expectedKey) {
+  if (expectedKey === undefined || expectedKey === null) return { row: presentRow(row) };
+  const decoded = decodeStoredContent(row.content);
+  if (decoded.key !== String(expectedKey)) {
+    return {
+      errorKind: "keyCollision",
+      error: "stored key metadata does not match the requested key; refusing to return a colliding row",
+    };
+  }
+  return { row: { ...row, content: decoded.content } };
+}
+
+function parseIdInput(id) {
+  if (typeof id === "number") {
+    if (!Number.isSafeInteger(id)) throw new Error("id numbers must be safe integers; pass large ids as decimal strings");
+    if (id <= 0) throw new Error("id 0 is reserved - use id >= 1 or a string key");
+    return parseDecimalInRange(String(id), 1n, U64_MAX, "id");
+  }
+  return parseDecimalInRange(String(id).trim(), 1n, U64_MAX, "id");
+}
+
+function parseValueInput(value) {
+  if (value === undefined || value === null || value === "") return "0";
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) throw new Error("value numbers must be safe integers; pass large values as decimal strings");
+    return parseDecimalInRange(String(value), I64_MIN, I64_MAX, "value");
+  }
+  return parseDecimalInRange(String(value).trim(), I64_MIN, I64_MAX, "value");
+}
+
+function resolveId({ id, key }) {
+  if (id !== undefined && id !== null && `${id}`.trim() !== "") return { id: parseIdInput(id) };
+  if (key !== undefined && key !== null && `${key}` !== "") return { id: keyToId(key), key: String(key) };
+  throw new Error("provide either `id` (u64 decimal string) or `key` (string)");
+}
+
+function parseLimitOffset({ limit = 100, offset = 0 }) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+    throw new Error("limit must be an integer from 1 through 1000");
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("offset must be a non-negative safe integer");
+  return { limit, offset };
+}
+
+async function engine(command) {
+  const out = await session.command(command);
+  const err = engineError(out);
+  if (err) throw Object.assign(new Error(err), { engine: true });
+  return out;
+}
+
+async function setPage(limit, offset) {
+  const out = await engine(`PAGE ${limit} ${offset}`);
+  if (!okStatus(out)) throw new Error("engine did not confirm PAGE setting");
+}
+
+async function selectRow(id) {
+  const out = await session.command(`SELECT ${id}`);
+  const err = engineError(out);
+  if (err && /not found/i.test(err)) return null;
+  if (err) throw Object.assign(new Error(err), { engine: true });
+  const rows = parseTsvRows(out);
+  if (rows.length > 1) throw new Error("engine returned more than one row for SELECT id");
+  return rows[0] ?? null;
+}
+
+async function transactional(fn) {
+  await engine("BEGIN");
+  try {
+    const result = await fn();
+    await engine("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      await session.command("ROLLBACK");
+    } catch {
+      /* best effort */
+    }
+    throw err;
+  }
+}
+
+function mapError(err, id) {
+  const msg = err?.message || String(err);
+  if (err?.errorKind) return fail(err.errorKind, msg, id ? { id } : {});
+  if (/not found/i.test(msg)) return fail("notFound", msg, id ? { id } : {});
+  if (/already exists/i.test(msg)) return fail("alreadyExists", msg, id ? { id } : {});
+  if (/timed out/i.test(msg)) return fail("timeout", msg, id ? { id } : {});
+  if (/exceeded output cap/i.test(msg)) return fail("outputTooLarge", msg, id ? { id } : {});
+  if (err?.engine) return fail("engineError", msg, id ? { id } : {});
+  return fail("invalidArgument", msg, id ? { id } : {});
+}
+
 const idKey = {
   id: z
-    .union([z.number().int(), z.string()])
+    .union([z.number(), z.string()])
     .optional()
-    .describe("numeric primary key (u64) - provide this or `key`"),
-  key: z
-    .string()
-    .optional()
-    .describe("string key hashed to the id with FNV-1a - provide this or `id`"),
+    .describe("primary key as a u64 decimal string; JS safe-integer numbers are accepted for small ids"),
+  key: z.string().optional().describe("string key hashed to the id with FNV-1a and verified on read"),
+};
+const valueSchema = z
+  .union([z.number(), z.string()])
+  .optional()
+  .describe("i64 decimal string; JS safe-integer numbers are accepted for small values");
+const pageSchema = {
+  limit: z.number().int().min(1).max(1000).optional().describe("maximum rows to return (default 100, max 1000)"),
+  offset: z.number().int().min(0).optional().describe("zero-based row offset (default 0)"),
 };
 
 server.registerTool(
   "db_insert",
   {
     title: "Insert a row",
-    description:
-      "Insert a new row into asmdb. Address it by `id` (u64) or `key` " +
-      "(string, hashed to the id). `content` is free text (<=175 chars), " +
-      "`tag` a short single-word category/namespace, `value` an optional " +
-      "numeric payload/score. Set `upsert:true` to overwrite instead of " +
-      "erroring when the row already exists. Example use - agent memory: " +
-      "key = the memory name, tag = namespace, content = the remembered text.",
+    description: "Insert a row addressed by u64 `id` or string `key`. Set `upsert:true` for atomic create-or-update.",
     inputSchema: {
       ...idKey,
-      content: z.string().optional().describe("free text payload (<=175 chars)"),
-      tag: z.string().optional().describe("short category / namespace (single word)"),
-      value: z.number().optional().describe("optional numeric payload / score (default 0)"),
-      upsert: z.boolean().optional().describe("overwrite an existing row instead of erroring"),
+      content: z.string().optional().describe("UTF-8 text payload (176 engine bytes max; keyed rows reserve metadata bytes)"),
+      tag: z.string().optional().describe("UTF-8 tag token (40 bytes max, no whitespace)"),
+      value: valueSchema,
+      upsert: z.boolean().optional().describe("atomically update an existing row instead of failing"),
     },
   },
   async ({ id, key, content, tag, value, upsert }) => {
-    const r = resolveId({ id, key });
-    if (r.error) return json({ ok: false, error: r.error });
-    const t = sanitizeTag(tag);
-    const c = sanitizeContent(content);
-    const v = Number.isFinite(value) ? Math.trunc(value) : 0;
-    let out = await session.command(`INSERT ${r.id} ${v} ${t} ${c}`);
-    let action = "inserted";
-    if (/already exists/i.test(out)) {
-      if (!upsert) return json({ ok: false, error: "row already exists", id: r.id });
-      out = await session.command(`UPDATE ${r.id} ${v} ${t} ${c}`);
-      action = "updated";
+    let r;
+    try {
+      r = resolveId({ id, key });
+      const t = cleanTag(tag);
+      const c = makeStoredContent(cleanContent(content), r.key);
+      const v = parseValueInput(value);
+      let action = "inserted";
+      if (upsert) {
+        action = await transactional(async () => {
+          const insertOut = await session.command(`INSERT ${r.id} ${v} ${t} ${c}`);
+          const insertErr = engineError(insertOut);
+          if (!insertErr) return "inserted";
+          if (!/already exists/i.test(insertErr)) throw Object.assign(new Error(insertErr), { engine: true });
+          if (r.key) {
+            const existing = await selectRow(r.id);
+            const verified = existing && verifyKey(existing, r.key);
+            if (!verified || verified.errorKind) {
+              throw Object.assign(new Error(verified?.error || "key collision"), { errorKind: "keyCollision" });
+            }
+          }
+          await engine(`UPDATE ${r.id} ${v} ${t} ${c}`);
+          return "updated";
+        });
+      } else {
+        const insertOut = await session.command(`INSERT ${r.id} ${v} ${t} ${c}`);
+        const insertErr = engineError(insertOut);
+        if (insertErr && /already exists/i.test(insertErr) && r.key) {
+          const existing = await selectRow(r.id);
+          const verified = existing && verifyKey(existing, r.key);
+          if (verified?.errorKind) return fail(verified.errorKind, verified.error, { id: r.id });
+        }
+        if (insertErr) throw Object.assign(new Error(insertErr), { engine: true });
+      }
+      return success({ action, id: r.id, tag: t, value: v });
+    } catch (err) {
+      return mapError(err, r?.id);
     }
-    if (/\[ERR\]/.test(out)) return json({ ok: false, error: out.trim(), id: r.id });
-    return json({ ok: true, action, id: r.id, tag: t, value: v });
   }
 );
 
@@ -127,27 +287,32 @@ server.registerTool(
   "db_update",
   {
     title: "Update a row",
-    description:
-      "Overwrite an existing row's value, tag and content. Address it by " +
-      "`id` or `key`. Fails if the row does not exist (use db_insert with " +
-      "upsert to create-or-update).",
+    description: "Overwrite an existing row addressed by `id` or `key`.",
     inputSchema: {
       ...idKey,
-      content: z.string().optional().describe("new free text payload (<=175 chars)"),
-      tag: z.string().optional().describe("new category / namespace (single word)"),
-      value: z.number().optional().describe("new numeric payload / score (default 0)"),
+      content: z.string().optional().describe("UTF-8 text payload (176 engine bytes max; keyed rows reserve metadata bytes)"),
+      tag: z.string().optional().describe("UTF-8 tag token (40 bytes max, no whitespace)"),
+      value: valueSchema,
     },
   },
   async ({ id, key, content, tag, value }) => {
-    const r = resolveId({ id, key });
-    if (r.error) return json({ ok: false, error: r.error });
-    const t = sanitizeTag(tag);
-    const c = sanitizeContent(content);
-    const v = Number.isFinite(value) ? Math.trunc(value) : 0;
-    const out = await session.command(`UPDATE ${r.id} ${v} ${t} ${c}`);
-    if (/not found/i.test(out)) return json({ ok: false, found: false, id: r.id });
-    if (/\[ERR\]/.test(out)) return json({ ok: false, error: out.trim(), id: r.id });
-    return json({ ok: true, action: "updated", id: r.id, tag: t, value: v });
+    let r;
+    try {
+      r = resolveId({ id, key });
+      const t = cleanTag(tag);
+      const c = makeStoredContent(cleanContent(content), r.key);
+      const v = parseValueInput(value);
+      if (r.key) {
+        const existing = await selectRow(r.id);
+        if (!existing) return fail("notFound", "key not found", { id: r.id });
+        const verified = verifyKey(existing, r.key);
+        if (verified.errorKind) return fail(verified.errorKind, verified.error, { id: r.id });
+      }
+      await engine(`UPDATE ${r.id} ${v} ${t} ${c}`);
+      return success({ action: "updated", id: r.id, tag: t, value: v });
+    } catch (err) {
+      return mapError(err, r?.id);
+    }
   }
 );
 
@@ -155,19 +320,25 @@ server.registerTool(
   "db_get",
   {
     title: "Get one row",
-    description:
-      "Fetch a single row by `id` or `key`, with its value, tag, content " +
-      "and created/updated timestamps.",
+    description: "Fetch a single row by `id` or verified string `key`.",
     inputSchema: { ...idKey },
   },
   async ({ id, key }) => {
-    const r = resolveId({ id, key });
-    if (r.error) return json({ ok: false, error: r.error });
-    const out = await session.command(`SELECT ${r.id}`);
-    if (/not found/i.test(out)) return json({ ok: true, found: false, id: r.id });
-    const rec = parseDetail(out);
-    if (!rec) return ok(out.trim());
-    return json({ ok: true, found: true, ...rec });
+    let r;
+    try {
+      r = resolveId({ id, key });
+      const out = await session.command(`SELECT ${r.id}`);
+      const err = engineError(out);
+      if (err && /not found/i.test(err)) return success({ found: false, id: r.id, record: null });
+      if (err) throw Object.assign(new Error(err), { engine: true });
+      const row = parseTsvRows(out)[0] ?? null;
+      if (!row) throw new Error("engine returned no TSV row for an existing id");
+      const verified = verifyKey(row, r.key);
+      if (verified.errorKind) return fail(verified.errorKind, verified.error, { id: r.id });
+      return success({ found: true, ...verified.row, record: verified.row });
+    } catch (err) {
+      return mapError(err, r?.id);
+    }
   }
 );
 
@@ -175,15 +346,25 @@ server.registerTool(
   "db_delete",
   {
     title: "Delete a row",
-    description: "Remove the row addressed by `id` or `key`, if it exists.",
+    description: "Remove the row addressed by `id` or `key`.",
     inputSchema: { ...idKey },
   },
   async ({ id, key }) => {
-    const r = resolveId({ id, key });
-    if (r.error) return json({ ok: false, error: r.error });
-    const out = await session.command(`DELETE ${r.id}`);
-    const deleted = /1 row deleted/i.test(out);
-    return json({ ok: true, deleted, id: r.id });
+    let r;
+    try {
+      r = resolveId({ id, key });
+      if (r.key) {
+        const row = await selectRow(r.id);
+        if (!row) return success({ deleted: false, id: r.id });
+        const verified = verifyKey(row, r.key);
+        if (verified.errorKind) return fail(verified.errorKind, verified.error, { id: r.id });
+      }
+      const out = await engine(`DELETE ${r.id}`);
+      const deleted = /1 row deleted/i.test(out);
+      return success({ deleted, id: r.id });
+    } catch (err) {
+      return mapError(err, r?.id);
+    }
   }
 );
 
@@ -191,32 +372,58 @@ server.registerTool(
   "db_find",
   {
     title: "Search rows",
-    description:
-      "Case-insensitive substring search across every row's tag and " +
-      "content. Returns all matching rows.",
+    description: "Case-insensitive substring search over tag and content, with mandatory pagination.",
     inputSchema: {
-      query: z.string().min(1).describe("substring to look for"),
+      query: z.string().min(1).describe("UTF-8 substring to look for"),
+      ...pageSchema,
     },
   },
-  async ({ query }) => {
-    const q = sanitizeContent(query);
-    const out = await session.command(`FIND ${q}`);
-    const rows = parseTable(out);
-    return json({ ok: true, query: q, count: rows.length, matches: rows });
+  async ({ query, limit, offset }) => {
+    try {
+      const page = parseLimitOffset({ limit, offset });
+      const q = validateUtf8Text(query, "query", undefined, { allowEmpty: false });
+      await setPage(page.limit, page.offset);
+      const rows = parseTsvRows(await engine(`FIND ${q}`)).map(presentRow);
+      const hasMore = rows.length === page.limit;
+      return success({
+        query: q,
+        count: rows.length,
+        matches: rows,
+        limit: page.limit,
+        offset: page.offset,
+        hasMore,
+        nextOffset: hasMore ? page.offset + page.limit : null,
+      });
+    } catch (err) {
+      return mapError(err);
+    }
   }
 );
 
 server.registerTool(
   "db_list",
   {
-    title: "List all rows",
-    description: "Return every live row (id, tag, value, content).",
-    inputSchema: {},
+    title: "List rows",
+    description: "Return live rows with mandatory pagination.",
+    inputSchema: { ...pageSchema },
   },
-  async () => {
-    const out = await session.command("SELECT *");
-    const rows = parseTable(out);
-    return json({ ok: true, count: rows.length, rows });
+  async ({ limit, offset }) => {
+    try {
+      const page = parseLimitOffset({ limit, offset });
+      await setPage(page.limit, page.offset);
+      const rows = parseTsvRows(await engine("SELECT *")).map(presentRow);
+      const hasMore = rows.length === page.limit;
+      return success({
+        count: rows.length,
+        rows,
+        limit: page.limit,
+        offset: page.offset,
+        hasMore,
+        nextOffset: hasMore ? page.offset + page.limit : null,
+      });
+    } catch (err) {
+      return mapError(err);
+    }
   }
 );
 
@@ -228,9 +435,14 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    const out = await session.command("COUNT");
-    const m = out.match(/\[\s*OK\s*\]\s*(\d+)/);
-    return json({ ok: true, count: m ? Number(m[1]) : null });
+    try {
+      const out = await engine("COUNT");
+      const m = out.match(/\[\s*OK\s*\]\s*(\d+)/);
+      if (!m) throw new Error("could not parse COUNT response");
+      return success({ count: Number(m[1]) });
+    } catch (err) {
+      return mapError(err);
+    }
   }
 );
 
@@ -242,11 +454,9 @@ async function shutdown() {
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
-// When the MCP client disconnects, our stdin is closed. Shut the engine down
-// gracefully so we never leave an orphaned asmdb.exe holding the data files.
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`[asmdb-mcp] ready - engine ${EXE}, db ${join(DIR, DB)}.dat`);
+console.error(`[asmdb-mcp ${SERVER_VERSION}] ready - engine ${EXE}, db ${join(DIR, DB)}.dat`);

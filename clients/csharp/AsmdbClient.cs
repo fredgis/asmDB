@@ -1,41 +1,58 @@
 // Minimal asmdb client for C# (.NET).
 //
 // asmdb has no network protocol or client library: it is a REPL that reads
-// commands from stdin and writes ASCII results to stdout. This client
-// "connects" by launching asmdb.exe as a child process, writing commands to
-// its stdin, and reading the plain-ASCII output back (color is auto-disabled
-// when stdout is redirected).
+// commands from stdin and writes results to stdout. This client "connects" by
+// launching asmdb as a child process, writing commands to stdin, and reading
+// stdout back.
 //
-// Build & run (from this folder):
-//     dotnet run
-// or drop AsmdbClient.cs into any project.
+// Drop AsmdbClient.cs into any .NET project.
 
 using System;
 using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
 
 public sealed class AsmdbClient
 {
     private readonly string _exe;
-    private readonly string _args;
+    private readonly string _database;
+    private readonly string? _table;
 
-    public AsmdbClient(string exe, string database, string? table = null)
+    public AsmdbClient(string database, string? table = null, string? exe = null)
     {
-        _exe = exe;
-        _args = table is null ? database : $"{database} {table}";
+        _exe = exe ?? DefaultExe();
+        _database = database;
+        _table = table;
+    }
+
+    public static string DefaultExe()
+    {
+        var env = Environment.GetEnvironmentVariable("ASMDB_EXE");
+        if (!string.IsNullOrEmpty(env))
+            return env;
+
+        var name = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? "asmdb.exe"
+            : "asmdb";
+        return Path.Combine("..", "..", "build", name);
     }
 
     // Send commands (one per array element), then QUIT. Returns raw stdout.
     public string Run(params string[] commands)
     {
-        var psi = new ProcessStartInfo(_exe, _args)
+        var psi = new ProcessStartInfo
         {
+            FileName = _exe,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             UseShellExecute = false,
         };
+        psi.ArgumentList.Add(_database);
+        if (_table is not null)
+            psi.ArgumentList.Add(_table);
 
         using var proc = Process.Start(psi)
-            ?? throw new InvalidOperationException("failed to start asmdb.exe");
+            ?? throw new InvalidOperationException("failed to start asmdb");
 
         foreach (var cmd in commands)
             proc.StandardInput.WriteLine(cmd);
@@ -49,13 +66,13 @@ public sealed class AsmdbClient
 
     public static void Main()
     {
-        var exe = System.IO.Path.Combine("..", "..", "build", "asmdb.exe");
-        var db = new AsmdbClient(exe, "DemoDB", "notes");
+        var db = new AsmdbClient("DemoDB", "notes");
         Console.Write(db.Run(
             "BEGIN",
             "INSERT 1 500 alice first memory about alice",
             "INSERT 2 750 bob follow-up on bob",
             "COMMIT",
+            "FORMAT TSV",
             "SELECT *"));
     }
 }

@@ -28,6 +28,9 @@
 %define SYS_fsync         74
 %define SYS_flock         73
 %define SYS_ftruncate     77
+%define SYS_fstat         5
+%define SYS_rename        82
+%define SYS_unlink        87
 %define SYS_getdents64    217
 %define SYS_clock_gettime 228
 %define SYS_exit_group    231
@@ -37,9 +40,14 @@
 %define O_WRONLY     0x1
 %define O_RDWR       0x2
 %define O_CREAT      0x40
+%define O_EXCL       0x80
 %define O_TRUNC      0x200
 %define O_DIRECTORY  0x10000
-%define MODE_0644    0x1A4
+; Data files are private to their owner. A database, its write-ahead log and
+; its change log contain the rows themselves, so world-readable 0644 leaked
+; every record to any local account. The change log is the worst case: it is
+; opened with read sharing precisely so consumers can follow it.
+%define MODE_0600    0x180
 %define PROT_RW      0x3
 %define MAP_PRIV_ANON 0x22
 %define MAP_PRIVATE  0x02
@@ -224,7 +232,7 @@ os_open_shared:
     mov  [rbp-16], rdi
     mov  rdi, rcx
     mov  esi, O_RDWR | O_CREAT
-    mov  edx, MODE_0644
+    mov  edx, MODE_0600
     mov  eax, SYS_open
     syscall
     test rax, rax
@@ -249,7 +257,7 @@ os_open:
     mov  qword [rel g_open_locked], 0
     mov  rdi, rcx                    ; pathname
     mov  esi, O_RDWR | O_CREAT
-    mov  edx, MODE_0644
+    mov  edx, MODE_0600
     mov  eax, SYS_open
     syscall
     test rax, rax
@@ -289,12 +297,143 @@ os_create:
     mov  [rbp-16], rdi
     mov  rdi, rcx
     mov  esi, O_RDWR | O_CREAT | O_TRUNC
-    mov  edx, MODE_0644
+    mov  edx, MODE_0600
     mov  eax, SYS_open
     syscall
     test rax, rax
     jns  .done
     mov  rax, -1
+.done:
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_create_new(rcx = name) -> rax = fd, or -1 if the file already exists.
+; Exclusive creation: used for anything that will later be renamed into place,
+; so a stale temporary from a previous run is never silently reused.
+os_create_new:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
+    mov  rdi, rcx
+    mov  esi, O_RDWR | O_CREAT | O_EXCL
+    mov  edx, MODE_0600
+    mov  eax, SYS_open
+    syscall
+    test rax, rax
+    jns  .done
+    mov  rax, -1
+.done:
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_file_id(rcx = fd, rdx = 16-byte out) -> rax = 0 ok / -1 error.
+; Writes (st_dev, st_ino) - the pair that identifies a file regardless of the
+; path used to reach it. Comparing paths as strings is not enough: a relative
+; path, a symlink and a hard link all name the same bytes.
+os_file_id:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
+    mov  [rbp-24], rbx
+    mov  rbx, rdx                    ; out
+    mov  rdi, rcx                    ; fd
+    lea  rsi, [rel g_statbuf]
+    mov  eax, SYS_fstat
+    syscall
+    test rax, rax
+    js   .fail
+    lea  rsi, [rel g_statbuf]
+    mov  rax, [rsi]                  ; st_dev
+    mov  [rbx], rax
+    mov  rax, [rsi+8]                ; st_ino
+    mov  [rbx+8], rax
+    xor  eax, eax
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
+    mov  rbx, [rbp-24]
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_rename(rcx = old, rdx = new) -> rax = 0 ok / -1. Atomically replaces new.
+os_rename:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
+    mov  rdi, rcx
+    mov  rsi, rdx
+    mov  eax, SYS_rename
+    syscall
+    test rax, rax
+    jns  .ok
+    mov  rax, -1
+    jmp  .done
+.ok:
+    xor  eax, eax
+.done:
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_unlink(rcx = name) -> rax = 0 ok / -1
+os_unlink:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20
+    mov  [rbp-8], rdi
+    mov  rdi, rcx
+    mov  eax, SYS_unlink
+    syscall
+    test rax, rax
+    jns  .ok
+    mov  rax, -1
+    jmp  .done
+.ok:
+    xor  eax, eax
+.done:
+    mov  rdi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_exists(rcx = name) -> rax = 1 if the path exists, 0 if not.
+; Kept as a separate primitive from os_open_read so that "cannot open" and
+; "not there" stay distinguishable - on Windows the live database refuses a
+; second open, and conflating the two would let BACKUP target it.
+os_exists:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
+    mov  rdi, rcx
+    lea  rsi, [rel g_statbuf]
+    mov  eax, SYS_stat
+    syscall
+    test rax, rax
+    js   .no
+    mov  eax, 1
+    jmp  .done
+.no:
+    xor  eax, eax
 .done:
     mov  rdi, [rbp-16]
     mov  rsi, [rbp-8]

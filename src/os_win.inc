@@ -185,6 +185,111 @@ os_create:
     pop  rbp
     ret
 
+; os_create_new(rcx = name) -> rax = handle, or -1 if the file already exists.
+; Exclusive creation: used for anything that will later be renamed into place,
+; so a stale temporary from a previous run is never silently reused.
+os_create_new:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50
+    mov  rdx, GENERIC_READ | GENERIC_WRITE
+    xor  r8, r8
+    xor  r9, r9
+    mov  dword [rsp+0x20], CREATE_NEW
+    mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
+    mov  qword [rsp+0x30], 0
+    call [rel iat_CreateFileA]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_file_id(rcx = handle, rdx = 16-byte out) -> rax = 0 ok / -1 error.
+; Writes (volume serial, file index) - the pair that identifies a file
+; regardless of the path used to reach it. Comparing paths as strings is not
+; enough: a relative path, "./db.dat" and a hard link all name the same bytes.
+os_file_id:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx
+    mov  rbx, rdx                    ; out
+    lea  rdx, [rel g_bhfi]
+    call [rel iat_GetFileInformationByHandle]
+    test eax, eax
+    jz   .fail
+    mov  eax, dword [rel g_bhfi+28]  ; dwVolumeSerialNumber
+    mov  [rbx], rax
+    mov  eax, dword [rel g_bhfi+44]  ; nFileIndexHigh
+    shl  rax, 32
+    mov  ecx, dword [rel g_bhfi+48]  ; nFileIndexLow
+    or   rax, rcx
+    mov  [rbx+8], rax
+    xor  eax, eax
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_rename(rcx = old, rdx = new) -> rax = 0 ok / -1. Replaces new atomically.
+os_rename:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  r8d, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    call [rel iat_MoveFileExA]
+    test eax, eax
+    jz   .fail
+    xor  eax, eax
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_unlink(rcx = name) -> rax = 0 ok / -1
+os_unlink:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call [rel iat_DeleteFileA]
+    test eax, eax
+    jz   .fail
+    xor  eax, eax
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_exists(rcx = name) -> rax = 1 if the path exists, 0 if not.
+; Deliberately not implemented as "try to open it": the live database is held
+; with no sharing, so opening it fails with a sharing violation rather than
+; "not found", and a caller testing for existence would conclude the file is
+; absent. GetFileAttributesA answers without needing any data access.
+os_exists:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    call [rel iat_GetFileAttributesA]
+    cmp  eax, -1
+    je   .no
+    mov  eax, 1
+    jmp  .done
+.no:
+    xor  eax, eax
+.done:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; os_open_read(rcx = name) -> rax = handle, or -1  (open existing, read/shared)
 os_open_read:
     push rbp
@@ -510,6 +615,8 @@ g_perfbuf:     dq 0
 g_fsize:       dq 0
 g_dir_handle:  dq 0
 g_dir_first:   dq 0
+g_bhfi:        times 52 db 0        ; BY_HANDLE_FILE_INFORMATION
+                align 8
 
 ; ============================== import table ================================
                 align 4
@@ -548,6 +655,10 @@ iat_DeviceIoControl:   dq RVA(h_DeviceIoControl)
 iat_GetFileSizeEx:     dq RVA(h_GetFileSizeEx)
 iat_CreateFileMappingA: dq RVA(h_CreateFileMappingA)
 iat_MapViewOfFile:     dq RVA(h_MapViewOfFile)
+iat_GetFileInformationByHandle: dq RVA(h_GetFileInformationByHandle)
+iat_MoveFileExA:       dq RVA(h_MoveFileExA)
+iat_DeleteFileA:       dq RVA(h_DeleteFileA)
+iat_GetFileAttributesA: dq RVA(h_GetFileAttributesA)
                        dq 0
 
 dll_name: db 'kernel32.dll', 0
@@ -624,3 +735,15 @@ h_CreateFileMappingA: dw 0
                 align 2
 h_MapViewOfFile:     dw 0
     db 'MapViewOfFile', 0
+                align 2
+h_GetFileInformationByHandle: dw 0
+    db 'GetFileInformationByHandle', 0
+                align 2
+h_MoveFileExA:       dw 0
+    db 'MoveFileExA', 0
+                align 2
+h_DeleteFileA:       dw 0
+    db 'DeleteFileA', 0
+                align 2
+h_GetFileAttributesA: dw 0
+    db 'GetFileAttributesA', 0

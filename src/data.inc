@@ -40,6 +40,14 @@ g_undo_n:      dq 0
 g_count_snap:  dq 0
 g_walbuf:      dq 0
 g_color:       dq 0
+; ---- machine-readable output (FORMAT / PAGE) ----
+g_fmt_tsv:     dq 0                  ; 1 = emit R-prefixed rows instead of a table
+g_tsvbuf:      dq 0                  ; one rendered row, written in a single call
+g_page_limit:  dq 0                  ; 0 = unlimited
+g_page_offset: dq 0
+g_list_skip:   dq 0                  ; page cursor, reset per listing command
+g_list_n:      dq 0                  ; rows emitted by the current listing
+g_vfy_n:       dq 0                  ; problems found by the last VERIFY
 g_qpf:         dq 0
 g_qpc0:        dq 0
 g_qpc1:        dq 0
@@ -57,6 +65,9 @@ g_base:        times 216 db 0
 g_datname:     times 224 db 0
 g_walname:     times 224 db 0
 g_bakname:     times 224 db 0
+g_tmpname:     times 240 db 0        ; <backup>.part, renamed into place on success
+g_idbuf:       times 16 db 0
+g_idbuf2:      times 16 db 0
 g_tablename:   times 64 db 0
 g_argtable:    times 64 db 0
 g_finddata:    times FIND_STRUCT db 0
@@ -132,6 +143,29 @@ s_count_pre:   db '[ OK ] ', 0
 s_count_post:  db ' row(s)', 13, 10, 0
 s_find_none:   db '[ OK ] no matching rows', 13, 10, 0
 s_range_none:  db '[ OK ] no rows in range', 13, 10, 0
+s_rows_pre:    db '[ OK ] ', 0
+s_rows_post:   db ' row(s)', 13, 10, 0
+s_fmt_table:   db '[ OK ] format table', 13, 10, 0
+s_fmt_tsv:     db '[ OK ] format tsv', 13, 10, 0
+s_page_set:    db '[ OK ] paging set', 13, 10, 0
+s_err_toolong: db '[ERR] line too long - command refused (max 511 bytes)', 13, 10, 0
+s_vfy_status:  db '[ERR] verify: invalid status byte at slot ', 0
+s_vfy_id:      db '[ERR] verify: live row with reserved id 0 at slot ', 0
+s_vfy_clen:    db '[ERR] verify: content length out of range at slot ', 0
+s_vfy_term:    db '[ERR] verify: unterminated text column at slot ', 0
+s_vfy_reach:   db '[ERR] verify: row unreachable or duplicate key at slot ', 0
+s_vfy_count:   db '[ERR] verify: live rows disagree with the header count: ', 0
+s_vfy_vs:      db ' live vs ', 0
+s_vfy_more:    db '[ERR] verify: further problems not listed', 13, 10, 0
+s_vfy_ok:      db '[ OK ] verify: ', 0
+s_vfy_ok_post: db ' row(s) checked, no problem found', 13, 10, 0
+s_vfy_bad:     db '[ERR] verify: ', 0
+s_vfy_bad_post: db ' problem(s) found', 13, 10, 0
+s_part_suffix: db '.part', 0
+s_err_bak_self: db '[ERR] that path IS one of the live database files - refused', 13, 10, 0
+s_err_bak_rename: db '[ERR] backup written but could not be moved into place', 13, 10, 0
+s_upg_nospace: db '[ERR] upgrade: no free slot for a source row - migration refused', 13, 10, 0
+s_upg_lost:   db '[ERR] upgrade: migrated row count does not match the source: ', 0
 s_ok_backup:   db '[ OK ] backup written', 13, 10, 0
 s_ok_restore:  db '[ OK ] database restored from backup', 13, 10, 0
 s_err_bak_open: db '[ERR] cannot open backup file', 13, 10, 0
@@ -293,7 +327,13 @@ hc_backup:  db 'BACKUP <file>', 0
 hd_backup:  db 'snapshot this database to <file>', 0
 hc_restore: db 'RESTORE <file>', 0
 hd_restore: db 'reload this database from <file>', 0
+hc_verify:  db 'VERIFY', 0
+hd_verify:  db 'full logical integrity scan of the store', 0
 
+hc_format:  db 'FORMAT TABLE|TSV', 0
+hd_format:  db 'human table, or machine-readable rows', 0
+hc_page:    db 'PAGE <limit> <offset>', 0
+hd_page:    db 'bound SELECT * / FIND / RANGE', 0
 hc_help:    db 'HELP', 0
 hd_help:    db 'show this reference', 0
 hc_exit:    db 'EXIT / QUIT', 0
@@ -388,3 +428,8 @@ kw_find:       db 'FIND', 0
 kw_range:      db 'RANGE', 0
 kw_backup:     db 'BACKUP', 0
 kw_restore:    db 'RESTORE', 0
+kw_format:     db 'FORMAT', 0
+kw_page:       db 'PAGE', 0
+kw_tsv:        db 'TSV', 0
+kw_table:      db 'TABLE', 0
+kw_verify:     db 'VERIFY', 0

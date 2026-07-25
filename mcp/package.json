@@ -1,6 +1,6 @@
 {
   "name": "asmdb-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Model Context Protocol server exposing the asmdb transactional engine as a generic CRUD store (agent memory is one example use case).",
   "type": "module",
   "bin": {

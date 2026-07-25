@@ -484,5 +484,74 @@ else
     echo "  [SKIP] CDC checks (python3 not found)"
 fi
 
+# ---------------------------------------------------------------------------
+# Run 16: safety of the destructive paths, strict parsing, machine format
+# ---------------------------------------------------------------------------
+long="$(printf 'x%.0s' $(seq 1 600))"
+big="$(printf 'C%.0s' $(seq 1 175))"
+r16="$(printf '%s\n' \
+    'INSERT 1 5 tag short' \
+    "INSERT 2 6 tag $big" \
+    'BACKUP saf.dat' \
+    'BACKUP saf.cdc' \
+    'BACKUP saf.wal' \
+    'COUNT' \
+    'DELETE 42junk' \
+    'INSERT 9 9223372036854775808 t overflow' \
+    "INSERT 8 8 t $long" \
+    'FORMAT TSV' \
+    'SELECT 2' \
+    'PAGE 1 0' \
+    'SELECT *' \
+    'PAGE 0 0' \
+    'FORMAT TABLE' \
+    'VERIFY' \
+    'EXIT' | ./asmdb saf 2>&1)"
+
+check 'BACKUP onto the live .dat refused' 'that path IS one of the live database files' "$r16"
+n_self=$(grep -c 'live database files' <<< "$r16" || true)
+if [[ "$n_self" -eq 3 ]]; then
+    echo "  [PASS] BACKUP refuses all three live files"
+else
+    echo "  [FAIL] BACKUP refuses all three live files (got $n_self)"; fail=$((fail+1))
+fi
+check 'refused backup left the rows alone' '\[ OK \] 2 row\(s\)'  "$r16"
+if [[ ! -e saf.dat.part ]]; then
+    echo "  [PASS] no .part left behind"
+else
+    echo "  [FAIL] no .part left behind"; fail=$((fail+1))
+fi
+n_syn=$(grep -c 'syntax error' <<< "$r16" || true)
+if [[ "$n_syn" -ge 2 ]]; then
+    echo "  [PASS] trailing junk is a syntax error"
+else
+    echo "  [FAIL] trailing junk is a syntax error (got $n_syn)"; fail=$((fail+1))
+fi
+check 'over-long line refused'        'line too long'            "$r16"
+check 'TSV row is not truncated'      "R.2.6.[0-9]+.[0-9]+.tag.$big" "$r16"
+check 'PAGE bounds the result set'    '\[ OK \] 1 row\(s\)'      "$r16"
+check 'VERIFY passes on a sound file' 'verify: 2 row\(s\) checked, no problem found' "$r16"
+
+printf '%s\n' 'BACKUP good.bak' 'EXIT' | ./asmdb saf > /dev/null
+if [[ -e good.bak && ! -e good.bak.part ]]; then
+    echo "  [PASS] BACKUP to a fresh path works"
+    echo "  [PASS] BACKUP leaves no temporary"
+else
+    echo "  [FAIL] BACKUP to a fresh path works"; fail=$((fail+2))
+fi
+
+# data files must not be readable by anyone else
+perm="$(stat -c '%a' saf.dat)"
+if [[ "$perm" == "600" ]]; then
+    echo "  [PASS] data files are private (0600)"
+else
+    echo "  [FAIL] data files are private (0600) - got $perm"; fail=$((fail+1))
+fi
+
+# VERIFY must notice a hand-edited status byte
+printf '\x09' | dd of=saf.dat bs=1 seek=520 count=1 conv=notrunc status=none
+r17="$(printf '%s\n' 'VERIFY' 'EXIT' | ./asmdb saf 2>&1)"
+check 'VERIFY reports a damaged file' 'verify: [0-9]+ problem\(s\) found' "$r17"
+
 if [[ $fail -gt 0 ]]; then echo; echo "$fail check(s) failed."; exit 1; fi
 echo; echo "All checks passed."

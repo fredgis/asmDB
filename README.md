@@ -722,7 +722,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.1.0 · 1.0.0 · 0.9.0 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.2.0 · 1.1.0 · 1.0.0 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -741,6 +741,104 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+<summary><b>1.2.0</b> — machine protocol, integrity checks, and a full external audit</summary>
+
+A 26-point external audit went over the whole project — engine, MCP server,
+example clients, CI and documentation. This release closes the findings that
+could lose or leak data, and adds the two things the audit showed were missing
+outright: a way to read the database without parsing a human table, and a way
+to ask the engine whether its own file still makes sense.
+
+**`BACKUP` could destroy the database it was asked to protect.** The target was
+opened with create-and-truncate and compared to nothing. On Linux, where the
+single-writer lock is advisory, `BACKUP db.dat` truncated the live file to zero
+and then wrote a snapshot of an already-empty table over it. Comparing path
+*strings* would not have been enough either — `db.dat`, `./db.dat`, an absolute
+path, a symlink and a hard link all reach the same bytes. The target is now
+identified by **(device, inode)** on Linux and **(volume, file index)** on
+Windows, and any path that resolves to the live `.dat`, `.wal` or `.cdc` is
+refused. A path that exists but cannot be identified is refused too: the one
+guess that can destroy data is the one that assumes it is safe.
+
+The snapshot itself is now written to `<file>.part`, created **exclusively**,
+flushed, and only then renamed into place. A failed or interrupted backup no
+longer leaves a plausible-looking half file behind, and no longer destroys the
+previous good backup at the same path.
+
+**`--upgrade` could silently migrate a partial database.** The source was read
+with a single `pread` per chunk, and the offset advanced by the raw byte count.
+A short read therefore dropped the trailing partial record *and* restarted the
+next chunk off a record boundary, so every record after it was reinterpreted
+from the wrong offset. Chunks are now filled completely; a source that ends
+early is refused. Two more holes closed on the same path: a record that found no
+free slot was **skipped** — a dropped row is a lost row, so it now refuses — and
+the migrated row count is checked against the count the source header declares.
+The destination is created exclusively instead of overwriting whatever was there.
+
+**Numbers were parsed too generously.** `parse_i64` accepted positive literals
+above `INT64_MAX`, which wrapped into the negative half — an operator asking for
+`9223372036854775808` got a negative value stored without a word. And every
+numeric token stopped at the first non-digit, so `DELETE 42junk` deleted row 42
+and `RANGE 1x 5` scanned from 1. A number must now end on a token boundary.
+
+**Over-long input lines were executed after being truncated.** The tail past 511
+bytes was dropped and the amputated command ran anyway, which meant an `INSERT`
+storing less than the caller wrote and — worse — a `RESTORE`, `BACKUP` or
+`DELETE` acting on a different target than the one typed. An over-long line is
+now refused outright.
+
+**`FORMAT TSV` — reading without parsing a picture.** Everything that consumed
+the database went through the ASCII table, whose content column is 40 characters
+wide and truncates with `~`. `db_get` returned all 175 bytes while `db_list` and
+`db_find` returned about 39, and because the marker was stripped the loss was
+undetectable. `FORMAT TSV` switches `SELECT`, `FIND` and `RANGE` to one
+`R`-prefixed line per row, never truncated, with only backslash, TAB, LF and CR
+escaped — every other byte passes through, so UTF-8 survives. `PAGE <limit>
+<offset>` bounds the same commands. The MCP server and the Python client now use
+this protocol; the table is for humans.
+
+**`VERIFY` — a logical integrity check.** The WAL checksum protects a frame in
+flight and says nothing about the file it was applied to. Nothing ever re-read
+the store to ask whether it was still coherent, so a truncated, hand-edited or
+partially restored `.dat` was served as if it were sound. `VERIFY` walks every
+slot and checks status bytes, the reserved id 0, content lengths and their
+terminators, and that each row is reachable by probing from its own hash — one
+check that catches both a broken probe chain and a duplicate key — then compares
+the live rows against the header count.
+
+**Data files are no longer world-readable.** They were created `0644` on Linux.
+The rows *are* the file, so every local account could read every record. They
+are now `0600`. The change log is the sharpest case: it is opened with read
+sharing precisely so consumers can follow it.
+
+**MCP server** (`1.1.0` → `1.2.0`): `id` and `value` are exchanged as decimal
+strings, because a `u64` key and an `i64` value do not survive a JavaScript
+number; reads are paginated and bounded with a timeout and an output cap;
+UTF-8 is accepted and limited by *bytes*, not characters, instead of being
+stripped to ASCII; text keys store and verify their original spelling rather
+than trusting a bare 64-bit hash; the child process reports spawn failures,
+propagates stderr and respects backpressure; the default executable follows the
+platform instead of always being `asmdb.exe`; and every tool returns one stable
+envelope. Its smoke suite went 13 → 24 checks.
+
+**Example clients**: the C client built a command string and handed it to a
+shell, so a quote or a `;` in any field became shell syntax — it now uses
+`CreateProcess` pipes on Windows and `fork`/`execv` on POSIX. The C# client uses
+`ArgumentList` instead of concatenating into a re-parsed string. The Python
+client reads `FORMAT TSV` and picks its executable from the platform.
+
+**CI** runs the MCP suite and a dependency audit, and every third-party action is
+pinned to a commit SHA.
+
+A latent bug found on the way: `u64_to_dec` pushed `rdi` *after* overwriting it,
+so it returned with the caller's register replaced by the output buffer. No
+existing caller depended on it; the first one that did produced wrong digits.
+
+Tests: 113 → 124 checks on Windows, 107 → 118 on Linux, 13 → 24 for the MCP.
+
+</details>
 
 <details>
 <summary><b>1.1.0</b> — CDC lineage, dense sequences, and four audit fixes</summary>

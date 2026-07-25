@@ -102,6 +102,11 @@ entry:
     mov  ecx, LINE_MAX
     call valloc_req
     mov  [rel g_linebuf], rax
+    ; One rendered machine-readable row. Worst case is every tag and content
+    ; byte needing a two-byte escape, plus five numeric columns and separators.
+    mov  ecx, TSV_BUF_SIZE
+    call valloc_req
+    mov  [rel g_tsvbuf], rax
     ; g_table is NOT allocated here: db_open maps the .dat copy-on-write, so the
     ; store costs address space rather than 1 GiB of committed, zeroed memory.
     mov  rcx, UNDO_MAX*UNDO_ENTRY
@@ -155,10 +160,16 @@ repl_loop:
     call read_line
     cmp  rax, -1
     je   .quit
+    cmp  rax, -2
+    je   .toolong
     mov  rcx, [rel g_linebuf]
     call dispatch
     cmp  rax, CMD_EXIT
     je   .quit
+    jmp  .loop
+.toolong:
+    lea  rcx, [rel s_err_toolong]
+    call puts
     jmp  .loop
 .quit:
     mov  rsp, rbp

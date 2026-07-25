@@ -13,7 +13,7 @@ are a general-purpose database interface, not memory-specific.
 flowchart LR
     CLIENT["MCP client<br/>(agent, IDE)"]
     SERVER["asmdb-mcp<br/>(Node server)"]
-    ENGINE["asmdb.exe<br/>(engine)"]
+    ENGINE["asmdb / asmdb.exe<br/>(engine)"]
     FILES[("asmdb.dat<br/>asmdb.wal")]
     CLIENT -->|"MCP (stdio) · tool calls"| SERVER
     SERVER -->|"stdin/stdout · commands"| ENGINE
@@ -41,32 +41,48 @@ server shuts the engine down cleanly (no orphaned process).
 
 Every record-addressed tool accepts **either**:
 
-- `id` — a numeric primary key (`u64`), used as-is (the generic-DB pattern), or
+- `id` — a decimal string primary key (`u64`), used as-is (the generic-DB
+  pattern; JS safe-integer numbers are accepted for convenience), or
 - `key` — a free-text string that the server hashes to a `u64` id with 64-bit
   **FNV-1a** (the named-record / agent-memory pattern).
 
 So the engine stays a pure id-keyed store — no secondary string index needed.
+For keyed rows, the server stores a hidden content prefix
+`\asmdb-key:<base64url(utf8-key)>;` before the caller's content. `db_get`,
+`db_find` and `db_list` strip that prefix before returning rows, so caller
+content round-trips unchanged. On `db_get`/`db_delete` by `key`, the decoded key
+must exactly match the requested key; otherwise the server reports a
+`keyCollision` error instead of returning or deleting a row that belongs to a
+different key. Because the engine content column is 176 bytes, keyed rows must
+fit the caller content plus this metadata in 176 UTF-8 bytes.
+
 The rest of the record maps as:
 
 | Field     | asmdb column | notes |
 |-----------|--------------|-------|
-| `id`/`key`| `id`         | integer as-is, or FNV-1a(key) → u64 |
-| `tag`     | `tag`        | short single-word category / namespace (≤ 39 chars) |
-| `value`   | `value`      | optional numeric payload / score (i64) |
-| `content` | `content`    | free text (≤ 175 chars) |
+| `id`/`key`| `id`         | decimal string as-is, or FNV-1a(key) → u64 |
+| `tag`     | `tag`        | UTF-8 category / namespace token (≤ 40 bytes, no whitespace/control chars) |
+| `value`   | `value`      | optional i64 decimal string payload / score |
+| `content` | `content`    | UTF-8 text (≤ 176 bytes; keyed rows reserve metadata bytes) |
 | —         | `created` / `updated` | set automatically (unix ms) |
 
 ## Tools
 
 | Tool | Arguments | Description |
 |------|-----------|-------------|
-| `db_insert` | `id`\|`key`, `content?`, `tag?`, `value?`, `upsert?` | insert a row; `upsert:true` overwrites instead of erroring |
+| `db_insert` | `id`\|`key`, `content?`, `tag?`, `value?`, `upsert?` | insert a row; `upsert:true` atomically overwrites instead of erroring |
 | `db_update` | `id`\|`key`, `content?`, `tag?`, `value?` | overwrite an existing row (errors if absent) |
 | `db_get`    | `id`\|`key` | fetch one row with value, tag, content, timestamps |
 | `db_delete` | `id`\|`key` | remove a row |
-| `db_find`   | `query` | case-insensitive substring search over tag + content |
-| `db_list`   | — | return every live row |
+| `db_find`   | `query`, `limit?`, `offset?` | case-insensitive substring search over tag + content |
+| `db_list`   | `limit?`, `offset?` | return live rows |
 | `db_count`  | — | number of live rows |
+
+Every tool returns JSON with `ok: true` on success. Failures return
+`ok: false`, an `error` string and an `errorKind` discriminator. `id` and
+`value` are always decimal strings in responses. `db_find` and `db_list` are
+bounded: `limit` defaults to 100, is capped at 1000, and responses include
+`hasMore` plus `nextOffset` when another page may exist.
 
 ## Install & run
 
@@ -77,16 +93,26 @@ node src/server.js       # speaks MCP over stdio
 npm test                 # end-to-end test against a scratch database
 ```
 
-Build the engine first (`powershell -File build.ps1` from the repo root) so
-`build/asmdb.exe` exists.
+Build the engine first (`powershell -ExecutionPolicy Bypass -File build.ps1`
+from the repo root on Windows) so `build/asmdb.exe` exists. On non-Windows
+platforms the default executable name is `build/asmdb`.
 
 ### Configuration
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `ASMDB_EXE` | `../build/asmdb.exe` | path to the engine binary |
+| `ASMDB_EXE` | `../build/asmdb.exe` on Windows, `../build/asmdb` elsewhere | path to the engine binary |
 | `ASMDB_DIR` | `~/.asmdb` | directory holding the data files |
 | `ASMDB_DB`  | `asmdb` | database base name (`<db>.dat` / `<db>.wal`) |
+| `ASMDB_TIMEOUT_MS` | `30000` | per-engine-command timeout |
+| `ASMDB_MAX_OUTPUT_BYTES` | `67108864` | per-command output cap |
+
+## Compatibility
+
+| MCP server | Engine | Storage format | CLI protocol |
+|------------|--------|----------------|--------------|
+| 1.1.0 | 1.1.0 | asmdb 1.x `.dat` + `.wal` | REPL with `FORMAT TSV` rows (`R<TAB>...`) and `PAGE <limit> <offset>` |
+| 1.0.0 | 1.0.0 | asmdb 1.x `.dat` + `.wal` | Human table parsing (deprecated; content could be truncated) |
 
 ### Register with an MCP client
 

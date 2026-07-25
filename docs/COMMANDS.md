@@ -70,6 +70,9 @@ Rules that apply everywhere:
 | [`VERSION`](#version) | engine build, storage format, and the writing engine's stamp |
 | [`BENCH <n>`](#bench) | insert *n* synthetic rows and report engine rows/sec || [`BACKUP <file>`](#backup) | snapshot this database to `<file>` |
 | [`RESTORE <file>`](#restore) | reload this database from a snapshot |
+| [`VERIFY`](#verify) | full logical integrity scan of the store |
+| [`FORMAT TABLE\|TSV`](#format) | human table (default) or machine-readable rows |
+| [`PAGE <limit> <offset>`](#page) | bound what the listing commands return |
 | [`HELP`](#help) | in-app command reference |
 | [`EXIT` / `QUIT`](#exit--quit) | leave asmdb |
 
@@ -486,6 +489,16 @@ the final flush are checked: if any of them fails the command reports
 never announced as a usable snapshot. The live database is not touched either
 way.
 
+The snapshot is written to `<file>.part`, created exclusively, flushed, and only
+then renamed over `<file>`. So a backup either lands whole or not at all, and a
+failed run never destroys the previous good backup at the same path.
+
+`<file>` is compared to the live `.dat`, `.wal` and `.cdc` **by file identity**
+— `(device, inode)` on Linux, `(volume, file index)` on Windows — not by name.
+`BACKUP db.dat`, `BACKUP ./db.dat` and a symlink to it are all refused with
+`[ERR] that path IS one of the live database files - refused`. A path that
+exists but cannot be identified is refused as well.
+
 ```text
 asmdb> BACKUP salesdb.bak
 [ OK ] backup written
@@ -516,7 +529,92 @@ asmdb> RESTORE salesdb.bak
 
 ---
 
+### `VERIFY`
+
+```
+VERIFY
+```
+
+Walk every slot and check the invariants the rest of the engine assumes. A
+checksum protects a WAL frame in flight; it says nothing about the file that
+frame was applied to, so this is the only command that asks whether the store
+itself is still coherent.
+
+It checks that each status byte is one of the three defined values, that no live
+row carries the reserved id `0`, that content lengths stay within the column and
+land on their terminator, that both text columns remain NUL-terminated, that
+every row is reachable by probing from its own hash — one test that catches both
+a broken probe chain and a duplicate key — and that the number of live rows
+matches the header count.
+
+```text
+asmdb> VERIFY
+[ OK ] verify: 1204 row(s) checked, no problem found
+```
+
+At most 16 individual problems are printed before the output is summarised.
+
+```text
+asmdb> VERIFY
+[ERR] verify: invalid status byte at slot 12
+[ERR] verify: live rows disagree with the header count: 3 live vs 4
+[ERR] verify: 2 problem(s) found
+```
+
+`VERIFY` is read-only. It never repairs anything.
+
+---
+
 ## Session commands
+
+### `FORMAT`
+
+```
+FORMAT TABLE
+FORMAT TSV
+```
+
+`TABLE` (the default) is the ASCII rendering meant for humans; its content
+column is 40 characters wide and truncates with `~`. **Do not parse it.**
+
+`TSV` switches `SELECT <id>`, `SELECT *`, `FIND` and `RANGE` to one line per
+row, never truncated:
+
+```
+R<TAB>id<TAB>value<TAB>created<TAB>updated<TAB>tag<TAB>content
+```
+
+Inside `tag` and `content` exactly four sequences are escaped — `\\`, `\t`,
+`\n`, `\r`. Every other byte passes through untouched, so UTF-8 survives. Rows
+are terminated by the usual status line, e.g. `[ OK ] 3 row(s)`, which tells a
+reader the result set is complete.
+
+```text
+asmdb> FORMAT TSV
+[ OK ] format tsv
+asmdb> SELECT *
+R	1	999	1730000000000	1730000000000	alice	revised note
+[ OK ] 1 row(s)
+```
+
+---
+
+### `PAGE`
+
+```
+PAGE <limit> <offset>
+```
+
+Bound `SELECT *`, `FIND` and `RANGE`. The setting persists until changed;
+`PAGE 0 0` restores the unlimited default. A client that receives exactly
+`limit` rows should assume there are more and ask for the next page.
+
+```text
+asmdb> PAGE 100 0
+[ OK ] paging set
+```
+
+---
 
 ### `HELP`
 

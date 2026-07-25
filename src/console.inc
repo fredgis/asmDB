@@ -330,9 +330,9 @@ print_banner:
 u64_to_dec:
     push rbp
     mov  rbp, rsp
+    push rdi                         ; save the CALLER's rdi, not the buffer
     mov  rax, rcx                    ; value
-    mov  rdi, rdx                    ; buf  (rdi is non-volatile; save/restore)
-    push rdi
+    mov  rdi, rdx                    ; buf
     xor  rcx, rcx                    ; digit count
     mov  r9, 10
 .divloop:
@@ -487,6 +487,131 @@ put_field:
     pop  rbp
     ret
 
+; tsv_esc(rcx = src, rdx = max, r8 = dest) -> rax = bytes written.
+;
+; Copies up to `max` bytes (stopping at the first NUL) into `dest`, escaping the
+; four sequences that would otherwise break the line protocol: backslash, TAB,
+; LF and CR. Every other byte is copied verbatim, so UTF-8 survives untouched -
+; the engine stores bytes and this format must not reinterpret them.
+tsv_esc:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push rsi
+    push rdi
+    mov  rsi, rcx
+    mov  rdi, r8
+    xor  rbx, rbx                    ; source index
+    xor  r9, r9                      ; bytes written
+.loop:
+    cmp  rbx, rdx
+    jae  .done
+    movzx eax, byte [rsi+rbx]
+    test al, al
+    je   .done
+    cmp  al, 0x5C                   ; backslash
+    je   .esc_bs
+    cmp  al, 9
+    je   .esc_t
+    cmp  al, 10
+    je   .esc_n
+    cmp  al, 13
+    je   .esc_r
+    mov  [rdi+r9], al
+    inc  r9
+    inc  rbx
+    jmp  .loop
+.esc_bs:
+    mov  al, 0x5C
+    jmp  .emit2
+.esc_t:
+    mov  al, 't'
+    jmp  .emit2
+.esc_n:
+    mov  al, 'n'
+    jmp  .emit2
+.esc_r:
+    mov  al, 'r'
+.emit2:
+    mov  byte [rdi+r9], 0x5C
+    mov  [rdi+r9+1], al
+    add  r9, 2
+    inc  rbx
+    jmp  .loop
+.done:
+    mov  rax, r9
+    pop  rdi
+    pop  rsi
+    pop  rbx
+    pop  rbp
+    ret
+
+; tsv_row(rcx = record ptr) - emit one machine-readable row:
+;   R \t id \t value \t created \t updated \t tag \t content CRLF
+;
+; Built in one scratch buffer and written with a single call: a per-byte writer
+; would issue a syscall per character on a scan of the whole store. Nothing here
+; is ever truncated - that is the entire point of this format.
+tsv_row:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rdi
+    mov  rbx, rcx                    ; slot
+    mov  rdi, [rel g_tsvbuf]         ; write cursor
+    mov  byte [rdi], 'R'
+    mov  byte [rdi+1], 9
+    add  rdi, 2
+    mov  rcx, [rbx+REC_ID]
+    mov  rdx, rdi
+    call u64_to_dec
+    add  rdi, rax
+    mov  byte [rdi], 9
+    inc  rdi
+    mov  rcx, [rbx+REC_VALUE]
+    mov  rdx, rdi
+    call i64_to_dec
+    add  rdi, rax
+    mov  byte [rdi], 9
+    inc  rdi
+    mov  rcx, [rbx+REC_CREATED]
+    mov  rdx, rdi
+    call u64_to_dec
+    add  rdi, rax
+    mov  byte [rdi], 9
+    inc  rdi
+    mov  rcx, [rbx+REC_UPDATED]
+    mov  rdx, rdi
+    call u64_to_dec
+    add  rdi, rax
+    mov  byte [rdi], 9
+    inc  rdi
+    lea  rcx, [rbx+REC_TAG]
+    mov  rdx, TAG_MAX
+    mov  r8, rdi
+    call tsv_esc
+    add  rdi, rax
+    mov  byte [rdi], 9
+    inc  rdi
+    lea  rcx, [rbx+REC_CONTENT]
+    mov  rdx, CONTENT_MAX
+    mov  r8, rdi
+    call tsv_esc
+    add  rdi, rax
+    mov  byte [rdi], 13
+    mov  byte [rdi+1], 10
+    add  rdi, 2
+    mov  rcx, [rel g_tsvbuf]
+    mov  rdx, rdi
+    sub  rdx, rcx
+    call putn
+    mov  rdi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; console_fill() -> rax = bytes read (0 = EOF); refills g_readbuf
 console_fill:
     push rbp
@@ -555,7 +680,13 @@ console_getc:
     pop  rbp
     ret
 
-; read_line(rcx = dest, rdx = max) -> rax = length, or -1 on EOF with no data
+; read_line(rcx = dest, rdx = max) -> rax = length, -1 on EOF with no data,
+; or -2 when the line was longer than the buffer.
+;
+; An over-long line must never be executed. Silently dropping the tail turns
+; "INSERT 1 5 tag <very long content>" into a shorter row that the caller
+; believes was stored verbatim, and a truncated DELETE/RESTORE would act on a
+; different target than the one typed. Overflow is a refusal, not a trim.
 read_line:
     push rbp
     mov  rbp, rsp
@@ -565,6 +696,7 @@ read_line:
     mov  rsi, rcx                    ; dest
     mov  [rbp-24], rdx               ; max
     xor  rbx, rbx                    ; count
+    mov  qword [rbp-32], 0           ; overflow flag
 .next:
     call console_getc
     cmp  rax, -1
@@ -576,13 +708,22 @@ read_line:
     mov  rcx, [rbp-24]
     dec  rcx
     cmp  rbx, rcx
-    jae  .next                       ; drop overflow, keep consuming to EOL
+    jae  .over                       ; keep consuming to EOL, but remember
     mov  [rsi+rbx], al
     inc  rbx
     jmp  .next
+.over:
+    mov  qword [rbp-32], 1
+    jmp  .next
 .eol:
     mov  byte [rsi+rbx], 0
+    cmp  qword [rbp-32], 0
+    jne  .toolong
     mov  rax, rbx
+    jmp  .done
+.toolong:
+    mov  byte [rsi], 0               ; never hand a partial command to dispatch
+    mov  rax, -2
     jmp  .done
 .eof:
     test rbx, rbx

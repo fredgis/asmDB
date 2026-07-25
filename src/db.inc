@@ -742,6 +742,8 @@ db_upgrade:
     mov  qword [rel g_reset_pend], 0
     mov  qword [rel g_reset_seq], 0
     mov  r13, [rel g_hdr_read+16]    ; old capacity
+    mov  rax, [rel g_hdr_read+24]    ; live rows the source claims to hold
+    mov  [rbp-88], rax
     ; ---- create the destination ----
     lea  rdi, [rel g_bakname]
     lea  rsi, [rel g_base]
@@ -755,7 +757,7 @@ db_upgrade:
     lea  rcx, [rel s_nl]
     call puts
     lea  rcx, [rel g_bakname]
-    call os_create
+    call os_create_new               ; refuse to clobber an existing destination
     cmp  rax, INVALID_HANDLE
     je   .nodest
     mov  [rel g_dat_handle], rax
@@ -797,16 +799,31 @@ db_upgrade:
     jbe  .haveln
     mov  rbx, rax
 .haveln:
+    ; Fill the chunk completely before parsing it. A single pread is allowed to
+    ; return fewer bytes than asked for; the previous code advanced by that raw
+    ; count, so a short read both dropped the trailing partial record AND
+    ; restarted the next chunk off a record boundary - every record after it
+    ; was then reinterpreted from the wrong offset.
+    mov  qword [rbp-80], 0           ; bytes filled in this chunk
+.fill:
+    mov  rax, [rbp-80]
+    cmp  rax, rbx
+    jae  .filled
     mov  rcx, r14
     mov  rdx, r12
     add  rdx, HDR_SIZE
+    add  rdx, rax
     mov  r8, [rel g_walbuf]
+    add  r8, rax
     mov  r9, rbx
+    sub  r9, rax
     call os_pread
     test rax, rax
     js   io_fatal_read               ; a read error must never look like success
-    jz   .short_src                  ; EOF before the header's own length
-    mov  rbx, rax
+    jz   .short_src                  ; EOF inside the region the header declares
+    add  [rbp-80], rax
+    jmp  .fill
+.filled:
     xor  rsi, rsi                    ; offset inside the chunk
 .rec:
     mov  rax, rsi
@@ -821,7 +838,7 @@ db_upgrade:
     mov  rcx, [rdi+REC_ID]
     call store_locate                ; rdx = insertable slot in the NEW table
     test rdx, rdx
-    jz   .recnext                    ; no room - cannot happen below 0.75 load
+    jz   .nospace                    ; refuse: a dropped row is a lost row
     mov  [rbp-72], rsi
     mov  rsi, [rbp-64]
     mov  rdi, rdx
@@ -836,6 +853,13 @@ db_upgrade:
     add  r12, rbx
     jmp  .chunk
 .streamed:
+    ; Every live row the source advertised must be present in the rebuilt table.
+    ; Migrating fewer rows than the source header declares means the source was
+    ; inconsistent or a record was lost on the way, and either way the result
+    ; must not be presented as a successful migration.
+    mov  rax, [rel g_count]
+    cmp  rax, [rbp-88]
+    jne  .lostrows
     ; ---- persist the rebuilt table ----
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
@@ -901,6 +925,28 @@ db_upgrade:
     mov  rcx, r14
     call os_close
     lea  rcx, [rel s_upg_short]
+    call puts
+    mov  eax, 1
+    jmp  .ret
+.nospace:
+    mov  rcx, r14
+    call os_close
+    lea  rcx, [rel s_upg_nospace]
+    call puts
+    mov  eax, 1
+    jmp  .ret
+.lostrows:
+    mov  rcx, r14
+    call os_close
+    lea  rcx, [rel s_upg_lost]
+    call puts
+    mov  rcx, [rel g_count]
+    call put_u64
+    lea  rcx, [rel s_vfy_vs]
+    call puts
+    mov  rcx, [rbp-88]
+    call put_u64
+    lea  rcx, [rel s_nl]
     call puts
     mov  eax, 1
 .ret:

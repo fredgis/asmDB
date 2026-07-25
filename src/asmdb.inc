@@ -44,6 +44,11 @@
 %define WAL_BUF_SIZE   0x200000   ; 2 MiB in-memory WAL staging
 %define UNDO_MAX       4096       ; max slots touched per transaction
 %define UNDO_ENTRY     (8+REC_SIZE) ; 8-byte slot index + record image
+; "R" + 5 numeric columns (20 digits each) + 6 separators + fully escaped tag
+; and content (two bytes per source byte) + CRLF, rounded up.
+%define TSV_BUF_SIZE   (2 + 5*21 + 2*(TAG_MAX + CONTENT_MAX) + 4)
+%define PAGE_LIMIT_MAX 1000000    ; refuse absurd page sizes rather than wrap
+%define VERIFY_MAX_REPORT 16      ; per-slot problems printed before summarising
 
 ; ---- Dispatch results ----
 %define CMD_OK   0
@@ -65,6 +70,9 @@
 %define OPEN_ALWAYS        4
 %define OPEN_EXISTING      3
 %define CREATE_ALWAYS      2
+%define CREATE_NEW         1
+%define MOVEFILE_REPLACE_EXISTING 0x1
+%define MOVEFILE_WRITE_THROUGH    0x8
 %define FILE_ATTRIBUTE_NORMAL 0x80
 %define FILE_BEGIN         0
 %define PAGE_WRITECOPY     0x08
@@ -95,7 +103,7 @@
 ; HDR_ENGINE purely for diagnostics: it tells you which build touched a
 ; database, without ever affecting whether it can be opened.
 %define ENGINE_MAJOR 1
-%define ENGINE_MINOR 1
+%define ENGINE_MINOR 2
 %define ENGINE_PATCH 0
 %define ENGINE_VERSION ((ENGINE_MAJOR << 16) | (ENGINE_MINOR << 8) | ENGINE_PATCH)
 

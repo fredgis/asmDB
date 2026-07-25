@@ -11,7 +11,7 @@ jobs:
     name: Linux (ELF64, native run)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install NASM
         run: sudo apt-get update && sudo apt-get install -y nasm
       - name: Build ELF64
@@ -27,7 +27,7 @@ jobs:
     name: Windows (PE64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install NASM
         run: choco install nasm -y --no-progress
       - name: Add NASM to PATH
@@ -37,3 +37,30 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File .\build.ps1
       - name: Smoke test (CRUD + txn + persistence)
         run: powershell -ExecutionPolicy Bypass -File .\tests\smoke.ps1 -NoBuild
+
+  mcp:
+    name: MCP server smoke (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Build ELF64
+        run: bash ./build.sh
+      - name: Prepare engine path for MCP smoke test
+        run: cp build/asmdb build/asmdb.exe && chmod +x build/asmdb.exe
+      - name: Audit MCP dependencies
+        working-directory: mcp
+        run: npm audit --audit-level=high
+        continue-on-error: true
+      - name: Install MCP dependencies
+        working-directory: mcp
+        run: npm ci
+      - name: Smoke test MCP server
+        working-directory: mcp
+        run: node test/smoke.js

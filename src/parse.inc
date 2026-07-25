@@ -73,6 +73,11 @@ token_eq:
 ;   Rejects values that do not fit in 64 bits. Wrapping silently would be a
 ;   correctness hole for a primary key: "18446744073709551617" would otherwise
 ;   parse as id 1 and collide with a real row.
+;
+;   The number must also end on a token boundary. Stopping at the first
+;   non-digit would make "DELETE 42junk" delete row 42 and "RANGE 1x 5" scan
+;   from 1: the operator asked for something the engine cannot express, and
+;   guessing at their intent is worse than refusing.
 parse_u64:
     xor  rax, rax
     xor  r9, r9
@@ -95,7 +100,16 @@ parse_u64:
     jmp  .loop
 .end:
     test r9, r9
-    jz   .err
+    jz   .err                        ; no digits at all
+    movzx ecx, byte [rsi]
+    test cl, cl
+    je   .ok
+    cmp  cl, ' '
+    je   .ok
+    cmp  cl, 9
+    je   .ok
+    jmp  .err                        ; trailing junk glued to the number
+.ok:
     mov  rdx, 1
     ret
 .err:
@@ -103,6 +117,9 @@ parse_u64:
     ret
 
 ; parse_i64() - optional leading '-' then decimal -> rax value, rdx ok flag
+;   Bounded to [INT64_MIN, INT64_MAX]. The stored column is signed, so a
+;   positive literal above INT64_MAX must be a syntax error rather than a
+;   negative row value the caller never asked for.
 parse_i64:
     mov  al, [rsi]
     cmp  al, '-'
@@ -119,6 +136,12 @@ parse_i64:
     ret
 .pos:
     call parse_u64
+    test rdx, rdx
+    jz   .err
+    mov  rcx, 0x7FFFFFFFFFFFFFFF
+    cmp  rax, rcx
+    ja   .err                        ; would land in the negative half
+    mov  rdx, 1
     ret
 .err:
     xor  rdx, rdx
@@ -719,6 +742,157 @@ cmd_truncate:
     pop  rbp
     ret
 
+; --------------------- listing: format and paging ---------------------------
+;
+; Every listing command (SELECT *, FIND, RANGE) shares the same emission path so
+; that a machine consumer sees one protocol. In TABLE mode nothing changed. In
+; TSV mode rows are emitted verbatim and terminated by a status line, which is
+; what lets a reader know the result set is complete.
+
+; list_start() - reset the page cursor and, in TABLE mode, open the frame.
+list_start:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  rax, [rel g_page_offset]
+    mov  [rel g_list_skip], rax
+    mov  qword [rel g_list_n], 0
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; list_full() -> rax = 1 once the page limit has been reached.
+list_full:
+    xor  eax, eax
+    mov  rcx, [rel g_page_limit]
+    test rcx, rcx
+    jz   .no                         ; 0 = unlimited
+    cmp  [rel g_list_n], rcx
+    jb   .no
+    mov  eax, 1
+.no:
+    ret
+
+; list_skip() -> rax = 1 when the current row falls before the page offset
+; (and consumes one unit of it). Callers must test this before opening the
+; table frame, otherwise a fully skipped page would still print a header.
+list_skip:
+    mov  rax, [rel g_list_skip]
+    test rax, rax
+    jz   .keep
+    dec  rax
+    mov  [rel g_list_skip], rax
+    mov  eax, 1
+    ret
+.keep:
+    xor  eax, eax
+    ret
+
+; list_row(rcx = slot ptr) - emit one row in the active format and count it.
+list_row:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    cmp  qword [rel g_fmt_tsv], 0
+    jne  .tsv
+    call print_row
+    jmp  .counted
+.tsv:
+    call tsv_row
+.counted:
+    inc  qword [rel g_list_n]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; list_report() - in TSV mode, terminate the result set with a row count.
+list_report:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    cmp  qword [rel g_fmt_tsv], 0
+    je   .out
+    lea  rcx, [rel s_rows_pre]
+    call puts
+    mov  rcx, [rel g_list_n]
+    call put_u64
+    lea  rcx, [rel s_rows_post]
+    call puts
+.out:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_format() - FORMAT TABLE | TSV
+cmd_format:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-16], rsi
+    call skip_spaces_rsi
+    lea  rdi, [rel kw_tsv]
+    call token_eq
+    test rax, rax
+    jnz  .tsv
+    lea  rdi, [rel kw_table]
+    call token_eq
+    test rax, rax
+    jnz  .table
+    lea  rcx, [rel s_err_syntax]
+    call puts
+    jmp  .out
+.tsv:
+    mov  qword [rel g_fmt_tsv], 1
+    lea  rcx, [rel s_fmt_tsv]
+    call puts
+    jmp  .out
+.table:
+    mov  qword [rel g_fmt_tsv], 0
+    lea  rcx, [rel s_fmt_table]
+    call puts
+.out:
+    mov  rsi, [rbp-16]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_page() - PAGE <limit> <offset> : bound the listing commands.
+; PAGE 0 0 restores the unlimited default.
+cmd_page:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-16], rsi
+    call skip_spaces_rsi
+    call parse_u64
+    test rdx, rdx
+    jz   .syntax
+    mov  rcx, PAGE_LIMIT_MAX
+    cmp  rax, rcx
+    ja   .syntax
+    mov  [rbp-24], rax
+    call skip_spaces_rsi
+    call parse_u64
+    test rdx, rdx
+    jz   .syntax
+    mov  rcx, CAPACITY
+    cmp  rax, rcx
+    ja   .syntax
+    mov  [rel g_page_offset], rax
+    mov  rax, [rbp-24]
+    mov  [rel g_page_limit], rax
+    lea  rcx, [rel s_page_set]
+    call puts
+    jmp  .out
+.syntax:
+    lea  rcx, [rel s_err_syntax]
+    call puts
+.out:
+    mov  rsi, [rbp-16]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; cmd_select() - SELECT <id> | SELECT *
 cmd_select:
     push rbp
@@ -741,14 +915,25 @@ cmd_select:
     test rax, rax
     jz   .notfound
     mov  rcx, rax
+    cmp  qword [rel g_fmt_tsv], 0
+    jne  .one_tsv
     call print_detail
     jmp  .done
+.one_tsv:
+    call tsv_row
+    jmp  .done
 .all:
+    call list_start
+    xor  rbx, rbx
+    cmp  qword [rel g_fmt_tsv], 0
+    jne  .aloop
     call tbl_sep
     call tbl_head
     call tbl_sep
-    xor  rbx, rbx
 .aloop:
+    call list_full
+    test rax, rax
+    jnz  .aend
     cmp  rbx, CAPACITY
     jae  .aend
     mov  rax, rbx
@@ -756,13 +941,21 @@ cmd_select:
     add  rax, [rel g_table]
     cmp  byte [rax+REC_STATUS], ST_OCCUPIED
     jne  .anext
-    mov  rcx, rax
-    call print_row
+    mov  [rbp-40], rax
+    call list_skip
+    test rax, rax
+    jnz  .anext
+    mov  rcx, [rbp-40]
+    call list_row
 .anext:
     inc  rbx
     jmp  .aloop
 .aend:
+    cmp  qword [rel g_fmt_tsv], 0
+    jne  .areport
     call tbl_sep
+.areport:
+    call list_report
     jmp  .done
 .notfound:
     lea  rcx, [rel s_err_nf]
@@ -790,6 +983,157 @@ cmd_count:
     call put_u64
     lea  rcx, [rel s_count_post]
     call puts
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; vfy_fail(rcx = message, rdx = slot index) - report one integrity problem.
+; Output is capped: a systematically corrupted file would otherwise print four
+; million lines and bury the summary.
+vfy_fail:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rdx
+    inc  qword [rel g_vfy_n]
+    mov  rax, [rel g_vfy_n]
+    cmp  rax, VERIFY_MAX_REPORT
+    ja   .quiet
+    call puts
+    mov  rcx, [rbp-8]
+    call put_u64
+    call crlf
+    jmp  .out
+.quiet:
+    cmp  rax, VERIFY_MAX_REPORT+1
+    jne  .out
+    lea  rcx, [rel s_vfy_more]
+    call puts
+.out:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cmd_verify() - VERIFY : full logical integrity scan of the store.
+;
+; The WAL checksum protects a frame in flight; it says nothing about the file
+; that frame was applied to. Nothing in the engine ever re-reads the store to
+; ask whether it still makes sense, so a truncated, hand-edited or
+; partially-restored .dat was served as if it were sound. VERIFY walks every
+; slot and checks the invariants the rest of the engine assumes:
+;
+;   - the status byte is one of the three defined values;
+;   - a live row has a non-zero id (0 is the reserved "no key" sentinel);
+;   - the declared content length is within the column and lands on its
+;     terminator, and both text columns stay NUL-terminated;
+;   - the row is reachable by probing from its own hash - this single check
+;     catches both a broken probe chain and a duplicate key, because a second
+;     row with the same id can never be the one the probe finds first;
+;   - the number of live rows matches the header count used by COUNT.
+cmd_verify:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x60
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    mov  qword [rel g_vfy_n], 0
+    mov  qword [rbp-40], 0           ; live rows counted
+    xor  rbx, rbx
+.loop:
+    cmp  rbx, CAPACITY
+    jae  .done_scan
+    mov  rsi, rbx
+    shl  rsi, REC_SHIFT
+    add  rsi, [rel g_table]
+    movzx eax, byte [rsi+REC_STATUS]
+    cmp  al, ST_OCCUPIED
+    je   .live
+    cmp  al, ST_EMPTY
+    je   .next
+    cmp  al, ST_DELETED
+    je   .next
+    lea  rcx, [rel s_vfy_status]
+    mov  rdx, rbx
+    call vfy_fail
+    jmp  .next
+.live:
+    inc  qword [rbp-40]
+    cmp  qword [rsi+REC_ID], 0
+    jne  .chk_clen
+    lea  rcx, [rel s_vfy_id]
+    mov  rdx, rbx
+    call vfy_fail
+.chk_clen:
+    mov  eax, dword [rsi+REC_CLEN]
+    cmp  eax, CONTENT_MAX
+    jbe  .chk_term
+    lea  rcx, [rel s_vfy_clen]
+    mov  rdx, rbx
+    call vfy_fail
+    jmp  .chk_reach
+.chk_term:
+    cmp  byte [rsi+REC_TAG+TAG_MAX-1], 0
+    jne  .bad_term
+    cmp  byte [rsi+REC_CONTENT+CONTENT_MAX-1], 0
+    jne  .bad_term
+    mov  eax, dword [rsi+REC_CLEN]
+    cmp  eax, CONTENT_MAX
+    je   .chk_reach                  ; a full column has no room for a NUL
+    lea  rcx, [rsi+REC_CONTENT]
+    add  rcx, rax
+    cmp  byte [rcx], 0
+    je   .chk_reach
+.bad_term:
+    lea  rcx, [rel s_vfy_term]
+    mov  rdx, rbx
+    call vfy_fail
+.chk_reach:
+    mov  rcx, [rsi+REC_ID]
+    call store_locate
+    cmp  rax, rsi
+    je   .next
+    lea  rcx, [rel s_vfy_reach]
+    mov  rdx, rbx
+    call vfy_fail
+.next:
+    inc  rbx
+    jmp  .loop
+.done_scan:
+    mov  rax, [rbp-40]
+    cmp  rax, [rel g_count]
+    je   .report
+    inc  qword [rel g_vfy_n]
+    lea  rcx, [rel s_vfy_count]
+    call puts
+    mov  rcx, [rbp-40]
+    call put_u64
+    lea  rcx, [rel s_vfy_vs]
+    call puts
+    mov  rcx, [rel g_count]
+    call put_u64
+    call crlf
+.report:
+    cmp  qword [rel g_vfy_n], 0
+    jne  .bad
+    lea  rcx, [rel s_vfy_ok]
+    call puts
+    mov  rcx, [rbp-40]
+    call put_u64
+    lea  rcx, [rel s_vfy_ok_post]
+    call puts
+    jmp  .out
+.bad:
+    lea  rcx, [rel s_vfy_bad]
+    call puts
+    mov  rcx, [rel g_vfy_n]
+    call put_u64
+    lea  rcx, [rel s_vfy_bad_post]
+    call puts
+.out:
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret
@@ -862,9 +1206,13 @@ cmd_find:
     lea  rdi, [rel g_namebuf]
     mov  rdx, 63
     call parse_rest                  ; needle = rest of line
+    call list_start
     xor  r12, r12                    ; match count
     xor  rbx, rbx                    ; slot index
 .scan:
+    call list_full
+    test rax, rax
+    jnz  .done_scan
     cmp  rbx, CAPACITY
     jae  .done_scan
     mov  rax, rbx
@@ -885,22 +1233,32 @@ cmd_find:
     test rax, rax
     jz   .next
 .hit:
+    call list_skip
+    test rax, rax
+    jnz  .next
     test r12, r12
     jnz  .have_hdr
+    cmp  qword [rel g_fmt_tsv], 0
+    jne  .have_hdr
     call tbl_sep
     call tbl_head
     call tbl_sep
 .have_hdr:
     mov  rcx, [rbp-40]
-    call print_row
+    call list_row
     inc  r12
 .next:
     inc  rbx
     jmp  .scan
 .done_scan:
+    cmp  qword [rel g_fmt_tsv], 0
+    jne  .report
     test r12, r12
     jz   .none
     call tbl_sep
+    jmp  .done
+.report:
+    call list_report
     jmp  .done
 .none:
     lea  rcx, [rel s_find_none]
@@ -934,9 +1292,13 @@ cmd_range:
     test rdx, rdx
     jz   .syntax
     mov  [rbp-56], rax               ; hi
+    call list_start
     xor  r12, r12                    ; match count
     xor  rbx, rbx                    ; slot index
 .scan:
+    call list_full
+    test rax, rax
+    jnz  .done_scan
     cmp  rbx, CAPACITY
     jae  .done_scan
     mov  rax, rbx
@@ -949,23 +1311,33 @@ cmd_range:
     jl   .next                       ; value < lo (signed)
     cmp  rcx, [rbp-56]
     jg   .next                       ; value > hi (signed)
-    mov  [rbp-64], rax               ; slot ptr (survives tbl_* / print_row)
+    mov  [rbp-64], rax               ; slot ptr (survives tbl_* / list_row)
+    call list_skip
+    test rax, rax
+    jnz  .next
     test r12, r12
     jnz  .have_hdr
+    cmp  qword [rel g_fmt_tsv], 0
+    jne  .have_hdr
     call tbl_sep
     call tbl_head
     call tbl_sep
 .have_hdr:
     mov  rcx, [rbp-64]
-    call print_row
+    call list_row
     inc  r12
 .next:
     inc  rbx
     jmp  .scan
 .done_scan:
+    cmp  qword [rel g_fmt_tsv], 0
+    jne  .report
     test r12, r12
     jz   .none
     call tbl_sep
+    jmp  .done
+.report:
+    call list_report
     jmp  .done
 .none:
     lea  rcx, [rel s_range_none]
@@ -983,9 +1355,107 @@ cmd_range:
     pop  rbp
     ret
 
+; id_matches(rcx = handle) -> rax = 1 when that handle's file identity equals
+; the one already loaded in g_idbuf.
+id_matches:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    test rcx, rcx
+    jz   .no
+    cmp  rcx, INVALID_HANDLE
+    je   .no
+    lea  rdx, [rel g_idbuf2]
+    call os_file_id
+    test rax, rax
+    js   .no
+    mov  rax, [rel g_idbuf]
+    cmp  rax, [rel g_idbuf2]
+    jne  .no
+    mov  rax, [rel g_idbuf+8]
+    cmp  rax, [rel g_idbuf2+8]
+    jne  .no
+    mov  eax, 1
+    jmp  .out
+.no:
+    xor  eax, eax
+.out:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; path_is_live(rcx = path) -> rax = 1 when the path names one of the three files
+; this process has open for writing.
+;
+; A string comparison is not enough. "db.dat", "./db.dat", an absolute path, a
+; symlink and a hard link all reach the same bytes, and on Linux the advisory
+; flock does not stop a second open from truncating the file. BACKUP db.dat
+; therefore used to destroy the database it was asked to protect. Identity is
+; the only reliable test, so the target is opened read-only and compared by
+; (device, inode) on Linux and (volume, file index) on Windows.
+path_is_live:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rcx               ; path (os_exists clobbers rcx)
+    call os_exists
+    test rax, rax
+    jz   .safe                       ; truly absent - nothing to alias
+    mov  rcx, [rbp-16]
+    call os_open_read
+    cmp  rax, INVALID_HANDLE
+    je   .noopen                     ; it exists but will not open: assume ours
+    mov  rbx, rax
+    mov  rcx, rbx
+    lea  rdx, [rel g_idbuf]
+    call os_file_id
+    test rax, rax
+    js   .unknown
+    mov  rcx, [rel g_dat_handle]
+    call id_matches
+    test rax, rax
+    jnz  .alias
+    mov  rcx, [rel g_wal_handle]
+    call id_matches
+    test rax, rax
+    jnz  .alias
+    mov  rcx, [rel g_cdc_handle]
+    call id_matches
+    test rax, rax
+    jnz  .alias
+    mov  rcx, rbx
+    call os_close
+    xor  eax, eax
+    jmp  .out
+.alias:
+    mov  rcx, rbx
+    call os_close
+    mov  eax, 1
+    jmp  .out
+.unknown:
+    ; The file exists but refuses to identify itself. Treating that as "not the
+    ; database" is the one guess that can destroy data, so assume the worst.
+    mov  rcx, rbx
+    call os_close
+.noopen:
+    mov  eax, 1
+    jmp  .out
+.safe:
+    xor  eax, eax
+.out:
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; cmd_backup() - BACKUP <file> : snapshot the current database (header + full
-; slot region) to <file>. Rejected while a transaction is open. Temporarily
-; retargets g_dat_handle at the backup file.
+; slot region) to <file>. Rejected while a transaction is open.
+;
+; The snapshot is written to <file>.part, created exclusively, fully flushed,
+; and only then renamed over <file>. Two properties follow: a failed or
+; interrupted backup never leaves a plausible-looking half file behind, and it
+; never destroys the previous good backup at the same path.
 ;
 ; Every transfer is checked. A failure here does NOT abort the process (the
 ; live database was never touched) but it must never be reported as success,
@@ -1007,7 +1477,16 @@ cmd_backup:
     mov  rdx, 200
     call parse_tok
     lea  rcx, [rel g_bakname]
-    call os_create
+    call path_is_live
+    test rax, rax
+    jnz  .selftarget
+    lea  rdi, [rel g_tmpname]
+    lea  rsi, [rel g_bakname]
+    call strcpy_z
+    lea  rsi, [rel s_part_suffix]
+    call strcpy_z
+    lea  rcx, [rel g_tmpname]
+    call os_create_new
     cmp  rax, INVALID_HANDLE
     je   .openfail
     mov  rbx, rax                    ; backup handle
@@ -1047,8 +1526,21 @@ cmd_backup:
     mov  rax, [rbp-32]
     mov  [rel g_dat_handle], rax     ; restore live handle
     mov  rcx, rbx
-    call os_close
+    call os_close                    ; close before renaming: Windows will not
+                                     ; replace a path that still has an open
+                                     ; handle to the destination
+    lea  rcx, [rel g_tmpname]
+    lea  rdx, [rel g_bakname]
+    call os_rename
+    test rax, rax
+    jnz  .renamefail
     lea  rcx, [rel s_ok_backup]
+    call puts
+    jmp  .done
+.renamefail:
+    lea  rcx, [rel g_tmpname]
+    call os_unlink                   ; do not leave a stale .part behind
+    lea  rcx, [rel s_err_bak_rename]
     call puts
     jmp  .done
 .wfail:
@@ -1056,7 +1548,13 @@ cmd_backup:
     mov  [rel g_dat_handle], rax     ; restore live handle before reporting
     mov  rcx, rbx
     call os_close
+    lea  rcx, [rel g_tmpname]
+    call os_unlink                   ; a partial snapshot must not survive
     lea  rcx, [rel s_err_bak_write]
+    call puts
+    jmp  .done
+.selftarget:
+    lea  rcx, [rel s_err_bak_self]
     call puts
     jmp  .done
 .openfail:
@@ -1454,11 +1952,20 @@ cmd_help:
     lea  rcx, [rel hc_restore]
     lea  rdx, [rel hd_restore]
     call help_row
+    lea  rcx, [rel hc_verify]
+    lea  rdx, [rel hd_verify]
+    call help_row
     call crlf
     lea  rcx, [rel h_g_sess]
     lea  rdx, [rel c_yellow]
     call puts_col
     call crlf
+    lea  rcx, [rel hc_format]
+    lea  rdx, [rel hd_format]
+    call help_row
+    lea  rcx, [rel hc_page]
+    lea  rdx, [rel hd_page]
+    call help_row
     lea  rcx, [rel hc_help]
     lea  rdx, [rel hd_help]
     call help_row
@@ -1822,6 +2329,18 @@ dispatch:
     call token_eq
     test rax, rax
     jnz  .restore
+    lea  rdi, [rel kw_format]
+    call token_eq
+    test rax, rax
+    jnz  .format
+    lea  rdi, [rel kw_page]
+    call token_eq
+    test rax, rax
+    jnz  .page
+    lea  rdi, [rel kw_verify]
+    call token_eq
+    test rax, rax
+    jnz  .verify
     lea  rcx, [rel s_unknown]
     call puts
     jmp  .ok0
@@ -1893,6 +2412,17 @@ dispatch:
 .restore:
     call advance_token
     call cmd_restore
+    jmp  .ok0
+.format:
+    call advance_token
+    call cmd_format
+    jmp  .ok0
+.page:
+    call advance_token
+    call cmd_page
+    jmp  .ok0
+.verify:
+    call cmd_verify
     jmp  .ok0
 .exit:
     mov  rax, CMD_EXIT
