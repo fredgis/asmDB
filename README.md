@@ -26,32 +26,36 @@
 ---
 
 **asmdb** is a tiny, transactional database engine written from scratch in
-x86-64 assembly. NASM emits the final executable **directly** (`nasm -f bin`) —
-there is **no linker, no C runtime, no libraries**. The same engine source builds
-two native binaries: a **Windows PE64** that calls `kernel32.dll` through a
-hand-built import table, and a **Linux ELF64** (a hand-assembled ELF header) that
-talks to the kernel through raw `syscall`s — selected by a thin `os_*` platform
-layer. Yet it is a real database: every statement is flushed to disk,
-`BEGIN`/`COMMIT`/`ROLLBACK` are real transactions, and a write-ahead log makes
-crash recovery atomic.
+x86-64 assembly — and it is a *real* database, not a demo.
 
-You drive it two ways: an **ASCII-art CLI** over stdin/stdout, and a bundled
-**[MCP server](mcp/)** that exposes the engine to any Model Context Protocol
-client as a generic CRUD store (`db_insert` / `db_get` / `db_find` / …). Its
-256-byte record — a numeric `value`, automatic `created`/`updated` timestamps,
-a short `tag`, and a free-text `content` field — suits many workloads;
-**durable long-term memory for an AI agent is one example use case**, not the
-only one.
+|  | |
+|---|---|
+| 🔩 **Nothing underneath it** | NASM emits the executable **directly** (`nasm -f bin`). No linker, no C runtime, no libraries — the whole engine is one `.asm` tree |
+| 🪟🐧 **One source, two native binaries** | a **Windows PE64** calling `kernel32.dll` through a hand-built import table, and a **Linux ELF64** with a hand-assembled header talking to the kernel by raw `syscall` — chosen by a thin `os_*` layer |
+| 💾 **Durable, not best-effort** | every statement reaches the disk, `BEGIN`/`COMMIT`/`ROLLBACK` are real transactions, and a write-ahead log makes crash recovery atomic |
+| 🔁 **Every change is captured** | an append-only change log records one durable frame per committed transaction, so anything downstream can follow the database exactly |
+| 👥 **One writer, many readers** | `--reader` sessions run alongside the writer, each command isolated by the commit sequence |
+| ⚡ **Absurdly fast at its one job** | **over 12 million inserts/second** in RAM — roughly **12× SQLite** on the same machine (benchmark below, reproducible) |
+
+**Two ways to drive it:**
+
+- an **ASCII-art CLI** over stdin/stdout — plus `FORMAT TSV` when a program, not
+  a human, is reading;
+- a bundled **[MCP server](mcp/)** exposing the engine to any Model Context
+  Protocol client as a generic CRUD store (`db_insert` / `db_get` / `db_find` / …).
+
+The 256-byte record — a numeric `value`, automatic `created`/`updated`
+timestamps, a short `tag` and a free-text `content` field — suits many
+workloads. **Durable long-term memory for an AI agent is one example, not the
+only one.**
 
 <p align="center">
   <img src="docs/assets/asmdb-quick.png" alt="asmdb REPL: INSERT, SELECT * rendering a table, FIND matching on content" width="88%">
 </p>
 
-Because the engine does one thing — fixed-shape rows in a single hash-indexed
-table — it does that one thing at speeds a general-purpose SQL database cannot
-touch: **over 12 million inserts/second** in RAM (measured below, and
-reproducible — ≈ 12× SQLite on the same machine). That is the whole point of
-writing a database in assembly.
+The speed is not a trick — it is the direct consequence of doing far less. One
+fixed-shape row, one hash-indexed table, no parser, no planner. That is the
+whole point of writing a database in assembly.
 
 ## What fits, and what is enforced
 
@@ -76,7 +80,16 @@ time rather than silently trimmed.
 | **Concurrency** | one writer, unlimited `--reader` sessions |
 | **Not there** | no SQL, no joins, no query planner, no secondary indexes, no auth, no encryption |
 
-One table per database file. A [`FIND`](docs/COMMANDS.md#find) or
+**A database *is* a table.** There is no `CREATE TABLE`, no `USE`, no catalogue:
+`<name>.dat` holds exactly one table, and that file plus its `<name>.wal` and
+`<name>.cdc` is simultaneously the unit of durability, of locking, of
+transactions, of backup and of change capture. "Database", "table" and "engine
+instance" are three words for the same object — the table simply carries a
+display name that may differ from the file name. Several tables means several
+files, therefore several engine processes, and **no transaction spans two of
+them**.
+
+A [`FIND`](docs/COMMANDS.md#find) or
 [`RANGE`](docs/COMMANDS.md#range) is a full scan of the 4 194 304 slots;
 [`SELECT <id>`](docs/COMMANDS.md#select) is O(1). Full details in
 [Data model & supported types](#data-model--supported-types).
@@ -729,7 +742,7 @@ Two documents, deliberately kept in separate lanes:
 | **Integration** | ✅ MCP server (generic CRUD tools) + Python / C# / C stdio clients |
 | **Security** | ⚠️ no auth, no encryption, no audit log; the binary is a single RWX image at a fixed address — see [`SECURITY.md`](SECURITY.md) |
 | **Tests** | ✅ 151 checks on Windows and the same battery on Linux, plus 24 for the MCP server — fault-injected I/O failures, crash windows, format fuzzing |
-| **Next up** | 🔜 **persisted status directory** (see below), then secondary indexes, SIMD scans, and multi-writer MVCC |
+| **Next up** | 🔜 **secondary indexes** — a full `FIND` costs ~900 ms whatever the row count, and a status directory was prototyped and measured *worse* on populated tables. Then SIMD scans and multi-writer MVCC |
 
 **The roadmap is driven by measurement, not intuition.** The last milestone came
 from noticing that opening a database cost **~600 ms regardless of its
@@ -743,6 +756,23 @@ fixed it at the root:
 | open + `COUNT` | 684 ms | **104 ms** |
 | peak memory | 1 029 MB | **5 MB** |
 | `BENCH` in-RAM insert | 11.8 M rows/s | 11.7 M rows/s (unchanged) |
+
+**And measurement kills ideas as well as confirming them.** The next roadmap item
+was a *persisted status directory* — one byte per slot, held contiguously, so a
+full scan reads 4 MiB instead of striding through 1 GiB. It was built, and it did
+exactly what it promised on a nearly-empty table:
+
+| full `FIND` | 1 GiB sweep | status directory |
+|---|--:|--:|
+| 100 rows | 529 ms | **108 ms** |
+| 100 000 rows | **897 ms** | 6 000 ms |
+
+Reading one byte per slot is cheap; *then jumping to each live record* is not.
+The old code streamed the region sequentially and let readahead do the work,
+while the directory turns the same work into random reads. The win only survives
+below roughly a thousand rows — nowhere near enough to justify changing the
+storage format. It was reverted, and the real answer to a slow `FIND` is a
+**secondary index**.
 
 Durability was deliberately left alone: a *private* mapping keeps uncommitted
 writes out of the file, so the WAL protocol still owns every byte that reaches

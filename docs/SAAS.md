@@ -32,7 +32,7 @@ configured, and they are what a tenant actually buys.
 
 | Dimension | Hard limit | What it means for the service |
 |---|---|---|
-| Rows per database | 4 194 304 slots, comfortable to ~3.1 M | **The unit of scale is the instance, not the table.** A tenant outgrowing 3 M rows needs a second instance and a routing key, not a bigger box. |
+| Rows per database | 4 194 304 slots, comfortable to ~3.1 M | **A database *is* a table** - one file, one table, no catalogue. So the unit of scale is the instance, and a tenant outgrowing 3 M rows needs a second instance and a routing key, not a bigger box. |
 | Row shape | 256 bytes, seven fixed columns | No per-tenant schema. The product sells a **typed key/value/tag/text row**, and anything richer is encoded by the client. |
 | `tag` | 39 bytes | Usable as a namespace/partition marker; too small for arbitrary metadata. |
 | `content` | 175 bytes | **The single biggest product constraint.** Documents, embeddings and blobs do not fit; they live elsewhere and the row holds a reference. |
@@ -42,15 +42,20 @@ configured, and they are what a tenant actually buys.
 | Concurrency | one writer, unlimited `--reader` | A natural read-replica story with no work; a **write-scaling story that does not exist yet** (MVCC is roadmap). |
 | Absent from the engine | no SQL, no joins, no planner, no secondary indexes, no auth, no encryption, no audit log | Every one of these is the service layer's job, or is not sold. |
 
-Three consequences worth stating plainly before designing anything:
+Four consequences worth stating plainly before designing anything:
 
 1. **`FIND` and `RANGE` are full scans** of 4 194 304 slots. They are fine at
    human scale and unacceptable as a public API on a hot path. The service must
    either bound them, cache them, or maintain its own index outside the engine.
-2. **The change log has no retention policy.** `<db>.cdc` grows for the life of
-   the instance and is re-read in full at every start. Retention is a service
-   responsibility today and an engine feature on the roadmap.
-3. **Security is entirely the service layer's.** The engine has no notion of a
+2. **The change log's retention is manual.** `<db>.cdc` grows for the life of
+   the instance unless something calls `CDCTRIM`, and it is re-read in full at
+   every start. Deciding *when* to trim needs to know what consumers have
+   acknowledged, which only the control plane knows — so it owns the policy.
+3. **No transaction spans two entities.** Since a database is a single table,
+   `BEGIN`/`COMMIT` is atomic over one table only. A tenant with users *and*
+   orders has two instances, and keeping them consistent is a saga or a
+   coordinator in the control plane — a decision to take early, not after.
+4. **Security is entirely the service layer's.** The engine has no notion of a
    user. See [`SECURITY.md`](../SECURITY.md) for the engine's actual threat
    model — it is short, and that is the point.
 

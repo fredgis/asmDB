@@ -84,7 +84,7 @@ see different states, but neither will ever see half of one.
 | [`RANGE <lo> <hi>`](#range) | list rows whose `value` is in `[lo, hi]` |
 | [`COUNT`](#count) | number of live rows |
 | [`BEGIN`](#begin) · [`COMMIT`](#commit) · [`ROLLBACK`](#rollback) | transaction control |
-| [`TABLES`](#tables) | the table held in this database |
+| [`TABLES`](#tables) | the one table this file holds (a database *is* a table) |
 | [`DATABASES`](#databases) | list `*.dat` databases in the current folder |
 | [`SCHEMA`](#schema) | show the fixed record layout |
 | [`TYPES`](#types) | supported logical column types |
