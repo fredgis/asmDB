@@ -7,7 +7,7 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). ~21 KB. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). ~22 KB. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -17,7 +17,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-~21%20KB%20PE%20%2F%20~30%20KB%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-~22%20KB%20PE%20%2F%20~31%20KB%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -137,8 +137,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~21 KB</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~30 KB</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~22 KB</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~31 KB</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -311,7 +311,7 @@ flowchart LR
 
 ### The deep dive
 
-How ~21 KB of assembly becomes a durable database.
+How ~22 KB of assembly becomes a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -324,7 +324,7 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is `VirtualAlloc`'d / `mmap`'d at runtime, which is why the
-binaries stay ~21 KB (PE) / ~30 KB (ELF) on disk.
+binaries stay ~22 KB (PE) / ~31 KB (ELF) on disk.
 
 #### The record store — four cache lines per row
 
