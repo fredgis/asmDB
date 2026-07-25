@@ -119,15 +119,20 @@ os_read:
 
 ; ------------------------------- file I/O -----------------------------------
 
-; os_open(rcx = name) -> rax = handle, or -1 (sets g_open_locked on share denial)
-;   opens read/write, creating if absent, with no sharing (single writer)
+; os_open(rcx = name) -> rax = handle, or -1 (sets g_open_locked on lock denial)
+;   Opens read/write, creating if absent, and lets other processes READ the file
+;   while we hold it. Single-writer exclusion is enforced by an exclusive lock on
+;   a sentinel byte far past the data region, not by denying the share: denying
+;   it also blocked readers, which is the whole point of reader mode. The
+;   sentinel is outside anything either side ever reads or writes, so it costs
+;   nothing and conflicts only with another writer.
 os_open:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x50
+    sub  rsp, 0x60
     mov  [rbp-8], rbx
     mov  rdx, GENERIC_READ | GENERIC_WRITE
-    xor  r8, r8                      ; exclusive - no sharing
+    mov  r8d, 1                      ; FILE_SHARE_READ
     xor  r9, r9
     mov  dword [rsp+0x20], OPEN_ALWAYS
     mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
@@ -136,6 +141,32 @@ os_open:
     mov  rbx, rax
     cmp  rax, INVALID_HANDLE
     je   .fail
+    ; LockFileEx(handle, EXCLUSIVE|FAIL_IMMEDIATELY, 0, 1, 0, &overlapped)
+    ; OVERLAPPED: Internal +0, InternalHigh +8, Offset +16, OffsetHigh +20,
+    ; hEvent +24. Putting the offset anywhere else locks byte 0 instead, which
+    ; would make every read of the header fail with a lock violation.
+    mov  rcx, rbx
+    mov  edx, LOCKFILE_EXCLUSIVE | LOCKFILE_FAIL_IMMEDIATELY
+    xor  r8d, r8d                    ; reserved
+    mov  r9d, 1                      ; nNumberOfBytesToLockLow
+    mov  qword [rel g_lockovl], 0
+    mov  qword [rel g_lockovl+8], 0
+    mov  r10, WRITER_LOCK_OFFSET     ; via a register: a 64-bit immediate does
+    mov  [rel g_lockovl+16], r10     ; not fit in "mov qword [mem], imm"
+    mov  qword [rel g_lockovl+24], 0
+    lea  rax, [rel g_lockovl]
+    mov  dword [rsp+0x20], 0         ; nNumberOfBytesToLockHigh
+    mov  [rsp+0x28], rax             ; lpOverlapped
+    call [rel iat_LockFileEx]
+    test eax, eax
+    jz   .locked
+    mov  rax, rbx
+    jmp  .ret
+.locked:
+    mov  rcx, rbx
+    call [rel iat_CloseHandle]
+    mov  qword [rel g_open_locked], 1
+    mov  rbx, -1
 .ret:
     mov  rax, rbx
     mov  rbx, [rbp-8]
@@ -149,6 +180,45 @@ os_open:
     jne  .ret
     mov  qword [rel g_open_locked], 1
     jmp  .ret
+
+; os_map_read(rcx = handle, rdx = size) -> rax = base address, or 0.
+; A shared read-only view: readers observe the writer's committed pages through
+; the page cache instead of copying a gigabyte at startup.
+os_map_read:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50
+    mov  [rbp-8], rbx
+    mov  rbx, rdx                    ; size
+    xor  edx, edx                    ; lpAttributes
+    mov  r8d, PAGE_READONLY
+    mov  r9, rbx
+    shr  r9, 32                      ; dwMaximumSizeHigh
+    mov  eax, ebx
+    mov  [rsp+0x20], eax             ; dwMaximumSizeLow
+    mov  qword [rsp+0x28], 0         ; lpName
+    call [rel iat_CreateFileMappingA]
+    test rax, rax
+    jz   .fail
+    mov  [rbp-16], rax               ; mapping handle
+    mov  rcx, rax
+    mov  edx, FILE_MAP_READ
+    xor  r8d, r8d                    ; offset high
+    xor  r9d, r9d                    ; offset low
+    mov  qword [rsp+0x20], 0         ; whole file
+    call [rel iat_MapViewOfFile]
+    mov  [rbp-24], rax
+    mov  rcx, [rbp-16]
+    call [rel iat_CloseHandle]       ; the view keeps the mapping alive
+    mov  rax, [rbp-24]
+    jmp  .done
+.fail:
+    xor  eax, eax
+.done:
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
 
 ; os_open_shared(rcx = name) -> rax = handle, or -1
 ;   Like os_open, but lets other processes READ the file while we hold it open
@@ -290,13 +360,17 @@ os_exists:
     pop  rbp
     ret
 
-; os_open_read(rcx = name) -> rax = handle, or -1  (open existing, read/shared)
+; os_open_read(rcx = name) -> rax = handle, or -1  (open existing, read-only)
+;   Shares both read AND write: a reader has to be able to open a file the
+;   single writer is holding. Windows requires each opener's share mode to
+;   permit the access the other already has, so FILE_SHARE_READ alone would
+;   make every reader fail while a writer is running.
 os_open_read:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x50
     mov  rdx, GENERIC_READ
-    mov  r8d, 1                      ; FILE_SHARE_READ
+    mov  r8d, 3                      ; FILE_SHARE_READ | FILE_SHARE_WRITE
     xor  r9, r9
     mov  dword [rsp+0x20], OPEN_EXISTING
     mov  dword [rsp+0x28], FILE_ATTRIBUTE_NORMAL
@@ -617,6 +691,8 @@ g_dir_handle:  dq 0
 g_dir_first:   dq 0
 g_bhfi:        times 52 db 0        ; BY_HANDLE_FILE_INFORMATION
                 align 8
+g_lockovl:     times 32 db 0        ; OVERLAPPED for the writer lock
+                align 8
 
 ; ============================== import table ================================
                 align 4
@@ -659,6 +735,7 @@ iat_GetFileInformationByHandle: dq RVA(h_GetFileInformationByHandle)
 iat_MoveFileExA:       dq RVA(h_MoveFileExA)
 iat_DeleteFileA:       dq RVA(h_DeleteFileA)
 iat_GetFileAttributesA: dq RVA(h_GetFileAttributesA)
+iat_LockFileEx:        dq RVA(h_LockFileEx)
                        dq 0
 
 dll_name: db 'kernel32.dll', 0
@@ -747,3 +824,6 @@ h_DeleteFileA:       dw 0
                 align 2
 h_GetFileAttributesA: dw 0
     db 'GetFileAttributesA', 0
+                align 2
+h_LockFileEx:        dw 0
+    db 'LockFileEx', 0

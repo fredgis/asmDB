@@ -734,8 +734,44 @@ allowed).
 - `INSERT`/`UPDATE` enforce the `id ≥ 1` **CHECK** constraint (id `0` is
   reserved); duplicate keys are rejected on `INSERT`.
 - `BACKUP`/`RESTORE` are refused while a transaction is open — `COMMIT` or
-  `ROLLBACK` first. A second engine process opening a database already held by
-  another is refused (exclusive **single-writer** lock).
+  `ROLLBACK` first. A second engine process opening a database another process
+  already holds **for writing** is refused (single-writer lock).
+- `FORMAT TSV` switches the listing commands to one untruncated `R`-prefixed
+  line per row; `PAGE <limit> <offset>` bounds them. That is the interface
+  machines are expected to use — the bordered table is for humans.
+- `VERIFY` re-reads every slot and checks the store's own invariants.
+
+### 9.1 Concurrency model
+
+One writer, any number of readers.
+
+| | Writer (`asmdb <db>`) | Reader (`asmdb <db> --reader`) |
+|---|---|---|
+| `.dat` | read/write, shared for reading | read-only |
+| exclusion | exclusive lock: `LockFileEx` on one sentinel byte far past the data region (Windows), `flock(LOCK_EX\|LOCK_NB)` (Linux) | none |
+| mapping | private copy-on-write | shared read-only |
+| `.wal` / `.cdc` | opened, recovered, written | never touched |
+| creates files | yes | never |
+| mutating commands | yes | refused by whitelist |
+
+Windows previously obtained single-writer exclusion by opening the file with no
+sharing at all, which is precisely what made a second process — even a purely
+reading one — impossible. Exclusion is now a byte-range lock on a byte nothing
+ever reads or writes, so it conflicts only with another writer.
+
+**Reader isolation.** The commit path writes the slots first and the header —
+which carries `last_commit_seq` — only afterwards. A reader therefore reads that
+sequence, runs its command, and reads it again. Unchanged means no commit landed
+in between, so every row it saw belongs to the same committed state. Changed
+means the command is replayed against the newer state, which is why reader
+output is buffered instead of streamed: a replay must not print anything twice.
+A result too large for the buffer can no longer be replayed silently and is
+reported as mixed rather than presented as a snapshot.
+
+The guarantee is per **command**, not per session: a reader never observes a
+half-applied transaction, but two consecutive `SELECT`s may legitimately see two
+different committed states. Holding one snapshot across a whole session, and
+letting more than one writer commit at a time, both require MVCC — roadmap.
 
 ---
 
@@ -846,7 +882,7 @@ recall. This is one workload the record shape suits — not the only one.
 | 13 | Fatal-I/O and out-of-memory guards (open failure aborts cleanly) | ✅ done |
 | 14 | `RANGE` value access path; `id ≥ 1` CHECK constraint | ✅ done |
 | 15 | `BACKUP`/`RESTORE` snapshot commands | ✅ done |
-| 16 | Exclusive single-writer lock (concurrent open refused) | ✅ done |
+| 16 | Single-writer lock + unlimited concurrent snapshot readers | ✅ done |
 | 17 | 1 GiB capacity (`2^22` slots) on **sparse** `.dat`; 2M-row benchmark vs SQLite | ✅ done |
 | 18 | **Linux ELF64 port**: hand-built ELF header + raw-`syscall` backend behind the `os_*` layer; `TRUNCATE` command; CI runs the ELF natively on Ubuntu | ✅ done |
 
@@ -909,7 +945,7 @@ The theme is "more cores, more machines, more OSes — still assembly."
 |------|--------------|------------------|
 | **Partitioning** | shard slots into `<db>.partN.dat` by key hash; prune irrelevant partitions | all CRUD at scale |
 | **Parallel scans** | one worker thread per partition (`CreateThread`), fan-in results | analytical Read, bulk ops |
-| **MVCC + snapshot isolation** | versioned rows so readers never block writers; a lock-free ring for versions | concurrent workloads |
+| **MVCC (multi-writer)** | versioned rows so several writers can commit concurrently; a lock-free ring for versions | write-heavy workloads |
 | **Overlapped / async I/O** | Windows IOCP for checkpoint writes off the commit path | durable throughput |
 | **macOS port** | extend the `os_*` layer with a BSD `syscall`/`svc` backend and a Mach-O emitter (the **Linux ELF64 port is already shipped** — see Delivered #18) | portability |
 | **Binary wire protocol** | a length-prefixed request/response codec in assembly, replacing line parsing — the substrate the [SaaS](SAAS.md) data plane speaks | networked access |
@@ -934,10 +970,10 @@ the hosted [SaaS layer](SAAS.md) rather than the single-node engine.
 |--:|-----------|:------:|-------------|
 | 1 | **Atomicity** | ✅ | `BEGIN`/`COMMIT`/`ROLLBACK` + undo log (§7) |
 | 2 | **Consistency** | ✅ | unique primary key, fixed-width typed columns (§4, §10), and `CHECK`-style domain validation (`id ≥ 1` reserved-key rule + bounded field lengths) enforced at write |
-| 3 | **Isolation** | ✅ | serial (serializable) execution — a single writer holds the DB exclusively, so no dirty / non-repeatable / phantom reads are possible; MVCC for concurrent readers is a throughput optimization on the roadmap |
+| 3 | **Isolation** | ✅ | serializable for writes (one writer at a time). Readers get snapshot isolation *per command* through the commit-sequence fence: no dirty and no phantom reads, but two consecutive reads may observe different committed states. Multi-writer MVCC → roadmap |
 | 4 | **Durability** | ✅ | WAL + `FlushFileBuffers` (§6, §7); every durable write and flush is checked, and a failure aborts instead of acknowledging (§7.5) |
 | 5 | **Crash recovery** | ✅ | idempotent WAL redo with commit marker **and CRC-32 per frame** (§6.2, §7.3); open-time header validation refuses a truncated/foreign/incompatible `.dat` instead of silently recreating it (§6.1) |
-| 6 | **Concurrency control** | ✅ | exclusive database lock (single-writer): a second engine opening the same file is refused with a clear "locked" message; group commit / finer-grained locking → roadmap |
+| 6 | **Concurrency control** | ✅ | one writer (`LockFileEx` byte range on Windows, `flock` on Linux): a second writer is refused with a clear "locked" message. Unlimited concurrent `--reader` sessions, which take no lock at all; group commit / finer-grained locking → roadmap |
 | 7 | **Indexing & access paths** | ✅ | O(1) primary hash index (§5) plus full-scan (`SELECT *`), substring (`FIND`) and value-range (`RANGE`) access paths; index-accelerated secondary columns → v1.5 |
 | 8 | **Query & access interface** | ✅ | REPL grammar (§9), MCP CRUD tools (§11), Python/C#/C clients |
 | 9 | **Backup & restore / PITR** | ✅ | in-engine `BACKUP`/`RESTORE` snapshot commands (§9), with the snapshot fully validated before any live data is overwritten (§7.5); WAL shipping + point-in-time recovery → [SaaS layer](SAAS.md) |

@@ -553,5 +553,71 @@ printf '\x09' | dd of=saf.dat bs=1 seek=520 count=1 conv=notrunc status=none
 r17="$(printf '%s\n' 'VERIFY' 'EXIT' | ./asmdb saf 2>&1)"
 check 'VERIFY reports a damaged file' 'verify: [0-9]+ problem\(s\) found' "$r17"
 
+# ---------------------------------------------------------------------------
+# Run 18: one writer, many readers
+# ---------------------------------------------------------------------------
+printf '%s\n' 'INSERT 1 10 a one' 'INSERT 2 20 b two' 'EXIT' | ./asmdb conc > /dev/null
+# A long-lived writer is driven through a FIFO: file descriptor 9 stays open, so
+# the writer keeps waiting for commands until we close it.
+if ! mkfifo wpipe 2>/dev/null; then
+    echo "  [SKIP] concurrency checks (no FIFO support here)"
+else
+./asmdb conc < wpipe > writer.log 2>&1 &
+wpid=$!
+exec 9> wpipe
+sleep 1
+if ! kill -0 "$wpid" 2>/dev/null; then
+    echo "  [SKIP] concurrency checks (writer did not stay up)"
+    exec 9>&-
+    rm -f wpipe
+else
+
+ro="$(printf '%s\n' 'COUNT' 'FORMAT TSV' 'SELECT *' 'VERIFY' \
+    'INSERT 3 30 c three' 'DELETE 1' 'TRUNCATE' 'BACKUP x.bak' 'BEGIN' 'EXIT' \
+    | ./asmdb conc --reader 2>&1)"
+w2="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb conc 2>&1)"
+
+check 'reader opens a database a writer holds' '\[ OK \] 2 row\(s\)'   "$ro"
+check 'reader sees the rows'                   'R.2.20.[0-9]+.[0-9]+.b.two' "$ro"
+check 'reader can VERIFY'                      'verify: 2 row\(s\) checked' "$ro"
+n_ro=$(grep -c 'read-only session' <<< "$ro" || true)
+if [[ "$n_ro" -eq 5 ]]; then
+    echo "  [PASS] reader refuses every mutation"
+else
+    echo "  [FAIL] reader refuses every mutation (got $n_ro)"; fail=$((fail+1))
+fi
+check 'a second WRITER is still refused' 'locked by another process' "$w2"
+
+echo 'INSERT 42 42 live added-while-readers-run' >&9
+sleep 1
+ro2="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb conc --reader 2>&1)"
+check 'reader observes a new commit' '\[ OK \] 3 row\(s\)' "$ro2"
+
+# three readers at once
+for i in 1 2 3; do
+    (printf '%s\n' 'COUNT' 'EXIT' | ./asmdb conc --reader > "par$i.out" 2>&1) &
+done
+wait
+n_par=$(cat par1.out par2.out par3.out | grep -c '\[ OK \] 3 row(s)' || true)
+if [[ "$n_par" -eq 3 ]]; then
+    echo "  [PASS] three readers at once all succeed"
+else
+    echo "  [FAIL] three readers at once all succeed (got $n_par)"; fail=$((fail+1))
+fi
+
+exec 9>&-              # closing the pipe ends the writer
+wait "$wpid" 2>/dev/null || true
+rm -f wpipe
+fi
+fi
+
+rg="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb ghost --reader 2>&1)"
+check 'reader refuses a missing database' 'a reader never creates one' "$rg"
+if [[ ! -e ghost.dat ]]; then
+    echo "  [PASS] reader never creates a database"
+else
+    echo "  [FAIL] reader never creates a database"; fail=$((fail+1))
+fi
+
 if [[ $fail -gt 0 ]]; then echo; echo "$fail check(s) failed."; exit 1; fi
 echo; echo "All checks passed."

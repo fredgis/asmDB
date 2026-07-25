@@ -49,6 +49,10 @@
 %define TSV_BUF_SIZE   (2 + 5*21 + 2*(TAG_MAX + CONTENT_MAX) + 4)
 %define PAGE_LIMIT_MAX 1000000    ; refuse absurd page sizes rather than wrap
 %define VERIFY_MAX_REPORT 16      ; per-slot problems printed before summarising
+; Reader mode: buffered output so a command can be replayed when a commit lands
+; underneath it, and a bound on how many times that is worth doing.
+%define CAP_BUF_SIZE   0x400000   ; 4 MiB
+%define SNAP_RETRIES   8
 
 ; ---- Dispatch results ----
 %define CMD_OK   0
@@ -76,6 +80,13 @@
 %define FILE_ATTRIBUTE_NORMAL 0x80
 %define FILE_BEGIN         0
 %define PAGE_WRITECOPY     0x08
+%define PAGE_READONLY      0x02
+%define FILE_MAP_READ      0x0004
+%define LOCKFILE_FAIL_IMMEDIATELY 0x1
+%define LOCKFILE_EXCLUSIVE        0x2
+; A byte nothing else ever touches: past the header + slot region, so an
+; exclusive lock on it excludes other writers without blocking any read.
+%define WRITER_LOCK_OFFSET 0x4000000000
 %define FILE_MAP_COPY      0x0001
 %define FSCTL_SET_SPARSE   0x000900C4
 %define ENABLE_VT          0x0004    ; ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -103,7 +114,7 @@
 ; HDR_ENGINE purely for diagnostics: it tells you which build touched a
 ; database, without ever affecting whether it can be opened.
 %define ENGINE_MAJOR 1
-%define ENGINE_MINOR 2
+%define ENGINE_MINOR 3
 %define ENGINE_PATCH 0
 %define ENGINE_VERSION ((ENGINE_MAJOR << 16) | (ENGINE_MINOR << 8) | ENGINE_PATCH)
 

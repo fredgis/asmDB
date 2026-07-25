@@ -37,6 +37,42 @@ putn:
     sub  rsp, 0x40
     mov  [rbp-8], rbx                ; buffer cursor
     mov  [rbp-16], rsi               ; bytes remaining
+    ; Reader mode buffers output so a command whose snapshot moved underneath it
+    ; can be replayed without printing anything twice.
+    cmp  qword [rel g_cap_on], 0
+    je   .direct
+    mov  rax, [rel g_cap_len]
+    add  rax, rdx
+    cmp  rax, CAP_BUF_SIZE
+    ja   .overflow
+    mov  [rbp-24], rdi
+    mov  [rbp-32], rax               ; new length
+    mov  rsi, rcx
+    mov  rdi, [rel g_capbuf]
+    add  rdi, [rel g_cap_len]
+    mov  rcx, rdx
+    rep  movsb
+    mov  rax, [rbp-32]
+    mov  [rel g_cap_len], rax
+    mov  rdi, [rbp-24]
+    jmp  .done
+.overflow:
+    ; Too much output to hold. Stop buffering, flush what we have, and remember
+    ; that this command can no longer be replayed silently.
+    mov  [rbp-24], rcx
+    mov  [rbp-32], rdx
+    mov  qword [rel g_cap_on], 0
+    mov  qword [rel g_cap_ovf], 1
+    mov  rcx, [rel g_capbuf]
+    mov  rdx, [rel g_cap_len]
+    mov  qword [rel g_cap_len], 0
+    test rdx, rdx
+    jz   .noflush
+    call putn                        ; capture is off now: this writes directly
+.noflush:
+    mov  rcx, [rbp-24]
+    mov  rdx, [rbp-32]
+.direct:
     mov  rbx, rcx
     mov  rsi, rdx
 .loop:
@@ -54,6 +90,36 @@ putn:
 .done:
     mov  rsi, [rbp-16]
     mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; cap_begin() - start buffering console output
+cap_begin:
+    mov  qword [rel g_cap_len], 0
+    mov  qword [rel g_cap_ovf], 0
+    mov  qword [rel g_cap_on], 1
+    ret
+
+; cap_discard() - throw the buffered output away (the command will be replayed)
+cap_discard:
+    mov  qword [rel g_cap_len], 0
+    mov  qword [rel g_cap_on], 0
+    ret
+
+; cap_flush() - emit the buffered output and leave capture mode
+cap_flush:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  qword [rel g_cap_on], 0
+    mov  rdx, [rel g_cap_len]
+    test rdx, rdx
+    jz   .out
+    mov  rcx, [rel g_capbuf]
+    mov  qword [rel g_cap_len], 0
+    call putn
+.out:
     mov  rsp, rbp
     pop  rbp
     ret

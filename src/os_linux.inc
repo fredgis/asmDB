@@ -51,6 +51,8 @@
 %define PROT_RW      0x3
 %define MAP_PRIV_ANON 0x22
 %define MAP_PRIVATE  0x02
+%define MAP_SHARED   0x01
+%define PROT_READ    0x1
 %define SEEK_END     2
 %define LOCK_EXNB    0x6              ; LOCK_EX (2) | LOCK_NB (4)
 %define TCGETS       0x5401
@@ -604,6 +606,33 @@ os_map_cow:
     mov  eax, SYS_mmap
     syscall
     cmp  rax, -4095                  ; -errno range -> failure
+    jb   .done
+    xor  rax, rax
+.done:
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_map_read(rcx = fd, rdx = size) -> rax = base address, or 0 on failure
+;   MAP_SHARED + PROT_READ: a reader observes the writer's committed pages
+;   through the same page cache instead of copying a gigabyte at startup.
+os_map_read:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
+    mov  r8, rcx                     ; fd
+    mov  rsi, rdx                    ; length
+    xor  rdi, rdi                    ; addr = NULL
+    mov  rdx, PROT_READ
+    mov  r10, MAP_SHARED
+    xor  r9, r9                      ; offset 0
+    mov  eax, SYS_mmap
+    syscall
+    cmp  rax, -4095
     jb   .done
     xor  rax, rax
 .done:

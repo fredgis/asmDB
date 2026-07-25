@@ -19,6 +19,11 @@ g_in_txn:      dq 0
 g_auto_txn:    dq 0                  ; 1 = the open transaction is implicit
 g_writer_ver:  dq 0                  ; engine version that last wrote the open db
 g_upgrade:     dq 0                  ; 1 = --upgrade was passed on the command line
+g_readonly:    dq 0                  ; 1 = --reader: no lock, no writes, snapshot reads
+g_capbuf:      dq 0                  ; reader output buffer (replay without echoing twice)
+g_cap_on:      dq 0
+g_cap_len:     dq 0
+g_cap_ovf:     dq 0
 ; ---- change data capture ----
 g_cdc_handle:  dq 0
 g_cdcname:     times 224 db 0
@@ -166,6 +171,11 @@ s_err_bak_self: db '[ERR] that path IS one of the live database files - refused'
 s_err_bak_rename: db '[ERR] backup written but could not be moved into place', 13, 10, 0
 s_upg_nospace: db '[ERR] upgrade: no free slot for a source row - migration refused', 13, 10, 0
 s_upg_lost:   db '[ERR] upgrade: migrated row count does not match the source: ', 0
+s_err_readonly: db '[ERR] read-only session (--reader) - this command would modify the database', 13, 10, 0
+s_err_ro_open: db '[ERR] cannot open the database for reading', 13, 10, 0
+s_err_ro_nofile: db '[ERR] no such database - a reader never creates one', 13, 10, 0
+s_snap_moved: db '[ERR] the database changed while this result was being written - it mixes two states, run it again', 13, 10, 0
+s_snap_busy:  db '[ERR] the database is changing too fast to read consistently - try again', 13, 10, 0
 s_ok_backup:   db '[ OK ] backup written', 13, 10, 0
 s_ok_restore:  db '[ OK ] database restored from backup', 13, 10, 0
 s_err_bak_open: db '[ERR] cannot open backup file', 13, 10, 0
@@ -205,6 +215,7 @@ s_ver_older:    db '  written by     : an engine older than 0.9 (no stamp)', 13,
 s_verdot:       db '.', 0
 s_bnr_ver:      db '  .  v', 0
 s_flag_upgrade: db '--upgrade', 0
+s_flag_reader: db '--reader', 0
 s_upg_suffix:   db '.upgraded.dat', 0
 s_upg_head:     db '  asmdb upgrade', 13, 10, 0
 s_upg_src:      db '  source   : ', 0

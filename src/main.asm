@@ -132,6 +132,8 @@ entry:
     call db_init_names
     cmp  qword [rel g_upgrade], 0
     jne  .upgrade
+    cmp  qword [rel g_readonly], 0
+    jne  .reader
     call db_open
 
     call print_banner
@@ -139,6 +141,19 @@ entry:
     call repl_loop
 
     call db_close
+    xor  ecx, ecx
+    call os_exit
+.reader:
+    ; Readers allocate the capture buffer that lets a command be replayed when
+    ; a commit lands underneath it; a writer never needs it.
+    mov  ecx, CAP_BUF_SIZE
+    call valloc_req
+    mov  [rel g_capbuf], rax
+    call db_open_reader
+    call print_banner
+    call repl_loop
+    mov  rcx, [rel g_dat_handle]
+    call os_close
     xor  ecx, ecx
     call os_exit
 .upgrade:
@@ -150,7 +165,7 @@ entry:
 repl_loop:
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x30
+    sub  rsp, 0x40
 .loop:
     lea  rcx, [rel s_prompt]
     lea  rdx, [rel c_prompt]
@@ -162,6 +177,8 @@ repl_loop:
     je   .quit
     cmp  rax, -2
     je   .toolong
+    cmp  qword [rel g_readonly], 0
+    jne  .snapshot
     mov  rcx, [rel g_linebuf]
     call dispatch
     cmp  rax, CMD_EXIT
@@ -169,6 +186,45 @@ repl_loop:
     jmp  .loop
 .toolong:
     lea  rcx, [rel s_err_toolong]
+    call puts
+    jmp  .loop
+.snapshot:
+    ; Run the command between two reads of the commit sequence. Equal sequences
+    ; mean no commit landed while it ran, so the rows it saw all belong to the
+    ; same committed state. Otherwise replay it against the newer one.
+    mov  qword [rbp-32], 0           ; attempts
+.retry:
+    call snap_refresh
+    mov  [rbp-24], rax               ; sequence before
+    call cap_begin
+    mov  rcx, [rel g_linebuf]
+    call dispatch
+    mov  [rbp-40], rax               ; dispatch result
+    call snap_refresh
+    cmp  rax, [rbp-24]
+    je   .stable
+    cmp  qword [rel g_cap_ovf], 0
+    jne  .partial                    ; already printed - cannot replay
+    inc  qword [rbp-32]
+    mov  rax, [rbp-32]
+    cmp  rax, SNAP_RETRIES
+    jae  .busy
+    call cap_discard
+    jmp  .retry
+.stable:
+    call cap_flush
+    mov  rax, [rbp-40]
+    cmp  rax, CMD_EXIT
+    je   .quit
+    jmp  .loop
+.partial:
+    call cap_flush
+    lea  rcx, [rel s_snap_moved]
+    call puts
+    jmp  .loop
+.busy:
+    call cap_discard
+    lea  rcx, [rel s_snap_busy]
     call puts
     jmp  .loop
 .quit:

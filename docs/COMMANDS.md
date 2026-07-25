@@ -26,7 +26,6 @@ here instead of inlining the list.
 ---
 
 ## Conventions
-
 | Placeholder | Meaning |
 |---|---|
 | `<id>` | primary key, an unsigned integer **≥ 1** and **< 2⁶⁴** (id `0` is reserved; a literal too large to fit is rejected as a syntax error, never wrapped) |
@@ -46,6 +45,28 @@ Rules that apply everywhere:
   is skipped, so piping from any shell/editor is safe.
 - Colors are emitted only when `stdin` **and** `stdout` are both a terminal; when
   either is redirected (a pipe, a file, CI) the output is plain ASCII.
+- Numbers must end on a token boundary: `DELETE 42junk` is a syntax error, not a
+  deletion of row 42. An input line longer than 511 bytes is refused rather than
+  truncated and executed.
+
+### Sessions
+
+```
+asmdb <db>            # the writer: one at a time
+asmdb <db> --reader   # a reader: any number, alongside the writer
+asmdb <db> --upgrade  # migrate a database written in an older storage format
+```
+
+A `--reader` session takes no lock and creates nothing. It refuses every command
+that would modify the database — `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+`BEGIN`/`COMMIT`/`ROLLBACK`, `BACKUP`, `RESTORE`, `BENCH` — with
+`[ERR] read-only session (--reader) …`.
+
+Each reader command is executed between two reads of the database's commit
+sequence. If a commit lands while the command runs, the command is replayed
+against the newer state, so a reader never reports a mixture of two
+transactions. Isolation is therefore per command: two consecutive `SELECT`s may
+see different states, but neither will ever see half of one.
 
 ---
 

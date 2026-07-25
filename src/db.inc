@@ -244,23 +244,24 @@ db_write_slot:
 ; through the same WAL commit as explicit transactions - see auto_begin /
 ; auto_commit / txn_flush in wal.inc.
 
-; scan_upgrade(rsi = command line) - set g_upgrade if "--upgrade" appears
-scan_upgrade:
+; scan_flag(rsi = command line, rdi = flag text) -> rax = 1 if it appears
+scan_flag:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
     mov  [rbp-8], rbx
     mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
     mov  rbx, rsi
 .outer:
     cmp  byte [rbx], 0
-    je   .done
-    lea  rsi, [rel s_flag_upgrade]
+    je   .no
+    mov  rsi, [rbp-24]
     mov  rcx, rbx
 .inner:
     mov  dl, [rsi]
     test dl, dl
-    jz   .found
+    jz   .yes
     mov  al, [rcx]
     cmp  al, dl
     jne  .next
@@ -270,11 +271,33 @@ scan_upgrade:
 .next:
     inc  rbx
     jmp  .outer
-.found:
-    mov  qword [rel g_upgrade], 1
+.yes:
+    mov  eax, 1
+    jmp  .done
+.no:
+    xor  eax, eax
 .done:
+    mov  rdi, [rbp-24]
     mov  rsi, [rbp-16]
     mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; scan_options(rsi = command line) - set the flag globals
+scan_options:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rsi
+    lea  rdi, [rel s_flag_upgrade]
+    call scan_flag
+    mov  [rel g_upgrade], rax
+    mov  rsi, [rbp-8]
+    lea  rdi, [rel s_flag_reader]
+    call scan_flag
+    mov  [rel g_readonly], rax
+    mov  rsi, [rbp-8]
     mov  rsp, rbp
     pop  rbp
     ret
@@ -288,7 +311,7 @@ db_init_names:
     mov  [rbp-24], rdi
     call os_cmdline
     mov  rsi, rax
-    call scan_upgrade                ; sets g_upgrade if --upgrade is present
+    call scan_options                ; --upgrade / --reader
     ; skip program name (handle quoted path)
     mov  al, [rsi]
     cmp  al, '"'
@@ -959,6 +982,127 @@ db_upgrade:
     mov  rsp, rbp
     pop  rbp
     ret
+
+; ---------------------------------------------------------------------------
+; Reader mode
+;
+; Any number of readers can run beside the single writer. A reader takes no
+; lock, creates nothing, and never touches the write-ahead log or the change
+; log: it observes the durable table, never a transaction in flight.
+;
+; Isolation comes from the commit sequence rather than from locking. The commit
+; path writes the slots first and the header - carrying last_commit_seq - only
+; afterwards. So if a reader reads the sequence, runs its command, and reads the
+; sequence again unchanged, no commit landed in between and what it saw is
+; exactly the state at that sequence. If it did change, the command is simply
+; replayed against the newer snapshot. That is why reader output is buffered:
+; a retry must not print anything twice.
+; ---------------------------------------------------------------------------
+
+; snap_refresh() -> rax = last_commit_seq, adopting the header's row count.
+; The header is re-read from the file rather than from the mapping so a reader
+; never bases its fence on a page it may already be holding.
+snap_refresh:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    xor  rcx, rcx
+    lea  rdx, [rel g_hdr_read]
+    mov  r8, HDR_SIZE
+    call read_at
+    cmp  rax, HDR_SIZE
+    jne  io_fatal_read
+    mov  rax, [rel g_hdr_read+24]
+    mov  [rel g_count], rax
+    mov  rax, [rel g_hdr_read+HDR_SEQ]
+    mov  [rel g_seq], rax
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; db_open_reader() - open <db>.dat read-only and map it shared.
+db_open_reader:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    lea  rcx, [rel g_datname]
+    call os_exists
+    test rax, rax
+    jz   .nofile
+    lea  rcx, [rel g_datname]
+    call os_open_read
+    cmp  rax, INVALID_HANDLE
+    je   .noopen
+    mov  [rel g_dat_handle], rax
+    xor  rcx, rcx
+    lea  rdx, [rel g_hdr_read]
+    mov  r8, HDR_SIZE
+    call read_at
+    cmp  rax, HDR_SIZE
+    jne  .corrupt
+    mov  rax, [rel g_hdr]            ; magic from the header template
+    cmp  rax, [rel g_hdr_read]
+    jne  .corrupt
+    cmp  dword [rel g_hdr_read+8], DB_VERSION
+    jne  .badver
+    cmp  dword [rel g_hdr_read+12], REC_SIZE
+    jne  .badver
+    mov  rax, CAPACITY
+    cmp  [rel g_hdr_read+16], rax
+    jne  .badver
+    lea  rsi, [rel g_hdr_read+HDR_TABLE]
+    lea  rdi, [rel g_tablename]
+    mov  rcx, TABLE_MAX
+    call strcpy_n
+    mov  eax, [rel g_hdr_read+HDR_ENGINE]
+    mov  [rel g_writer_ver], rax
+    mov  rcx, [rel g_dat_handle]
+    call os_filesize
+    test rax, rax
+    js   io_fatal_read
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    cmp  rax, rdx
+    jb   .corrupt
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    call os_map_read
+    test rax, rax
+    jz   .mapfail
+    add  rax, HDR_SIZE
+    mov  [rel g_table], rax
+    call snap_refresh
+    mov  rsp, rbp
+    pop  rbp
+    ret
+.noopen:
+    lea  rcx, [rel s_err_ro_open]
+    call puts
+    mov  ecx, 1
+    call os_exit
+.nofile:
+    lea  rcx, [rel s_err_ro_nofile]
+    call puts
+    mov  ecx, 1
+    call os_exit
+.badver:
+    lea  rcx, [rel s_fmt_hint]
+    call puts
+    mov  ecx, 1
+    call os_exit
+.corrupt:
+    lea  rcx, [rel s_err_corrupt]
+    call puts
+    lea  rcx, [rel g_datname]
+    call puts
+    lea  rcx, [rel s_nl]
+    call puts
+    mov  ecx, 1
+    call os_exit
+.mapfail:
+    lea  rcx, [rel s_err_map]
+    call puts
+    mov  ecx, 1
+    call os_exit
 
 ; db_close()
 db_close:

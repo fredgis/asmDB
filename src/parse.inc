@@ -2231,6 +2231,85 @@ streq:
 ; cmd_begin / cmd_commit / cmd_rollback live in wal.inc (real transactions).
 
 ; dispatch(rcx = line ptr) -> rax = CMD_OK / CMD_EXIT
+; ro_allowed(rsi = line) -> rax = 1 when the command does not modify anything.
+;
+; A whitelist, not a blacklist: a command added later is refused by a reader
+; until someone has decided it is safe, which is the right default.
+ro_allowed:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-16], rdi
+    lea  rdi, [rel kw_select]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_find]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_range]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_count]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_verify]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_format]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_page]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_tables]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_databases]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_schema]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_types]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_version]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_help]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_exit]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    lea  rdi, [rel kw_quit]
+    call token_eq
+    test rax, rax
+    jnz  .yes
+    xor  eax, eax
+    jmp  .out
+.yes:
+    mov  eax, 1
+.out:
+    mov  rdi, [rbp-16]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 dispatch:
     push rbp
     mov  rbp, rsp
@@ -2241,6 +2320,15 @@ dispatch:
     mov  al, [rsi]
     test al, al
     je   .ok0
+    cmp  qword [rel g_readonly], 0
+    je   .rw
+    call ro_allowed
+    test rax, rax
+    jnz  .rw
+    lea  rcx, [rel s_err_readonly]
+    call puts
+    jmp  .ok0
+.rw:
     lea  rdi, [rel kw_help]
     call token_eq
     test rax, rax

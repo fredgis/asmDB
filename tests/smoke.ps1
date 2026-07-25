@@ -590,6 +590,60 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
     $r17 = (@('VERIFY', 'EXIT') -join "`n") | .\asmdb.exe saf
     $r17 = $r17 -join "`n"
     Check 'VERIFY reports a damaged file' ($r17 -match 'verify: \d+ problem\(s\) found')
+
+    # ---------------------------------------------------------------------
+    # Run 18: one writer, many readers
+    # ---------------------------------------------------------------------
+    (@('INSERT 1 10 a one', 'INSERT 2 20 b two', 'EXIT') -join "`n") | .\asmdb.exe conc | Out-Null
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = (Join-Path $work 'asmdb.exe')
+    $psi.Arguments = 'conc'
+    $psi.WorkingDirectory = $work
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false
+    $writer = [Diagnostics.Process]::Start($psi)
+    Start-Sleep -Milliseconds 1500
+    try {
+        $ro = (@('COUNT', 'FORMAT TSV', 'SELECT *', 'VERIFY',
+                 'INSERT 3 30 c three', 'DELETE 1', 'TRUNCATE', 'BACKUP x.bak',
+                 'BEGIN', 'EXIT') -join "`n") | .\asmdb.exe conc --reader
+        $ro = $ro -join "`n"
+        $w2 = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe conc
+        $w2 = $w2 -join "`n"
+
+        Check 'reader opens a database a writer holds' ($ro -match '\[ OK \] 2 row\(s\)')
+        Check 'reader sees the rows'          ($ro -match "R`t2`t20`t\d+`t\d+`tb`ttwo")
+        Check 'reader can VERIFY'             ($ro -match 'verify: 2 row\(s\) checked')
+        Check 'reader refuses every mutation' (([regex]::Matches($ro, 'read-only session')).Count -eq 5)
+        Check 'a second WRITER is still refused' ($w2 -match 'locked by another process')
+
+        # a commit by the writer becomes visible to a new reader command
+        $writer.StandardInput.WriteLine('INSERT 42 42 live added-while-readers-run')
+        $writer.StandardInput.Flush()
+        Start-Sleep -Milliseconds 800
+        $ro2 = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe conc --reader
+        $ro2 = $ro2 -join "`n"
+        Check 'reader observes a new commit'  ($ro2 -match '\[ OK \] 3 row\(s\)')
+
+        # several readers at once
+        $jobs = 1..3 | ForEach-Object {
+            Start-Job -ArgumentList $work -ScriptBlock {
+                param($w)
+                Set-Location $w
+                (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe conc --reader
+            }
+        }
+        $out = ($jobs | Wait-Job -Timeout 60 | Receive-Job) -join "`n"
+        $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+        Check 'three readers at once all succeed' (([regex]::Matches($out, '\[ OK \] 3 row\(s\)')).Count -eq 3)
+    }
+    finally {
+        if (-not $writer.HasExited) { $writer.Kill(); $writer.WaitForExit() }
+    }
+    Check 'reader never creates a database' (-not (Test-Path (Join-Path $work 'ghost.dat')))
+    $rg = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe ghost --reader 2>&1
+    Check 'reader refuses a missing database' (($rg -join "`n") -match 'a reader never creates one')
 }
 finally {
     Pop-Location

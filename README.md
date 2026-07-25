@@ -196,7 +196,8 @@ with `TRUNCATE`; "drop" is deleting the `.dat` file).
 Notes: `tag` is a single token, `content` is the rest of the line (spaces allowed);
 `INSERT`/`UPDATE` enforce an `id ≥ 1` **CHECK** (id `0` is reserved);
 `BACKUP`/`RESTORE` are refused inside a transaction; and opening a database that
-another engine already holds is refused (exclusive **single-writer** lock).
+another engine already holds **for writing** is refused (single-writer lock).
+Any number of `--reader` sessions can read it at the same time.
 
 ## Data model & supported types
 
@@ -589,7 +590,8 @@ path each technique accelerates, and where it sits on asmdb's roadmap.
 | Secondary & bitmap indexes | fast lookup on non-key columns | Reads with predicates | 🗺️ roadmap |
 | Partitioning + file split | prune irrelevant data, shrink the working set, parallel I/O | all CRUD at scale | 🗺️ roadmap |
 | SIMD + multi-threading | process many rows per instruction / per core | analytical Reads, bulk ops | 🗺️ roadmap |
-| MVCC | readers never block writers | concurrent workloads | 🗺️ roadmap |
+| Snapshot readers | readers never block the writer | concurrent workloads | ✅ `--reader` |
+| MVCC | many concurrent *writers* | write-heavy workloads | 🗺️ roadmap |
 
 **Columnar + compression.** A row store reads a whole 256-byte record even to sum
 one column. A *column* store keeps each column in its own contiguous run, so a
@@ -626,10 +628,10 @@ or the hosted [SaaS layer](docs/SAAS.md)).
 |--:|-----------|:-----------:|-------|
 | 1 | **Atomicity** — a transaction is all-or-nothing | ✅ | `BEGIN`/`COMMIT`/`ROLLBACK` + undo log (engine) |
 | 2 | **Consistency** — only valid states are committed | ✅ | unique primary key, fixed-width typed columns, and `CHECK`-style validation (`id ≥ 1` + bounded field lengths) enforced at write (engine) |
-| 3 | **Isolation** — concurrent txns don't interfere | ✅ | serializable: a single writer holds the DB exclusively, so no dirty/phantom reads are possible; multi-reader MVCC → roadmap |
+| 3 | **Isolation** — concurrent txns don't interfere | ✅ | serializable for writes (one writer at a time); readers get snapshot isolation at commit granularity via the commit-sequence fence — no dirty or phantom reads; concurrent *writers* (MVCC) → roadmap |
 | 4 | **Durability** — committed data survives a crash | ✅ | WAL + `FlushFileBuffers` (engine) |
 | 5 | **Crash recovery** — atomic redo / discard on restart | ✅ | idempotent WAL replay with commit marker (engine) |
-| 6 | **Concurrency control** — many clients, safely | ✅ | exclusive single-writer lock (a concurrent open is refused); group commit / MVCC → roadmap |
+| 6 | **Concurrency control** — many clients, safely | ✅ | one writer (byte-range / `flock` lock) plus unlimited concurrent `--reader` sessions; group commit and multi-writer MVCC → roadmap |
 | 7 | **Indexing & access paths** — no full scans | ✅ | O(1) primary hash index + `SELECT *`, `FIND` and value `RANGE` access paths; index-accelerated secondary columns → roadmap |
 | 8 | **Query & access interface** — a defined API | ✅ | REPL grammar + MCP CRUD tools + Python/C#/C clients |
 | 9 | **Backup & restore / PITR** — recover to a point in time | ✅ | in-engine `BACKUP`/`RESTORE` snapshots; WAL shipping + PITR → SaaS |
@@ -722,7 +724,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.2.0 · 1.1.0 · 1.0.0 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.3.0 · 1.2.0 · 1.1.0 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -741,6 +743,57 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+<summary><b>1.3.0</b> — concurrent readers</summary>
+
+Until now a database could be opened by exactly one process. Not one *writer* —
+one process. A second session was refused even if all it wanted to do was read a
+row, which made the engine unusable behind anything serving more than one
+caller, and it is the first thing that has to change before a hosted version
+makes any sense.
+
+**`asmdb <db> --reader` opens a read-only session.** It takes no lock, creates
+nothing, and never touches the write-ahead log or the change log. Any number of
+readers can run beside the single writer, and beside each other.
+
+**Isolation comes from the commit sequence, not from locking.** The commit path
+writes the slots first and the header — which carries `last_commit_seq` — only
+afterwards. So a reader reads that sequence, runs its command, and reads it
+again: if it did not move, no commit landed in between and every row it saw
+belongs to the same committed state. If it did move, the command is replayed
+against the newer one. That is why reader output is buffered rather than printed
+as it is produced — a replay must not print anything twice. A result larger than
+the 4 MiB buffer can no longer be replayed silently, so it is reported as mixed
+rather than passed off as a snapshot.
+
+The guarantee is therefore precise: **a reader never observes a half-applied
+transaction**, and never blocks the writer for an instant.
+
+**Writes are still excluded properly.** Windows used to get single-writer
+exclusion for free by opening the file with no sharing at all — which is exactly
+what blocked readers. Exclusion now comes from an exclusive `LockFileEx` on one
+sentinel byte far past the data region, so a second writer is still refused
+while readers are unaffected. Linux already used advisory `flock`, which readers
+simply do not take.
+
+Mutating commands in a reader session are refused by a **whitelist**, not a
+blacklist: a command added later is refused until someone decides it is safe.
+
+Two bugs found while building this. A 64-bit constant was being written with
+`mov qword [mem], imm`, which NASM narrows — the writer's lock landed on byte 0
+and made every read of the header fail with a lock violation. And the `OVERLAPPED`
+offset was being written to `InternalHigh` instead of `Offset`, with the same
+effect.
+
+Known limits, stated plainly: there is still exactly **one writer**. Readers do
+not see uncommitted data, but they also do not hold a snapshot across commands —
+each command is individually consistent. Multi-writer MVCC remains roadmap.
+
+Tests: 125 → 135 checks on Windows, 119 → 129 on Linux, including three
+simultaneous readers against a live writer.
+
+</details>
 
 <details>
 <summary><b>1.2.0</b> — machine protocol, integrity checks, and a full external audit</summary>
