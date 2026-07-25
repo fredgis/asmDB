@@ -87,8 +87,8 @@ Four consequences worth stating plainly before designing anything:
 
 **asmdb Cloud** is a hosted transactional database you pay for by the drop.
 You call an API to create a database; the service provisions a **dedicated
-micro-container running the assembly engine**, hands you an endpoint and an API
-key, and meters what you actually use — operations, stored bytes, and active
+micro-container running the assembly engine**, hands you an endpoint and an
+instance access token, and meters what you actually use — operations, stored bytes, and active
 compute time. Idle instances **scale to zero** and cost almost nothing.
 
 Why this can win:
@@ -175,59 +175,63 @@ the target.
 flowchart TB
     subgraph clients["clients"]
         REST[REST]
-        GRPC[gRPC]
         MCP[MCP]
+        CONSOLE["browser console"]
     end
-    subgraph cp["CONTROL PLANE &mdash; Rust/Go (NOT assembly)"]
-        GW["API gateway<br/>auth · rate limit · router"]
-        PROV["provisioner"]
-        USAGE["usage pipeline"]
-        GW --> PROV
-        GW --> USAGE
-    end
-    subgraph dp["DATA PLANE &mdash; one micro-container per instance"]
-        subgraph instA["instance A"]
-            SIDEA["sidecar (Rust/Go)"] --> ENGA["asmdb.exe<br/>A.dat / A.wal"]
+    subgraph vnet["asmdb-vnet 10.20.0.0/16"]
+        APIM["API Management<br/>Developer SKU · External VNet<br/>only public front door"]
+        subgraph cae["internal Container Apps environment<br/>10.20.1.197"]
+            CTRL["control plane<br/>management API"]
+            subgraph instA["instance A"]
+                SIDEA["sidecar"] --> ENGA["asmdb<br/>/data/A"]
+            end
+            subgraph instB["instance B"]
+                SIDEB["sidecar"] --> ENGB["asmdb<br/>/data/B"]
+            end
         end
-        subgraph instB["instance B"]
-            SIDEB["sidecar (Rust/Go)"] --> ENGB["asmdb.exe<br/>B.dat / B.wal"]
-        end
+        BLOB[("Blob private endpoint")]
+        NFS[("Azure Files NFS private endpoint")]
+        ACR[("ACR private endpoint<br/>runtime pulls")]
     end
-    OBJ[("object storage<br/>per-instance snapshots + WAL segments")]
 
-    REST -->|TLS| GW
-    GRPC -->|TLS| GW
-    MCP  -->|TLS| GW
-    PROV -.->|create / stop / resume| SIDEA
-    PROV -.->|create / stop / resume| SIDEB
-    GW -->|route per-instance endpoint| SIDEA
-    GW -->|route per-instance endpoint| SIDEB
-    ENGA --> OBJ
-    ENGB --> OBJ
+    REST -->|HTTPS| APIM
+    MCP  -->|HTTPS| APIM
+    CONSOLE -->|HTTPS + Entra PKCE| APIM
+    APIM -->|HTTPS| CTRL
+    APIM -->|HTTPS · /db/A/...| SIDEA
+    APIM -->|HTTPS · /db/B/...| SIDEB
+    SIDEA --> NFS
+    SIDEB --> NFS
+    CTRL --> BLOB
+    SIDEA -.-> ACR
+    SIDEB -.-> ACR
 
     classDef client fill:#1f6feb,stroke:#0b3d91,color:#fff
     classDef ctrl fill:#6e4aa0,stroke:#3b1e75,color:#fff
     classDef engine fill:#1a7f37,stroke:#0b4a20,color:#fff
     classDef store fill:#9a6700,stroke:#5a3d00,color:#fff
-    class REST,GRPC,MCP client
-    class GW,PROV,USAGE ctrl
+    class REST,MCP,CONSOLE client
+    class APIM,CTRL ctrl
     class SIDEA,SIDEB,ENGA,ENGB engine
-    class OBJ store
+    class BLOB,NFS,ACR store
 ```
 
-- **Control plane** (Rust/Go, stateless, horizontally scaled): API gateway (TLS,
-  authn/z, rate limiting, routing), the **provisioner** (creates/stops/resumes/
-  destroys instances and maps `instance_id → endpoint`), and the **usage
-  pipeline** (collects metering events for billing). Metadata (instances, keys,
-  placement) lives in a managed store (e.g. Postgres).
-- **Data plane**: one **micro-container per database instance**. The image is a
-  `FROM scratch` bundle of the **Linux ELF64 engine** (~48 KB, zero shared-library
-  dependencies) plus a small **sidecar** (Rust/Go) that supervises the `asmdb`
-  process, speaks the engine's protocol on one side and HTTP/gRPC/MCP on the
-  other, ships WAL/snapshots to object storage, and emits per-op usage events.
-- **Object storage** (S3 / Azure Blob / GCS): per-instance durability beyond the
-  node — WAL segments + periodic snapshots, and the resting place for hibernated
-  instances.
+- **Public edge:** API Management is the only public front door. Instance
+  Container Apps are internal; their domain does not resolve from the public
+  internet.
+- **Control plane:** the management API creates, lists, deletes and rotates
+  database tokens. It accepts Microsoft Entra ID v2 access tokens only, verifies
+  them against the tenant JWKS, and requires membership in the `ASMDB_ADMIN`
+  security group.
+- **Data plane:** one **micro-container per database instance**. The image
+  contains the Linux ELF64 engine and a small sidecar that supervises it,
+  translates HTTP/MCP calls into the engine protocol and mounts the instance's
+  `/data` directory.
+- **Private storage:** Blob, Azure Files NFS and ACR each have a private
+  endpoint and linked private DNS zone. Blob public access is disabled and
+  shared-key auth is disabled; NFS carries no account key. ACR is the explicit
+  exception: public network access remains enabled for ACR Tasks from a
+  workstation, while runtime pulls use the private endpoint.
 
 The engine is **unchanged** by all this; the service is built by *wrapping* one
 engine process per instance (the same stdio contract the local MCP server
@@ -266,10 +270,10 @@ stateDiagram-v2
 
 | Transition | What happens | Billing effect |
 |------------|--------------|----------------|
-| **Create** | provisioner allocates a container, initialises `<id>.dat`/`.wal`, registers the endpoint | storage starts |
+| **Create** | control plane allocates a Container App, mounts `/data` at the instance-id sub-path, initialises `<id>.dat`/`.wal`, and returns the endpoint plus instance token once | storage starts |
 | **Running → Idle** | no requests for *N* seconds | still warm, compute still billed |
-| **Idle → Hibernated** | container stopped; files flushed to object storage | **compute billing stops**; storage continues |
-| **Hibernated → Resume** | first request arrives; files pulled, `asmdb.exe` starts (ms), WAL recovered | compute resumes |
+| **Idle → Hibernated** | container stopped; files remain on the durable NFS volume | **compute billing stops**; storage continues |
+| **Hibernated → Resume** | first request arrives; `asmdb` starts against the mounted volume and recovers its WAL | compute resumes |
 | **Resize** | change CPU/mem/quota tier, or capacity (rides engine dynamic-resize, v1.0) | tier change |
 | **Backup / Restore** | snapshot to / from object storage; PITR via WAL replay | backup storage |
 | **Delete** | container destroyed; files retained per retention policy then purged | billing stops |
@@ -278,21 +282,29 @@ Scale-to-zero is the economic heart: because the engine cold-starts in
 milliseconds and recovers its WAL idempotently ([`ENGINE.md §7`](ENGINE.md#7-transactions-durability--crash-recovery)),
 hibernating idle databases is cheap and invisible to the caller.
 
+The control plane refuses to start an instance if the durable volume is not
+configured. A Container App's own filesystem is discarded on restart and on
+scale-to-zero; running without `/data` would make a database disappear the first
+time it went idle.
+
 ---
 
 ## 6. Isolation model
 
 - **Compute & memory:** each instance is one container with cgroup CPU/memory
   limits and an IO budget; a runaway tenant can only starve *itself*.
-- **Process:** exactly one `asmdb.exe` per instance — no shared engine, so there
+- **Process:** exactly one `asmdb` process per instance — no shared engine, so there
   is no cross-tenant memory or file access by construction.
-- **Storage:** each instance owns its `<id>.dat`/`<id>.wal` and its object-store
-  prefix; encryption keys are per instance (see §11).
+- **Storage:** one Azure Files NFS 4.1 share serves the platform, but the mount
+  sub-path is the instance id. Each database owns one directory under `/data`
+  and cannot see another's.
 - **Network:** the gateway routes an authenticated request only to *its*
-  instance's endpoint; instances have no lateral network path to each other.
-- **Stronger tier — micro-VMs:** tenants needing hardware-grade isolation (or
-  data residency) run each instance in a **Firecracker/Cloud-Hypervisor
-  micro-VM** instead of a container, at higher cost.
+  instance path. The Container Apps environment is internal, so instances are
+  not directly reachable from the internet.
+- **Replica count:** `maxReplicas` is `1` on every tier and is not negotiable.
+  The engine is a single-writer process holding an exclusive lock; a second
+  replica is not extra capacity, it is another process that cannot safely open
+  the same database.
 
 Because isolation is physical and per instance, the control plane never enforces
 tenant boundaries *inside* an engine — a whole class of multi-tenant bugs simply
@@ -302,33 +314,35 @@ does not exist here.
 
 ## 7. Access layer & protocols
 
-Every instance is reachable through the gateway by three interchangeable
-surfaces, all backed by the same engine verbs:
+Every instance is reached through the public gateway by a path prefix. Use
+`https://<gateway-host>` as a placeholder until the final hostname is assigned.
+Everything after `/db/<instance>` is forwarded verbatim, so the routes in
+`saas/contracts/CONTRACTS.md` §3 are unchanged except for the prefix.
 
 ### 7.1 REST (default)
 
 ```
-POST   /v1/db/{instance}/rows            {id|key, content?, tag?, value?, upsert?}
-GET    /v1/db/{instance}/rows/{idOrKey}
-GET    /v1/db/{instance}/rows?query=...            # substring search
-GET    /v1/db/{instance}/rows                      # list (paginated)
-DELETE /v1/db/{instance}/rows/{idOrKey}
-GET    /v1/db/{instance}/count
-POST   /v1/db/{instance}/tx                        # BEGIN…COMMIT batch
+POST   /db/{instance}/v1/rows            {id|key, content?, tag?, value?, upsert?}
+GET    /db/{instance}/v1/rows/{idOrKey}
+GET    /db/{instance}/v1/rows?query=...            # substring search
+GET    /db/{instance}/v1/rows                      # list (paginated)
+DELETE /db/{instance}/v1/rows/{idOrKey}
+GET    /db/{instance}/v1/count
+POST   /db/{instance}/v1/tx                        # BEGIN…COMMIT batch
 ```
 
 ### 7.2 Remote MCP
 
-MCP over **HTTP + SSE**, exposing the same seven CRUD tools as the local server
-(`db_insert`/`db_get`/`db_find`/…). Point an agent at the instance URL + API key
-and it has a durable cloud store — **hosted agent memory** is exactly this.
+MCP is exposed at `/db/{instance}/mcp`, with the same generic CRUD tools as the
+local server (`db_insert`/`db_get`/`db_find`/…). Point an agent at the instance
+URL plus the instance access token and it has a durable cloud store — **hosted
+agent memory** is exactly this.
 
-### 7.3 gRPC (high-throughput / server-to-server)
+### 7.3 Health
 
-The same operations as a `.proto` service over HTTP/2 for callers issuing many
-small ops.
+Health is exposed at `/db/{instance}/health`.
 
-> All three map onto the engine's REPL/CRUD verbs today; the **binary wire
+> These surfaces map onto the engine's REPL/CRUD verbs today; the **binary wire
 > protocol** on the engine roadmap ([`ENGINE.md §12`](ENGINE.md#12-roadmap),
 > v3.0) later lets the sidecar talk a length-prefixed socket protocol to the
 > engine instead of parsing REPL lines — lower overhead, cleaner framing.
@@ -339,20 +353,20 @@ Keys map to the engine's `u64` id exactly as the MCP server does: pass an intege
 ### 7.4 Connecting a web application (end-to-end)
 
 The common case: **your web app's backend talks to asmdb over REST; the browser
-never does.** An instance endpoint + API key is a server-side credential — treat
-it like a database password. Your frontend calls *your* API; your API calls the
+never does.** An instance endpoint + access token is a server-side credential —
+treat it like a database password. Your frontend calls *your* API; your API calls the
 asmdb instance. This is the standard backend-for-frontend (BFF) pattern.
 
 ```mermaid
 flowchart LR
-    BROWSER["browser / SPA<br/>(no API key)"]
-    APP["your web backend<br/>(Node / .NET / Go)<br/>holds ASMDB_API_KEY"]
+    BROWSER["browser / SPA<br/>(no instance token)"]
+    APP["your web backend<br/>(Node / .NET / Go)<br/>holds ASMDB_TOKEN"]
     GW["asmdb Cloud gateway<br/>auth · rate limit · route"]
     SIDE["instance sidecar"]
-    ENG["asmdb.exe<br/>&lt;instance&gt;.dat / .wal"]
+    ENG["asmdb<br/>&lt;instance&gt;.dat / .wal"]
 
     BROWSER -->|"HTTPS · your session cookie / JWT"| APP
-    APP -->|"HTTPS · Bearer &lt;API key&gt;<br/>/v1/db/&#123;instance&#125;/rows"| GW
+    APP -->|"HTTPS · bearer token<br/>/db/&#123;instance&#125;/v1/rows"| GW
     GW -->|"routed to this tenant only"| SIDE
     SIDE -->|"stdin/stdout"| ENG
     ENG -.->|rows| SIDE
@@ -373,18 +387,18 @@ flowchart LR
 **Steps**
 
 1. **Provision** an instance (dashboard, CLI, or the provisioning API). You get
-   back an **endpoint URL** (`https://api.asmdb.cloud/v1/db/{instance}`) and an
-   **API key**.
-2. **Store the key as a server secret** (env var / Key Vault / Secrets Manager) —
+   back an **endpoint URL** (`https://<gateway-host>/db/{instance}`) and an
+   **instance access token**. They are shown together once.
+2. **Store the token as a server secret** (env var / Key Vault / Secrets Manager) —
    never bundle it in frontend code or expose it to the browser.
-3. **Call the REST API from your backend** with `Authorization: Bearer <key>`.
+3. **Call the REST API from your backend** with `Authorization: Bearer <token>`.
    Map your app's identifiers to a row `key` (hashed to the engine's `u64` id).
 
 ```js
-// server-side only — the API key is a secret, never sent to the browser
-const ASMDB = "https://api.asmdb.cloud/v1/db/inst_8f3c"; // your instance endpoint
-const KEY   = process.env.ASMDB_API_KEY;                 // from your secret store
-const H = { Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" };
+// server-side only — the token is a secret, never sent to the browser
+const ASMDB = "https://<gateway-host>/db/inst_8f3c/v1"; // your instance endpoint
+const TOKEN = process.env.ASMDB_TOKEN;                  // from your secret store
+const H = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
 
 // CREATE / upsert a row
 await fetch(`${ASMDB}/rows`, {
@@ -408,7 +422,7 @@ await fetch(`${ASMDB}/tx`, {
 ```
 
 Wrap those calls behind your own routes so the browser only ever talks to your
-app (which enforces *its* user auth before touching the shared instance key):
+app (which enforces *its* user auth before touching the instance token):
 
 ```js
 // Express BFF route: browser -> your API -> asmdb instance
@@ -422,7 +436,7 @@ app.get("/api/profile/:uid", requireLogin, async (req, res) => {
 **Operational notes**
 
 - **Multi-tenant apps:** run **one instance per tenant** (clean isolation and
-  metering) and have your backend select the right endpoint + key per request,
+  metering) and have your backend select the right endpoint + token per request,
   or a single shared instance keyed by `tenant:<id>:...` when isolation is not
   required.
 - **Scale-to-zero cold starts:** the first request after **hibernation** wakes
@@ -457,7 +471,7 @@ engine hot path). Billable dimensions:
 
 - The sidecar emits one usage event per op (`instance`, `op`, `bytes`, `ts`) to a
   durable stream (Kafka/Kinesis → warehouse); billing and quotas derive from it.
-- **Quotas & rate limits** are enforced at the gateway per API key (ops/sec,
+- **Quotas & rate limits** are enforced at the gateway per instance token (ops/sec,
   concurrent connections, max rows/bytes). Hitting the per-instance capacity
   (`2^22` slots today) triggers a **resize** (engine v1.0 dynamic resize) or an
   upsell.
@@ -481,43 +495,52 @@ adds **beyond-the-container** durability, per instance:
 - **Portable export / GDPR erasure:** a tenant's export is literally their
   `.dat` + WAL tail; deletion is dropping their prefix.
 
-RPO/RTO by tier: free = best-effort daily snapshot; standard = ≤60 s RPO via WAL
-shipping; premium = ≤5 s RPO + warm replica (§10).
+The deployed platform stores live instance files on the `/data` durable volume,
+backed by Azure Files NFS. Blob is used by the control plane through managed
+identity; public Blob access and shared-key access are disabled.
 
 ---
 
 ## 10. High availability & replication
 
-- **Per-instance primary/replica via WAL streaming.** The instance's engine is
-  the single writer; the sidecar streams its WAL to one or more replica
-  containers that apply the same idempotent redo path used at recovery. Reads
-  (`db_get`/`db_find`) can be served from a replica for HA/read-scaling.
-- **Failover:** if a primary container/node dies, the control plane promotes a
-  caught-up replica (metadata flip) and fences the old primary. Single-writer
-  per instance makes promotion simple — no consensus on the data path.
-- **Multi-writer is out of scope for the engine.** Scaling a single hot database
-  beyond one writer is handled by **partitioning** (engine v3.0) into multiple
-  instances/shards, not by making the engine multi-writer. Consensus (if any)
-  guards only *placement metadata*, never the data path.
+The deployed service does **not** run read replicas for an instance. Every tier
+sets `maxReplicas` to `1` because the engine is a single-writer process holding
+an exclusive lock on its database. A second Container Apps replica is not extra
+capacity; it is another engine process that cannot safely open the same files
+until the first one releases them.
+
+Scale is therefore instance-level: create more databases and route by tenant,
+entity or shard key. Multi-writer inside one database remains an engine roadmap
+item, not a platform feature.
 
 ---
 
 ## 11. Security & compliance
 
-- **In transit:** TLS 1.3 at the gateway; mTLS for gRPC/VPC customers.
-- **At rest:** the sidecar / volume layer encrypts `.dat`/WAL and object-store
-  objects with **per-instance data keys** via KMS (envelope encryption) — keeping
-  crypto *out of the assembly hot path* while meeting at-rest requirements.
-- **Isolation:** physical, per instance (§6) — the strongest and simplest story.
-- **AuthN/Z:** API keys (hashed, revocable, scoped read/read-write) for the simple
-  case; JWT/OIDC (bring-your-own IdP) for enterprises. The gateway resolves
-  token → instance → scope *before* any request reaches an engine; the engine
-  never sees credentials.
-- **Audit logs:** every control-plane action (auth, provisioning, CRUD summaries)
-  logged immutably per instance, exportable for SOC 2 / ISO 27001.
-- **Compliance path:** SOC 2 Type II first, then ISO 27001; GDPR/CCPA export &
-  erasure are natural per-instance; **data residency** via region-pinned
-  instances (containers or micro-VMs).
+- **In transit:** the public gateway is HTTPS-only and forwards to the control
+  plane over HTTPS. Container Apps ingress redirects HTTP to HTTPS by default
+  because `allowInsecure` is not set. There is no plaintext hop in the request
+  path.
+- **Network:** API Management is the only public front door. The Container Apps
+  environment is internal, and Blob, NFS and ACR runtime pulls use private
+  endpoints.
+- **Management authentication:** create/list/delete/rotate operations require a
+  Microsoft Entra ID v2 access token. The server verifies signature, issuer,
+  audience and expiry against the tenant JWKS, then requires the `groups` claim
+  to contain the object id of `ASMDB_ADMIN`. A valid token outside the group is
+  `403`, not `401`.
+- **Browser authentication:** the console uses authorization-code with PKCE.
+  There is no client secret in the repository, image or app settings.
+- **Data-plane authentication:** each database has an opaque instance access
+  token, returned once at creation, stored only as a hash and compared in
+  constant time. Rotation is an Entra-authenticated management operation and
+  restarts the instance, so connections are briefly interrupted.
+- **Storage keys:** Blob has `allowSharedKeyAccess: false` and the control plane
+  uses managed identity. Azure Files NFS has no account key in the mount path;
+  reachability inside the VNet is the authorisation boundary.
+- **Engine boundary:** the engine still has no auth, encryption or audit log.
+  Those are platform controls around the engine, not features inside it. See
+  [`SECURITY.md`](SECURITY.md).
 
 ---
 
@@ -530,30 +553,26 @@ shipping; premium = ≤5 s RPO + warm replica (§10).
   `db_get` is attributable to an instance and node.
 - **Logging:** structured logs at gateway + sidecar; the engine's stdout is
   captured by the sidecar and surfaced as structured events.
-- **SLOs:** e.g. 99.9% standard / 99.95% premium; p99 `db_get` < 10 ms
-  same-region (warm). Error budgets drive release pace.
-- **Runbooks & alerts:** capacity-near-limit, WAL-lag-high, replica-behind,
-  resume-storm, node-down → paged with documented recovery (promote replica,
-  restore snapshot+WAL, resize).
+- **Runbooks & alerts:** capacity-near-limit, resume-storm and node-down are the
+  relevant failure modes for the deployed shape. Replica-lag alerts do not apply
+  while `maxReplicas` is fixed at `1`.
 
 ---
 
 ## 13. Deployment & orchestration
 
 - **Packaging:** engine binary + sidecar in one small container image; instance
-  data on fast local NVMe, replicated to object storage.
-- **Orchestration:** Kubernetes. Instances are **stateful** → one pod (or a
-  micro-VM via Kata/Firecracker) per instance with a persistent volume, managed
-  by a custom **operator** that handles create/hibernate/resume/resize/failover
-  and `instance_id → endpoint` mapping. Control plane is **stateless** →
-  `Deployment`s behind an ingress/LB.
-- **Scale-to-zero:** the operator stops idle instance pods and resumes them on a
-  gateway "wake" signal; the engine's ms cold-start makes this transparent.
-- **Regions:** start single-region multi-AZ; add regions for latency + residency;
-  object-storage replication for cross-region DR.
+  data on the `/data` Azure Files NFS mount.
+- **Orchestration:** Azure Container Apps. The environment is internal
+  (`internal: true`) with static IP `10.20.1.197`; API Management in External
+  VNet mode is the only public entry point.
+- **Scale-to-zero:** stopped instances resume against the same durable `/data`
+  mount. The control plane refuses to start if the volume is absent.
+- **Network dependencies:** Blob storage, the NFS share and ACR runtime pulls use
+  private endpoints and private DNS zones linked to `asmdb-vnet`. ACR public
+  network access remains enabled only for ACR Tasks from a workstation.
 - **Linux is the fleet target.** The ELF64 engine (~48 KB, no shared-library
-  dependencies) already exists, so instance images are Linux from day one and
-  Firecracker micro-VMs are open for the enterprise tier. The Windows binary
+  dependencies) already exists, so instance images are Linux. The Windows binary
   stays a first-class development target, not a deployment one.
 
 ---
@@ -611,10 +630,11 @@ Phased so each stage ships independent value; **none require changing the
 engine's assembly**, though some ride engine roadmap items.
 
 ### Phase 0 — Provisioned instances MVP (single region)
-- Provisioner + operator that creates **one container per instance** with the
-  existing stdio sidecar; REST API + API keys.
-- Object-storage snapshots (basic durability). Best-effort SLA.
-- **Goal:** `POST /v1/db` returns a live endpoint you can CRUD against.
+- Control plane creates **one Container App per instance** with the existing
+  stdio sidecar, mounted at `/data/<instance>`.
+- API Management routes `/db/<instance>/...` to the private instance.
+- **Goal:** `POST /api/v1/databases` returns a live endpoint and one-time
+  instance token you can CRUD against.
 
 ### Phase 1 — Consumption billing & scale-to-zero
 - Metering pipeline + pay-as-you-go billing (ops + compute + storage).
@@ -623,20 +643,20 @@ engine's assembly**, though some ride engine roadmap items.
 - **Goal:** first paying customers; idle instances cost ~nothing.
 
 ### Phase 2 — Durability, HA & scale
-- WAL shipping (≤60 s RPO), read replicas + failover, PITR.
-- Instance resize (rides engine v1.0 dynamic resize); gRPC surface.
-- **Goal:** 99.9% SLA, production-grade.
+- Backup/restore and token rotation workflows.
+- Instance resize where it does not violate the one-writer model.
+- **Goal:** operationally boring single-process instances with clear recovery
+  procedures.
 
 ### Phase 3 — Enterprise & compliance
-- Firecracker micro-VM tier, VPC peering, SSO/OIDC, audit export, residency.
-- SOC 2 Type II, then ISO 27001; per-instance KMS encryption.
-- Multi-region DR.
-- **Goal:** land enterprise workloads.
+- Harden the management plane, audit trail and network options.
+- Document any compliance path only after the controls exist.
+- **Goal:** make the platform's boundaries reviewable without implying
+  certifications that do not exist.
 
 ### Phase 4 — Performance edge as a feature
-- Adopt engine wins (binary wire protocol, SIMD scans, incremental checkpoint,
-  Linux port → cheaper Firecracker fleets) to publish credible "fastest/cheapest
-  small transactional DB" benchmarks.
+- Adopt engine wins (binary wire protocol, SIMD scans, incremental checkpoint)
+  and publish only reproducible benchmarks.
 - **Goal:** turn the assembly core into a defensible cost/performance story.
 
 ---
@@ -676,6 +696,13 @@ engine's assembly**, though some ride engine roadmap items.
 the code gets written*: the work breakdown, which streams run in parallel, who
 owns what, and the gates where they must converge.
 
+Several Wave 0/Wave 1 decisions have now landed: Azure Container Apps is the
+instance runtime, the environment is internal, API Management is the public
+front door, management auth is Entra-gated, data-plane auth uses hashed instance
+tokens, and durable instance storage is Azure Files NFS mounted at `/data` by
+instance-id sub-path. The table below remains useful as ownership history, but
+the deployed shape above is the source of truth.
+
 The plan is built for **parallel agent execution under a single orchestrator**.
 That imposes two hard rules, and everything below follows from them:
 
@@ -709,14 +736,14 @@ flowchart TB
         direction LR
         A["<b>Agent A · data plane</b><br/><code>saas/sidecar/</code><br/>supervise asmdb · HTTP<br/>readers · health · usage events"]:::agent
         C["<b>Agent C · provisioner</b><br/><code>saas/provisioner/</code><br/>create / stop / resume / destroy<br/>instance → endpoint map"]:::agent
-        I["<b>Agent I · platform</b><br/><code>saas/infra/</code><br/>Bicep · ACR · AKS/ACA<br/>pipelines · environments"]:::agent
+        I["<b>Agent I · platform</b><br/><code>saas/infra/</code><br/>Bicep · ACR · ACA<br/>private endpoints · environments"]:::agent
     end
 
-    G1{{"GATE 1 — <b>POST /v1/db returns a live endpoint you can CRUD against</b><br/>end-to-end on real Azure"}}:::gate
+    G1{{"GATE 1 — <b>POST /api/v1/databases returns an endpoint and token</b><br/>end-to-end on real Azure"}}:::gate
 
     subgraph W2["WAVE 2 — PRODUCTION SHAPE (3 agents in parallel)"]
         direction LR
-        B["<b>Agent B · edge</b><br/><code>saas/gateway/</code><br/>authn/z · API keys · routing<br/>rate limit · quotas"]:::agent
+        B["<b>Agent B · edge</b><br/><code>saas/gateway/</code><br/>Entra + token auth · routing<br/>rate limit · quotas"]:::agent
         D["<b>Agent D · durability</b><br/><code>saas/durability/</code><br/>snapshot + CDC shipping<br/>restore · PITR · watermarks"]:::agent
         F["<b>Agent F · observability</b><br/><code>saas/observability/</code><br/>metrics · traces · logs<br/>dashboards · alerts · runbooks"]:::agent
     end
@@ -757,7 +784,7 @@ and one deliverable, and is **done** only when its column-3 test passes.
 | **A** data plane | `saas/sidecar/` | supervises one `asmdb` process; HTTP + engine protocol; spawns `--reader` sessions for reads; emits usage events; health and readiness | a container serves CRUD over HTTP, survives an engine crash, and reports the right row after a restart |
 | **C** provisioner | `saas/provisioner/` | instance lifecycle API and state machine; `instance_id → endpoint`; hibernate/resume | create → use → hibernate → resume → destroy, driven only through the API, with state reconciled after a control-plane restart |
 | **I** platform | `saas/infra/` | Bicep modules, container registry, cluster, environments, deployment scripts | one command builds the image and rolls a change to dev |
-| **B** edge | `saas/gateway/` | TLS termination, API keys then OIDC, per-tenant routing, rate limits, quotas | an unauthenticated call is refused, a tenant cannot reach another tenant's instance, and a quota actually bites |
+| **B** edge | `saas/gateway/` | TLS termination, Entra-gated management, instance-token data plane, path routing, rate limits, quotas | an unauthenticated call is refused, a tenant cannot reach another tenant's instance, and a quota actually bites |
 | **D** durability | `saas/durability/` | snapshot + `.cdc` shipping to Blob, restore, PITR, backup watermark contract | a deliberately destroyed instance is restored to a point in time, verified by row count **and** `VERIFY` |
 | **F** observability | `saas/observability/` | metrics, traces, structured logs, dashboards, alert rules, runbooks | a fault injected in staging pages a human, and the runbook resolves it |
 | **E** metering | `saas/metering/` | usage events → aggregation → billing export; idempotent, replay-safe | a replayed event stream produces the identical bill twice |
@@ -785,9 +812,9 @@ Deliberately boring, because the interesting part is the engine.
 
 | Concern | Choice | Why |
 |---|---|---|
-| Instance runtime | **Azure Container Apps** for Wave 1, **AKS + operator** behind the same provisioner interface for scale | Container Apps gives scale-to-zero and a per-app endpoint on day one; the abstraction means swapping it later is Agent C's problem alone |
+| Instance runtime | **Azure Container Apps** in an internal environment | Container Apps gives scale-to-zero; API Management is the public endpoint |
 | Image registry | Azure Container Registry | one image: ELF64 engine + sidecar |
-| Instance volume | managed disk per instance, Blob for durability | matches §9 |
+| Instance volume | Azure Files NFS 4.1 share, mounted by instance-id sub-path at `/data` | avoids SMB account keys and keeps each instance in its own directory |
 | Object storage | Azure Blob (cool tier for snapshots) | snapshots + shipped `.cdc` segments |
 | Control-plane store | Azure Database for PostgreSQL Flexible Server | instances, tenants, keys, placement |
 | Secrets | Key Vault + workload identity | no secrets in images or env files |

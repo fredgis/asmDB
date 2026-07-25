@@ -34,16 +34,112 @@ The sensitive files are:
 
 Anyone who can write any of those files is inside the trust boundary.
 
-## Current security posture
+## Engine security posture
 
-- There is no authentication.
-- There is no authorisation.
-- There is no encryption at rest.
-- There is no encryption in transit; the engine has no network protocol.
-- There is no audit log.
+The engine itself has:
+
+- no authentication;
+- no authorisation;
+- no encryption at rest;
+- no encryption in transit; the engine has no network protocol;
+- no audit log.
 
 Access control is entirely external: whoever can run the binary and read or
 write the files has full access to the database.
+
+The hosted service does not change the engine. It wraps one engine process per
+database instance and provides the network, identity and storage controls around
+it. Keep those two layers separate: an engine binary copied out of the service
+still has the limitations above.
+
+## Hosted service boundary
+
+In asmdb Cloud, instances are not public endpoints. The deployed network is:
+
+- VNet `asmdb-vnet` (`10.20.0.0/16`) with separate subnets for Container Apps,
+  API Management and private endpoints.
+- An internal Container Apps environment (`internal: true`) at static IP
+  `10.20.1.197`. Its Container Apps domain is not publicly resolvable.
+- API Management in Developer SKU, External VNet mode, as the only public front
+  door.
+- Private endpoints for Blob storage, the Azure Files share and the container
+  registry, each with its own private DNS zone linked to the VNet.
+
+Blob storage has `publicNetworkAccess: Disabled` and
+`allowSharedKeyAccess: false`. The control plane uses managed identity; there is
+no storage account key to leak or rotate for Blob. Instance data is on Azure
+Files NFS 4.1. NFS carries no account key; access is authorised by network reach
+inside the VNet. SMB was deliberately not used because Container Apps SMB mounts
+require a storage account key.
+
+The honest exception is Azure Container Registry. Public network access remains
+enabled so images can be built with ACR Tasks from a workstation. Runtime pulls
+use the private endpoint. Closing that exception would require a dedicated build
+agent pool inside the VNet; that is not deployed.
+
+## Hosted request path and TLS
+
+Database traffic is routed through the gateway by path:
+
+- `https://<gateway-host>/db/<instance>/v1/rows`
+- `https://<gateway-host>/db/<instance>/mcp`
+- `https://<gateway-host>/db/<instance>/health`
+
+Everything after the instance identifier is forwarded verbatim to the instance,
+so the REST and MCP contracts are unchanged except for the `/db/<instance>`
+prefix.
+
+The gateway accepts HTTPS only and forwards to the control plane over HTTPS.
+Container Apps ingress does not set `allowInsecure`; the platform default is
+false, so HTTP is redirected to HTTPS and the platform supplies the certificate.
+There is no plaintext hop in the request path.
+
+## Hosted authentication and authorisation
+
+The service uses two credentials, and they are never interchangeable.
+
+**Management API** operations such as create, list, delete and rotate require a
+Microsoft Entra ID v2 access token. The server verifies the token against the
+tenant JWKS: signature, issuer, audience and expiry. The `groups` claim must
+contain the object id of the `ASMDB_ADMIN` security group. A valid token from a
+user outside that group is rejected as `403`, not `401`, because the caller is
+authenticated but not allowed. ID tokens are not accepted in place of access
+tokens, and no payload is trusted without signature verification. If the Entra
+configuration is absent, the management API fails closed.
+
+The browser flow is authorization-code with PKCE. There is no client secret in
+the image, repository or app settings. Tenant, client and group ids are supplied
+as environment variables and exposed to the browser through a config endpoint
+rather than being baked into a committed script. The previous shared admin key
+has been removed.
+
+**Data-plane** calls to a database's REST API, MCP endpoint and browser terminal
+use the instance access token. It is an opaque bearer string issued at creation,
+returned with the endpoint once, and stored by the control plane only as a hash.
+Comparisons are constant time.
+
+Tokens are not retrievable after creation. Rotation is available at
+`POST /api/v1/databases/{id}/rotate-token` and is authenticated with Entra, not
+with the instance token; that is intentional, because rotation is needed when
+the instance token is lost. Rotation restarts the instance and briefly interrupts
+connections. The new token arrives as an environment variable, which creates a
+new Container Apps revision, and the engine holds an exclusive lock until the
+old process exits.
+
+## Hosted durability and isolation
+
+Each instance mounts a durable volume at `/data`. A Container App's local
+filesystem is discarded on restart and scale-to-zero; the control plane refuses
+to start if the volume is not configured.
+
+One Azure Files NFS share serves the platform. The mount sub-path is the
+instance id, so each database owns one directory and cannot see another's. Every
+tier sets `maxReplicas` to `1`; this is not a tuning knob. The engine is a
+single-writer process with an exclusive lock, so a second replica would not add
+capacity and may not open the database at all.
+
+The engine transaction limit remains 4 096 distinct rows. The service layer may
+chunk requests, but it cannot make one engine transaction larger.
 
 ## Executable hardening limitations
 

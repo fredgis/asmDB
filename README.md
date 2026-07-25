@@ -99,25 +99,28 @@ A [`FIND`](docs/COMMANDS.md#find) or
 asmdb Cloud is the same engine run as a managed service, with **asmdb.cloud** as
 the intended public domain. You create a database and get a real isolated asmdb
 instance, reachable through the REST data API, an MCP endpoint for AI agents and
-a CLI. Every tier runs the identical engine, so tiers buy latency and headroom,
-not features.
+a CLI. The endpoint and the instance access token are returned together once at
+creation; the token is then stored only as a hash and can be rotated from the
+management API.
 
 <p align="center">
   <img src="docs/assets/asmdb-cloud-home.png" alt="asmdb Cloud homepage" width="90%">
 </p>
 
-| Tier | Price | Size | Behaviour |
-|---|---|---|---|
-| Free | $0 | 0.25 vCPU / 0.5 GiB | sleeps when idle, 3 per account |
-| Standard | $15/mo | 0.5 vCPU / 1 GiB | sleeps when idle |
-| Premium | $49/mo | 1 vCPU / 2 GiB | always warm, no cold start |
+Three tiers, priced from Azure list rates at 15 % margin on run — the derivation,
+the assumptions and the ways the model breaks are in
+[`docs/COST.md`](docs/COST.md).
 
-The service is not generally available yet. Prices are derived in
-[`docs/COST.md`](docs/COST.md) from Azure list rates at 15 % margin on run,
-with the assumptions and the ways the model breaks written down beside them.
-The full design is in [`docs/SAAS.md`](docs/SAAS.md): provisioning, instance
-isolation, the HTTP/MCP/CLI access layer, metering, backups, security
-boundaries, operations and the rollout plan.
+<p align="center">
+  <img src="docs/assets/asmdb-cloud-tiers.png" alt="asmdb Cloud pricing tiers: free at $0, standard at $15 a month, premium at $49 a month" width="90%">
+</p>
+
+The public front door is API Management; instance containers and storage stay
+private. Requests are HTTPS end-to-end, including the hop from the gateway to the
+control plane. The browser console signs in with Microsoft Entra ID and PKCE; it
+does not carry a client secret. The full design is in
+[`docs/SAAS.md`](docs/SAAS.md), and the engine/platform threat model is in
+[`docs/SECURITY.md`](docs/SECURITY.md).
 
 ## Table of contents
 
@@ -744,7 +747,7 @@ Two documents, deliberately kept in separate lanes:
   engine becomes **asmdb Cloud**: a hosted, pay-as-you-go database service where
   every database instance runs in its **own isolated micro-container** with a
   dedicated `asmdb` process. Covers provisioning & lifecycle, per-instance
-  isolation, the HTTP/gRPC + remote-MCP access layer, consumption metering &
+  isolation, the HTTP + remote-MCP access layer, consumption metering &
   billing, durability/backups, HA, security/compliance, deployment, pricing, and
   a phased GTM. The engine is the data plane and stays assembly; **this
   control/service layer may use any language** (Rust/Go), by design. (Hosted
@@ -1094,7 +1097,7 @@ shell, so a quote or a `;` in any field became shell syntax — it now uses
 `ArgumentList` instead of concatenating into a re-parsed string. The Python
 client reads `FORMAT TSV` and picks its executable from the platform.
 
-The MCP suite and dependency audit are run locally; there is no repository CI.
+The MCP suite and dependency audit are local checks.
 
 A latent bug found on the way: `u64_to_dec` pushed `rdi` *after* overwriting it,
 so it returned with the caller's register replaced by the output buffer. No

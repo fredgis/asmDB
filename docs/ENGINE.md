@@ -61,6 +61,10 @@ the WAL. (Agent memory is one workload this shape suits — not the only one.)
 - Non-integer primary keys (v1 key is `u64`; the MCP layer hashes strings to it).
 - Dynamic table resizing (capacity is fixed and documented).
 
+The hosted service in [`SAAS.md`](SAAS.md) supplies networking, TLS,
+authentication, routing and storage isolation around the engine. None of those
+controls live inside the assembly binary described here.
+
 Everything in [§12 Roadmap](#12-roadmap) — columnar storage, compression,
 bitmap/secondary indexes, partitioning, parallel scans, MVCC — is **not yet
 implemented** and is labelled as such throughout.
