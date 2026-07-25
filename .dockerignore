@@ -2,6 +2,10 @@
 # to assemble the engine from src/. Everything that is not needed for that or
 # for the Go builds is excluded — a 1 GiB sparse .dat uploaded by accident would
 # turn a 20-second build into a very long one.
+#
+# site/assets is NOT excluded: the control-plane image serves the site, so its
+# logo and hero images have to be inside it. Excluding them once cost a live
+# site with no images and 404s on every asset — 1.7 MB is not worth that.
 
 .git
 .github
@@ -13,7 +17,6 @@ tests/
 clients/
 mcp/node_modules
 docs/assets
-site/assets/*.png
 *.dat
 *.wal
 *.cdc
