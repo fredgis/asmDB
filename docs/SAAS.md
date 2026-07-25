@@ -53,11 +53,16 @@ compute time. Idle instances **scale to zero** and cost almost nothing.
 Why this can win:
 
 - **The engine is tiny and starts instantly.** `asmdb` is ~24 KB, has no
-  runtime to warm up, and maps a single 1 GiB record region on boot — **sparse
-  on disk**, so an empty or idle instance's data file costs only kilobytes. That
-  makes **per-instance micro-containers** and **scale-to-zero** economically
-  viable in a way a heavyweight DB image (hundreds of MB, slow warmup) is not — cold start
-  is milliseconds, so we can hibernate idle databases and still feel "always on."
+  runtime to warm up, and maps its record region **copy-on-write** from a
+  **sparse** file — so an idle instance's data file costs kilobytes on disk
+  *and* its process costs a few MB of RAM rather than a gigabyte. Measured on a
+  1 000 000-row database: **~5 MB peak working set, ~80 ms to open**, whatever
+  the database contains. That is the number the whole model rests on — it is
+  what lets a host carry **hundreds of live instances** instead of one per
+  gigabyte, and it makes **per-instance micro-containers** with
+  **scale-to-zero** economically viable in a way a heavyweight DB image
+  (hundreds of MB, slow warmup) is not. Cold start is milliseconds, so we can
+  hibernate idle databases and still feel "always on."
 - **Cost per operation is dominated by a hash probe + a WAL append.** The engine
   spends almost nothing per op, so **pay-per-use** pricing can be aggressive and
   still carry margin.

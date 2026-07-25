@@ -20,6 +20,7 @@
 %define SYS_open          2
 %define SYS_close         3
 %define SYS_stat          4
+%define SYS_lseek         8
 %define SYS_mmap          9
 %define SYS_ioctl         16
 %define SYS_pread64       17
@@ -41,6 +42,8 @@
 %define MODE_0644    0x1A4
 %define PROT_RW      0x3
 %define MAP_PRIV_ANON 0x22
+%define MAP_PRIVATE  0x02
+%define SEEK_END     2
 %define LOCK_EXNB    0x6              ; LOCK_EX (2) | LOCK_NB (4)
 %define TCGETS       0x5401
 %define CLK_REALTIME  0
@@ -393,6 +396,57 @@ os_truncate:
 ; os_set_sparse(rcx = fd) - no-op: Linux files are sparse by default, so the
 ;   ftruncate in db_open already leaves unwritten slots as unallocated holes.
 os_set_sparse:
+    ret
+
+; os_filesize(rcx = fd) -> rax = size in bytes, or -1 on failure
+;   lseek is safe here: all data I/O uses pread64/pwrite64, which ignore the
+;   file position.
+os_filesize:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
+    mov  rdi, rcx
+    xor  rsi, rsi
+    mov  rdx, SEEK_END
+    mov  eax, SYS_lseek
+    syscall
+    test rax, rax
+    jns  .done
+    mov  rax, -1
+.done:
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_map_cow(rcx = fd, rdx = size) -> rax = base address, or 0 on failure
+;   MAP_PRIVATE: reads fault in from the file, writes go to private pages that
+;   never reach it, so the durability model stays exactly as it was.
+os_map_cow:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    mov  [rbp-8], rsi
+    mov  [rbp-16], rdi
+    mov  r8, rcx                     ; fd
+    mov  rsi, rdx                    ; length
+    xor  rdi, rdi                    ; addr = NULL
+    mov  rdx, PROT_RW
+    mov  r10, MAP_PRIVATE
+    xor  r9, r9                      ; offset 0
+    mov  eax, SYS_mmap
+    syscall
+    cmp  rax, -4095                  ; -errno range -> failure
+    jb   .done
+    xor  rax, rax
+.done:
+    mov  rdi, [rbp-16]
+    mov  rsi, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
     ret
 
 ; os_close(rcx = fd)

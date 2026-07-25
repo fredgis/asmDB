@@ -456,23 +456,41 @@ db_open:
     call wal_open
     call wal_recover                 ; a committed WAL may predate this file
 .load:
-    ; Both paths load the slot region here. The new-file path must do it too:
-    ; wal_recover writes recovered rows to the .dat and publishes their count,
-    ; but it does not populate g_table, so skipping this read would leave the
-    ; in-memory table empty while the header claimed rows existed.
-    mov  rcx, HDR_SIZE
-    mov  rdx, [rel g_table]
-    mov  r8, CAPACITY*REC_SIZE
-    call read_at
+    ; Map the slot region COPY-ON-WRITE instead of committing 1 GiB and reading
+    ; it. Reads fault in on demand (a sparse file's holes cost nothing), writes
+    ; go to private pages that never reach the file - so the durability model is
+    ; untouched: the .dat still changes only through write_at/fsync. This is
+    ; also why the mapping is created AFTER wal_recover: recovery writes to the
+    ; file directly, and a private mapping is not guaranteed to observe writes
+    ; made to the file after it was created.
+    ;
+    ; The file must physically contain the whole region first. Checking the size
+    ; explicitly also replaces the old "read 1 GiB and see if it came up short"
+    ; truncation test - and CreateFileMapping would otherwise silently grow a
+    ; truncated file to fit.
+    mov  rcx, [rel g_dat_handle]
+    call os_filesize
     test rax, rax
     js   io_fatal_read
-    mov  rdx, CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
     cmp  rax, rdx
     jb   .corrupt                    ; data region truncated
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    call os_map_cow
+    test rax, rax
+    jz   .mapfail
+    add  rax, HDR_SIZE               ; slot region starts after the header
+    mov  [rel g_table], rax
 .done:
     mov  rsp, rbp
     pop  rbp
     ret
+.mapfail:
+    lea  rcx, [rel s_err_map]
+    call puts
+    mov  ecx, 1
+    call os_exit
 .corrupt:
     lea  rcx, [rel s_err_corrupt]
     call puts

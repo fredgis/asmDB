@@ -160,7 +160,9 @@ os_init_std      open stdin/stdout, detect a TTY (colour gate)
 os_open          open/create a file            (CreateFileA  / openat)
 os_read/os_write sequential console + file I/O (ReadFile     / read,  WriteFile / write)
 os_pread/os_pwrite  positioned slot I/O        (SetFilePointerEx+ReadFile / pread64, pwrite64)
-os_alloc         reserve the 1 GiB region      (VirtualAlloc / mmap)
+os_alloc         small runtime buffers         (VirtualAlloc / mmap anon)
+os_map_cow       map the store copy-on-write   (CreateFileMapping+MapViewOfFile / mmap MAP_PRIVATE)
+os_filesize      file length, for validation   (GetFileSizeEx / lseek SEEK_END)
 os_flush         force durability              (FlushFileBuffers / fsync)
 os_truncate      shrink a file (WAL checkpoint)(SetEndOfFile / ftruncate)
 os_now_ms        wall-clock epoch ms           (GetSystemTimeAsFileTime / clock_gettime)
@@ -182,7 +184,9 @@ callers never see the difference.
 | `os_write` | `WriteFile` | `write` (1) |
 | `os_pread` | `SetFilePointerEx` + `ReadFile` | `pread64` (17) |
 | `os_pwrite` | `SetFilePointerEx` + `WriteFile` | `pwrite64` (18) |
-| `os_alloc` | `VirtualAlloc` | `mmap` (9) |
+| `os_alloc` | `VirtualAlloc` | `mmap` anon (9) |
+| `os_map_cow` | `CreateFileMappingA` + `MapViewOfFile` | `mmap` `MAP_PRIVATE` (9) |
+| `os_filesize` | `GetFileSizeEx` | `lseek` `SEEK_END` (8) |
 | `os_flush` | `FlushFileBuffers` | `fsync` (74) |
 | `os_truncate` | `SetEndOfFile` | `ftruncate` (77) |
 | `os_now_ms` | `GetSystemTimeAsFileTime` | `clock_gettime` (228) |
@@ -262,9 +266,9 @@ The `SCHEMA` command prints this exact table at runtime.
 ## 5. Hash table — the store *is* the index
 
 - The store is a single array of **`CAPACITY = 4194304`** slots (`2^22`),
-  `256 B` each → a **1 GiB** contiguous region from `VirtualAlloc` / `mmap`. The
-  backing `.dat` file is created **sparse** (see §6.1), so unused slots cost no
-  disk.
+  `256 B` each → a **1 GiB** contiguous region, **mapped copy-on-write from the
+  `.dat`** rather than allocated and read (§6.1). The backing file is created
+  **sparse**, so unused slots cost neither disk nor RAM.
 
 - **Hash function — Fibonacci (multiplicative) hashing.** Multiply the key by the
   64-bit golden-ratio constant `⌊2^64 / φ⌋` and keep the **top** `log2(CAPACITY)`
@@ -337,18 +341,64 @@ Two files per database, named from the DB base name: `<db>.dat` and `<db>.wal`.
 ```
 
 The header is 512 bytes (`HDR_SIZE`); the slot region is a byte-for-byte image
-of the live hash table, so load = `ReadFile` into the `VirtualAlloc` region and
-persist = `WriteFile` of the touched slots plus the header. `count` is refreshed
-in the header on every durable write. The logical table name is resolved from
-(in priority order) a CLI argument, the header, or the DB base name.
+of the live hash table. `count` is refreshed in the header on every durable
+write. The logical table name is resolved from (in priority order) a CLI
+argument, the header, or the DB base name.
 
 A brand-new `.dat` is created **sparse**: `db_open` issues `DeviceIoControl`
 with `FSCTL_SET_SPARSE`, then `SetEndOfFile` extends the file to the full
 `HDR_SIZE + CAPACITY*256` logical size **without allocating or zeroing 1 GiB**.
 Unwritten slots read back as zero and cost nothing on disk, so an empty database
-occupies a few kilobytes while still presenting the whole slot region to
-`ReadFile`. Individual `WriteFile`s (autocommit, `COMMIT`, `BENCH` checkpoint)
-lazily materialise only the slots they touch.
+occupies a few kilobytes. Individual `WriteFile`s (autocommit, `COMMIT`,
+`BENCH` checkpoint) lazily materialise only the slots they touch.
+
+#### The store is a copy-on-write mapping, not a buffer
+
+`g_table` does **not** point at a 1 GiB allocation that was read from disk. The
+slot region is **mapped copy-on-write** — `CreateFileMapping(PAGE_WRITECOPY)` +
+`MapViewOfFile(FILE_MAP_COPY)` on Windows, `mmap(PROT_READ|PROT_WRITE,
+MAP_PRIVATE)` on Linux — and `g_table = mapped_base + HDR_SIZE`.
+
+```asm
+    mov  rcx, [rel g_dat_handle]
+    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    call os_map_cow                  ; reads fault in; writes stay private
+    test rax, rax
+    jz   .mapfail
+    add  rax, HDR_SIZE               ; slot region starts after the header
+    mov  [rel g_table], rax
+```
+
+Three properties follow, and the third is the reason this is safe:
+
+- **Open is O(1).** Nothing is read or committed up front. Opening a database
+  measured ~600 ms *regardless of its contents* before this change (0 rows,
+  1 000 rows and 1 000 000 rows were indistinguishable); it is now ~80 ms, and
+  that remainder is process start, not the store.
+- **Residency follows the data.** Pages materialise only when touched, so a
+  million-row database peaks at **~5 MB** of working set instead of ~1 029 MB.
+- **Durability is untouched.** A *private* mapping means writes to `g_table`
+  never reach the file. The `.dat` still changes only through the explicit
+  `write_at` / `fsync` paths of §7, so the WAL protocol, the undo log and the
+  "in a transaction, nothing is durable until COMMIT" invariant all hold exactly
+  as before. A shared mapping would have broken that: the OS could flush an
+  uncommitted page at any time.
+
+The mapping is created **after** `wal_recover`, because recovery writes to the
+file directly and a private mapping is not guaranteed to observe writes made to
+the file after it was created. The file size is checked explicitly first
+(`os_filesize`) — that replaces the old "read the whole region and see if it
+came up short" truncation test, and it matters because `CreateFileMapping`
+would otherwise silently grow a truncated file to fit.
+
+**The trade-off, stated plainly:** a full-table scan (`SELECT *`, `FIND`,
+`RANGE`, `TRUNCATE`) now faults the region in rather than walking RAM that was
+already resident, which costs about **26 % more on a full `FIND`** and more than
+that on a sparsely populated table. Every other operation — and every
+invocation's startup — is several times faster, and the memory saving is what
+makes one container per instance realistic (see [SAAS.md](SAAS.md)). Closing
+that gap is the next roadmap item: a **persisted dense status directory**, so a
+scan streams a few MiB instead of touching the whole region.
 
 #### Open-time validation
 
@@ -757,21 +807,20 @@ The theme is "never lie about durability, never corrupt on crash."
 | Item | What it adds | CRUD path helped |
 |------|--------------|------------------|
 | ~~**CRC32 on WAL frames**~~ | ✅ **done** — table-driven CRC-32 written and flushed with the commit marker; a damaged committed frame is refused instead of replayed (§6.2, §7.3) | durable C/U/D |
-| **Lazy (copy-on-write) `.dat` mapping** ⭐ | **the measured next bottleneck.** `db_open` currently commits and reads the whole 1 GiB slot region, so **opening a database costs ~600 ms whatever it contains** — 0 rows, 1 000 rows and 1 000 000 rows all measure the same. Mapping the file copy-on-write (`FILE_MAP_COPY` / `MAP_PRIVATE`) instead makes open O(1) and residency proportional to the pages actually touched. A *private* mapping is the point: uncommitted changes stay out of the file, so the WAL durability model of §7 is unchanged | every command, especially short-lived CLI/MCP invocations |
+| ~~**Lazy (copy-on-write) `.dat` mapping**~~ | ✅ **done** — the store is mapped `FILE_MAP_COPY` / `MAP_PRIVATE` instead of committed and read. Open went from ~600 ms *regardless of size* to ~80 ms, and peak working set on a 1 M-row database from ~1 029 MB to ~5 MB. Durability is unchanged: a private mapping keeps writes out of the file (§6.1) | every command, and per-instance density |
+| **Persisted dense status directory** ⭐ | **the new bottleneck.** With the store mapped lazily, a full scan (`SELECT *`, `FIND`, `RANGE`, `TRUNCATE`) faults the whole region: ~26 % slower on a full `FIND`, worse on a sparse table. Persisting one status byte per slot as a third region lets a scan stream ~4 MiB instead of touching 1 GiB. It must be *persisted*, not rebuilt at open — rebuilding means scanning the records, which is the very fault storm it exists to avoid. Needs a "clean shutdown" header flag so a stale directory is rebuilt after a crash instead of trusted | every full scan |
 | **Incremental checkpoint** | a dirty-slot bitmap so `COMMIT` flushes only touched pages, not the whole 1 GiB region — the fix for the bulk-durable benchmark | durable bulk write |
 | **Group commit** | coalesce concurrent `COMMIT`s into one `fsync` | high-rate durable writes |
 | **Dynamic resize / rehash** | grow the table past load factor 0.75 instead of erroring; power-of-two doubling + incremental re-probe | all CRUD at scale |
 | ~~**Short-write / error propagation**~~ | ✅ **done** — every read/write/flush return is checked; a failed durable write aborts instead of acknowledging (§7.5) | all persistence |
 
-> **Measured, and one idea already rejected on the numbers.** A dense
-> one-byte-per-slot status mirror (so scans stream 4 MiB instead of touching
-> 1 GiB of strided records) was prototyped and **reverted**: with the eager load
-> in place a full `SELECT *` is already lost in the noise of the ~600 ms open,
-> and the mirror's rebuild pass made every open ~100 ms *slower*. It becomes
-> worthwhile only **after** the lazy mapping lands — at which point scanning
-> records would fault in the whole file, and a dense mirror is exactly what
-> keeps a scan from doing that. Order matters: mapping first, then the mirror,
-> then SIMD kernels on top of it.
+> **Measured, and one idea deliberately sequenced.** A dense one-byte-per-slot
+> status mirror held only in RAM was prototyped before the mapping landed and
+> **reverted**: back then a full scan was lost in the noise of the ~600 ms open,
+> and the mirror's rebuild pass made every open ~100 ms *slower*. The mapping
+> changed the economics — scans are now the dominant cost — but it also rules
+> out the RAM-only version, because rebuilding the mirror at open would fault
+> the whole file and give back the win. Hence the persisted variant above.
 
 ### v1.5 — Make reads fast at scale (indexing & scans)
 
@@ -870,5 +919,6 @@ src/
   data.inc      ; strings, globals, buffers, kernel32 import table (Windows)
 ```
 
-The store itself is **not** in the exe — it is the 1 GiB `VirtualAlloc` / `mmap`
-region loaded from `<db>.dat` at startup.
+The store itself is **not** in the exe — it is the 1 GiB region **mapped
+copy-on-write** from `<db>.dat`, so only the pages actually touched ever become
+resident.

@@ -97,6 +97,7 @@ s_err_open:    db '[ERR] cannot open database file', 13, 10, 0
 s_err_lock:    db '[ERR] database is locked by another process (single-writer)', 13, 10, 0
 s_err_check:   db '[ERR] constraint: id must be >= 1 (0 is reserved)', 13, 10, 0
 s_err_mem:     db '[ERR] out of memory', 13, 10, 0
+s_err_map:     db '[ERR] cannot map the database file into memory', 13, 10, 0
 s_count_pre:   db '[ OK ] ', 0
 s_count_post:  db ' row(s)', 13, 10, 0
 s_find_none:   db '[ OK ] no matching rows', 13, 10, 0

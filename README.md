@@ -323,8 +323,9 @@ pointing at hint/name entries that Windows binds to `kernel32.dll` at load time.
 On **Linux** there is no import table at all: a hand-assembled ELF64 header maps a
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
-the 1 GiB record store is `VirtualAlloc`'d / `mmap`'d at runtime, which is why the
-binaries stay ~24 KB (PE) / ~33 KB (ELF) on disk.
+the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
+which is why the binaries stay ~24 KB (PE) / ~33 KB (ELF) on disk — and why a
+million-row database needs only a few MB of RAM.
 
 #### The record store — four cache lines per row
 
@@ -630,21 +631,35 @@ Two documents, deliberately kept in separate lanes:
 | **CRUD + transactions** | ✅ `INSERT`/`SELECT`/`UPDATE`/`DELETE`/`TRUNCATE`/`COUNT`, `BEGIN`/`COMMIT`/`ROLLBACK`, `FIND`, `RANGE` |
 | **Durability** | ✅ WAL with two-phase flush, **CRC-32 per frame**, idempotent crash recovery |
 | **Safety** | ✅ every read/write/flush checked; a failed durable write aborts instead of acknowledging; a corrupt or foreign `.dat` is refused, never silently recreated |
+| **Startup & memory** | ✅ the store is **mapped copy-on-write**: opening a database is ~80 ms whatever its size (was ~600 ms), and a 1 M-row database peaks at **~5 MB** of RAM (was ~1 029 MB) |
 | **Portability** | ✅ Windows PE64 + Linux ELF64 from one source, behind a thin `os_*` layer |
 | **Integration** | ✅ MCP server (generic CRUD tools) + Python / C# / C stdio clients |
 | **Tests** | ✅ 61 checks per platform in CI, incl. fault-injected I/O failures |
-| **Next up** | 🔜 **lazy `.dat` mapping** (see below), then incremental checkpoint, secondary indexes, SIMD scans |
+| **Next up** | 🔜 **persisted status directory** (see below), then incremental checkpoint, secondary indexes, SIMD scans |
 
-**The next bottleneck is measured, not guessed.** Opening a database costs
-**~600 ms regardless of its size** — 0 rows, 1 000 rows and 1 000 000 rows all
-measure the same, because `db_open` commits and reads the *entire* 1 GiB slot
-region up front even though the file is sparse and mostly holes. That fixed cost
-dwarfs every query: a full `SELECT *` scan on top of it is barely measurable.
-So the next engine milestone is to **map the `.dat` copy-on-write instead of
-allocating and reading it eagerly**, which makes open O(1) and memory
-proportional to the data actually touched — with the durability model unchanged,
-because a private mapping keeps uncommitted changes out of the file. Details in
-[§12 Roadmap](docs/ENGINE.md#12-roadmap).
+**The roadmap is driven by measurement, not intuition.** The last milestone came
+from noticing that opening a database cost **~600 ms regardless of its
+contents** — 0 rows, 1 000 rows and 1 000 000 rows all measured the same,
+because `db_open` committed and read the *entire* 1 GiB slot region even though
+the file is sparse and mostly holes. Mapping the file **copy-on-write** instead
+fixed it at the root:
+
+| 1 000 000 rows | before | after |
+|---|--:|--:|
+| open + `COUNT` | 684 ms | **104 ms** |
+| peak memory | 1 029 MB | **5 MB** |
+| `BENCH` in-RAM insert | 11.8 M rows/s | 11.7 M rows/s (unchanged) |
+
+Durability was deliberately left alone: a *private* mapping keeps uncommitted
+writes out of the file, so the WAL protocol still owns every byte that reaches
+disk. The 200× memory drop is also what makes the one-container-per-instance
+model in [`docs/SAAS.md`](docs/SAAS.md) realistic.
+
+**And the honest cost:** a full-table scan (`SELECT *`, `FIND`) now faults the
+region in rather than walking already-resident RAM — about **26 % slower** on a
+full `FIND`, more on a sparsely populated table. That is the next item: a
+**persisted dense status directory** so a scan streams a few MiB instead of
+touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 
 ## Project layout
 

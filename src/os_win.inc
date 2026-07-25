@@ -306,6 +306,67 @@ os_set_sparse:
     pop  rbp
     ret
 
+; os_filesize(rcx = handle) -> rax = size in bytes, or -1 on failure
+os_filesize:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    lea  rdx, [rel g_fsize]
+    call [rel iat_GetFileSizeEx]
+    test eax, eax
+    jz   .fail
+    mov  rax, [rel g_fsize]
+    jmp  .done
+.fail:
+    mov  rax, -1
+.done:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; os_map_cow(rcx = handle, rdx = size) -> rax = base address, or 0 on failure
+;   Maps the file COPY-ON-WRITE: reads fault in from the file, writes go to
+;   private pages that never reach it. That is what lets the store be "loaded"
+;   in O(1) while leaving the durability model alone - the file is still only
+;   ever changed by the explicit write_at/fsync paths.
+os_map_cow:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50
+    mov  [rbp-8], rbx
+    mov  rbx, rdx                    ; size (kept across both calls)
+    ; CreateFileMappingA(hFile, NULL, PAGE_WRITECOPY, sizeHigh, sizeLow, NULL)
+    xor  rdx, rdx                    ; lpAttributes
+    mov  r8d, PAGE_WRITECOPY
+    mov  r9, rbx
+    shr  r9, 32                      ; dwMaximumSizeHigh
+    mov  eax, ebx                    ; dwMaximumSizeLow
+    mov  [rsp+0x20], eax
+    mov  qword [rsp+0x28], 0         ; lpName
+    call [rel iat_CreateFileMappingA]
+    test rax, rax
+    jz   .fail
+    mov  [rbp-24], rax               ; section handle
+    ; MapViewOfFile(hMap, FILE_MAP_COPY, 0, 0, size)
+    mov  rcx, rax
+    mov  edx, FILE_MAP_COPY
+    xor  r8, r8                      ; offset high
+    xor  r9, r9                      ; offset low
+    mov  [rsp+0x20], rbx             ; dwNumberOfBytesToMap
+    call [rel iat_MapViewOfFile]
+    mov  [rbp-32], rax               ; view (0 on failure)
+    mov  rcx, [rbp-24]
+    call [rel iat_CloseHandle]       ; the view keeps the section alive
+    mov  rax, [rbp-32]
+    jmp  .done
+.fail:
+    xor  rax, rax
+.done:
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; os_close(rcx = handle)
 os_close:
     push rbp
@@ -427,6 +488,7 @@ g_conmode:     dd 0
                 align 8
 g_ft:          dq 0
 g_perfbuf:     dq 0
+g_fsize:       dq 0
 g_dir_handle:  dq 0
 g_dir_first:   dq 0
 
@@ -464,6 +526,9 @@ iat_QueryPerformanceFrequency: dq RVA(h_QueryPerformanceFrequency)
 iat_GetSystemTimeAsFileTime:   dq RVA(h_GetSystemTimeAsFileTime)
 iat_GetLastError:      dq RVA(h_GetLastError)
 iat_DeviceIoControl:   dq RVA(h_DeviceIoControl)
+iat_GetFileSizeEx:     dq RVA(h_GetFileSizeEx)
+iat_CreateFileMappingA: dq RVA(h_CreateFileMappingA)
+iat_MapViewOfFile:     dq RVA(h_MapViewOfFile)
                        dq 0
 
 dll_name: db 'kernel32.dll', 0
@@ -531,3 +596,12 @@ h_GetLastError:      dw 0
                 align 2
 h_DeviceIoControl:   dw 0
     db 'DeviceIoControl', 0
+                align 2
+h_GetFileSizeEx:     dw 0
+    db 'GetFileSizeEx', 0
+                align 2
+h_CreateFileMappingA: dw 0
+    db 'CreateFileMappingA', 0
+                align 2
+h_MapViewOfFile:     dw 0
+    db 'MapViewOfFile', 0

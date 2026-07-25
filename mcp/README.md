@@ -31,10 +31,11 @@ flowchart LR
     class FILES store
 ```
 
-The server keeps **one long-lived `asmdb.exe` process** for the whole session,
-so the 1 GiB record region is read from disk once at startup; every tool call
-is then an in-memory hash lookup plus a small durable write. When the MCP client
-disconnects, the server shuts the engine down cleanly (no orphaned process).
+The server keeps **one long-lived `asmdb` process** for the whole session, and
+the record region is **mapped copy-on-write**, so startup is immediate and only
+the pages actually touched become resident; every tool call is then an in-memory
+hash lookup plus a small durable write. When the MCP client disconnects, the
+server shuts the engine down cleanly (no orphaned process).
 
 ## Addressing rows: `id` or `key`
 

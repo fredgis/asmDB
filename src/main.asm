@@ -102,9 +102,8 @@ entry:
     mov  ecx, LINE_MAX
     call valloc_req
     mov  [rel g_linebuf], rax
-    mov  rcx, CAPACITY*REC_SIZE
-    call valloc_req
-    mov  [rel g_table], rax
+    ; g_table is NOT allocated here: db_open maps the .dat copy-on-write, so the
+    ; store costs address space rather than 1 GiB of committed, zeroed memory.
     mov  rcx, UNDO_MAX*UNDO_ENTRY
     call valloc_req
     mov  [rel g_undo], rax
