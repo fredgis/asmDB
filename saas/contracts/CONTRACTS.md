@@ -47,10 +47,67 @@ Base: `https://<controlplane-host>/api/v1`. All JSON. All errors use §5.
 ### `GET /databases/{id}` → the object without `token`
 ### `DELETE /databases/{id}` → **204**, idempotent (deleting a gone instance is 204)
 
+### `POST /databases/{id}/exec`
+
+Runs one raw engine command on behalf of the browser terminal and returns the
+engine's own output. The browser cannot reach an instance directly — the
+platform is a private network with APIM as the only public front door — so the
+control plane proxies.
+
+Authenticated with the **instance** access token, not an Entra token: this is
+the one control-plane route that speaks the data plane's credential.
+
+```json
+{ "command": "SELECT *" }
+```
+
+**200**
+```json
+{ "output": ["+------+---------+", "| id   | tag     |", "…"], "ok": true }
+```
+
+`ok` is `false` when the engine answered `[ERR]`. That is still **200** — an
+engine error is a normal thing to print in a terminal, not a transport failure.
+Reserve status codes for transport: `401` bad token, `404` no such instance,
+`400` malformed body, `502` instance unreachable, `504` instance timed out.
+
+The client timeout must exceed 20 s: `free` and `standard` scale to zero, so
+the first command after an idle period waits for a cold start.
+
 ### Instance states
 
 `provisioning` → `running` → `stopped` → `deleting` → *(gone)*.
 `failed` is terminal and carries `error`.
+
+---
+
+## 2b. Who may call the control plane
+
+Two credentials, never interchangeable.
+
+| Routes | Credential |
+|---|---|
+| `POST`/`GET`/`DELETE /databases` | **Microsoft Entra ID** access token |
+| `POST /databases/{id}/exec` | the **instance** access token |
+| `GET /healthz`, `GET /config`, the static site | none |
+
+Management is gated on Entra sign-in. The token must be a **v2 access token**
+for `api://<client-id>/console.access`, verified against the tenant's JWKS —
+signature, issuer, audience and expiry — and its `groups` claim must contain the
+object id of the security group **`ASMDB_ADMIN`**. A valid token from a user
+outside that group is **403**, not 401: the caller is authenticated, just not
+allowed.
+
+An ID token is not accepted in place of an access token, and a payload is never
+trusted without verifying the signature.
+
+`GET /config` returns `{"tenantId","clientId","scope"}` so the browser can
+configure itself. Those three are public values in any SPA. The flow is
+authorization-code with PKCE, so **there is no client secret anywhere** — not in
+the image, not in the repository, not in an app setting.
+
+Configuration arrives as `ASMDB_ENTRA_TENANT_ID`, `ASMDB_ENTRA_CLIENT_ID` and
+`ASMDB_ENTRA_GROUP_ID`. If they are absent the management API fails closed.
 
 ---
 
@@ -70,9 +127,32 @@ Base: the instance `endpoint`. **Every route requires** `Authorization: Bearer <
 | `GET /v1/find?q=&limit=&offset=` | — | same shape as `/v1/rows` |
 | `GET /v1/range?lo=&hi=&limit=&offset=` | — | same shape as `/v1/rows` |
 | `POST /v1/verify` | — | `200 {"ok":<bool>,"detail":"<engine output>"}` |
+| `POST /v1/exec` | `{"command":"<one line>"}` | `200 {"output":[<lines>],"ok":<bool>}` |
 | `POST /mcp` | MCP streamable-HTTP | the MCP session |
 
 `limit` default 100, max 1000. `offset` default 0.
+
+### `/v1/exec` — the terminal's route
+
+Everything else here parses the engine's machine format. `/v1/exec` is the one
+route that returns what a human would see, so it switches the engine to
+`FORMAT TABLE`, runs the command, and switches back to `FORMAT TSV` — all three
+under a single hold of the engine lock, and the restore runs even when the
+command failed. Leaving the engine in TABLE mode would make every later reply on
+every other route parse as TSV against a table: silent corruption of the whole
+data API.
+
+Refused before reaching the engine:
+
+- a command containing `CR` or `LF` — one request is one command. Two commands
+  produce two `[ OK ]` terminators and desynchronise the reader for every
+  request that follows.
+- `EXIT` and `QUIT` — they stop the engine process. A terminal session is not an
+  engine session; there is nothing to exit.
+- anything over 511 bytes.
+
+Everything else the engine accepts is allowed. It is the customer's own
+database.
 
 ### Row
 
