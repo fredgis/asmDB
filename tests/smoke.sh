@@ -316,5 +316,123 @@ else
     echo "  [SKIP] upgrade checks (python3 not found)"
 fi
 
+# ---------------------------------------------------------------------------
+# Run 15: change data capture
+# ---------------------------------------------------------------------------
+dump="$root/tests/cdc_dump.py"
+if command -v python3 >/dev/null 2>&1; then
+    # 15a shape of the log: one event per row per transaction, FINAL image;
+    #     a rollback contributes nothing
+    printf '%s\n' 'INSERT 1 100 alpha premiere' 'INSERT 2 200 beta deuxieme' \
+        'UPDATE 1 111 alpha modifiee' 'DELETE 2' \
+        'BEGIN' 'INSERT 3 300 gamma dans txn' 'UPDATE 3 333 gamma encore' 'COMMIT' \
+        'BEGIN' 'INSERT 4 400 delta annulee' 'ROLLBACK' 'EXIT' | ./asmdb cdc1 > /dev/null
+    if python3 "$dump" cdc1.cdc --quiet >/dev/null 2>&1; then
+        echo "  [PASS] CDC log validates"
+    else
+        echo "  [FAIL] CDC log validates"; fail=$((fail+1))
+    fi
+    c1="$(python3 "$dump" cdc1.cdc)"
+    check 'CDC one frame per commit'  'frames=5'                              "$c1"
+    check 'CDC update -> single UPSERT with final image' 'UPSERT id=1 value=111' "$c1"
+    check 'CDC delete -> DELETE event'                   'DELETE id=2'          "$c1"
+    check 'CDC txn collapses to one final UPSERT'        'UPSERT id=3 value=333' "$c1"
+    check 'CDC rollback emits nothing'                   '!id=4'                "$c1"
+
+    # 15b a transaction that ends where it started produces no frame at all
+    printf '%s\n' 'BEGIN' 'INSERT 9 900 x ephemere' 'DELETE 9' 'COMMIT' 'EXIT' | ./asmdb cdc1 > /dev/null
+    check 'CDC insert+delete in one txn is a no-op' 'last_seq=5' "$(python3 "$dump" cdc1.cdc --quiet)"
+
+    # 15c the sequence keeps climbing across restarts
+    printf '%s\n' 'INSERT 10 10 z apres redemarrage' 'EXIT' | ./asmdb cdc1 > /dev/null
+    check 'CDC sequence survives a restart' 'last_seq=6' "$(python3 "$dump" cdc1.cdc --quiet)"
+
+    # 15d the three whole-table operations are ONE reset each
+    printf '%s\n' 'INSERT 1 1 a un' 'INSERT 2 2 b deux' 'BACKUP snap2.bak' \
+        'TRUNCATE' 'RESTORE snap2.bak' 'BENCH 1000' 'EXIT' | ./asmdb cdc2 > /dev/null
+    if python3 "$dump" cdc2.cdc --expect-frames 5 --quiet >/dev/null 2>&1; then
+        echo "  [PASS] CDC BENCH is one frame, not 1000"
+    else
+        echo "  [FAIL] CDC BENCH is one frame, not 1000"; fail=$((fail+1))
+    fi
+    nres="$(python3 "$dump" cdc2.cdc | grep -c 'RESET' || true)"
+    if [[ "$nres" == "3" ]]; then
+        echo "  [PASS] CDC three global ops -> three RESETs"
+    else
+        echo "  [FAIL] CDC three global ops -> three RESETs (got $nres)"; fail=$((fail+1))
+    fi
+
+    # 15e torn tail trimmed on open; a COMPLETE frame with a bad checksum is
+    #     corruption: refuse and keep the log
+    before="$(stat -c%s cdc1.cdc)"
+    head -c 40 /dev/zero >> cdc1.cdc
+    printf '%s\n' 'COUNT' 'EXIT' | ./asmdb cdc1 > /dev/null 2>&1
+    if [[ "$(stat -c%s cdc1.cdc)" == "$before" ]]; then
+        echo "  [PASS] CDC torn tail is trimmed"
+    else
+        echo "  [FAIL] CDC torn tail is trimmed"; fail=$((fail+1))
+    fi
+    printf '\xFF' | dd of=cdc1.cdc bs=1 seek=60 conv=notrunc status=none
+    bad_size="$(stat -c%s cdc1.cdc)"
+    r15="$(printf '%s\n' 'COUNT' 'EXIT' | ./asmdb cdc1 2>&1)"; rc=$?
+    check 'CDC bad checksum refused' 'checksum'                               "$r15"
+    if [[ $rc -ne 0 && "$(stat -c%s cdc1.cdc)" == "$bad_size" ]]; then
+        echo "  [PASS] CDC bad checksum kept log"
+    else
+        echo "  [FAIL] CDC bad checksum kept log"; fail=$((fail+1))
+    fi
+
+    # 15f snapshot + watermark: BACKUP carries last_commit_seq, a consumer
+    #     resumes from the frames after it
+    printf '%s\n' 'INSERT 1 1 a un' 'INSERT 2 2 b deux' 'BACKUP wm.bak' \
+        'INSERT 3 3 c trois' 'INSERT 4 4 d quatre' 'EXIT' | ./asmdb cdc3 > /dev/null
+    wm="$(python3 -c "import struct,sys;print(struct.unpack_from('<Q',open('wm.bak','rb').read(128),88)[0])")"
+    if [[ "$wm" == "2" ]]; then
+        echo "  [PASS] BACKUP carries the CDC watermark"
+    else
+        echo "  [FAIL] BACKUP carries the CDC watermark (got $wm)"; fail=$((fail+1))
+    fi
+    nresume="$(python3 "$dump" cdc3.cdc --from-seq "$wm" | grep -c '^Frame' || true)"
+    if [[ "$nresume" == "2" ]]; then
+        echo "  [PASS] resume from watermark yields exactly the new rows"
+    else
+        echo "  [FAIL] resume from watermark yields exactly the new rows (got $nresume)"; fail=$((fail+1))
+    fi
+
+    # 15g crash between the WAL commit and the change frame: recovery owes the
+    #     log exactly one frame
+    if command -v nasm >/dev/null 2>&1; then
+        ( cd "$root/src" && nasm -f bin -dLINUX -dFAULT_CDC main.asm -o "$work/nocdc" )
+        chmod +x "$work/nocdc"
+        printf '%s\n' 'INSERT 1 100 a premiere' 'EXIT' | ./asmdb crash1 > /dev/null
+        printf '%s\n' 'INSERT 2 200 b deuxieme' 'EXIT' | ./nocdc crash1 > /dev/null 2>&1
+        check 'crash before the frame leaves it missing' 'frames=1' "$(python3 "$dump" crash1.cdc --quiet)"
+        printf '%s\n' 'COUNT' 'EXIT' | ./asmdb crash1 > /dev/null
+        check 'recovery publishes the missing frame' 'frames=2 last_seq=2' "$(python3 "$dump" crash1.cdc --quiet)"
+        printf '%s\n' 'COUNT' 'EXIT' | ./asmdb crash1 > /dev/null
+        check 'recovery never duplicates a frame' 'frames=2 last_seq=2' "$(python3 "$dump" crash1.cdc --quiet)"
+
+        # 15h crash mid-RESET: exactly one RESET after recovery, however often
+        for n in 2 3 4; do
+            ( cd "$root/src" && nasm -f bin -dLINUX -dFAULT_INJECT=$n main.asm -o "$work/fr$n" )
+            chmod +x "$work/fr$n"
+            printf '%s\n' 'INSERT 1 1 a un' 'INSERT 2 2 b deux' 'EXIT' | ./asmdb "rst$n" > /dev/null
+            printf '%s\n' 'TRUNCATE' 'EXIT' | "./fr$n" "rst$n" > /dev/null 2>&1
+            printf '%s\n' 'COUNT' 'EXIT' | ./asmdb "rst$n" > /dev/null
+            printf '%s\n' 'COUNT' 'EXIT' | ./asmdb "rst$n" > /dev/null
+            nr="$(python3 "$dump" "rst$n.cdc" | grep -c 'RESET' || true)"
+            if [[ "$nr" == "1" ]]; then
+                echo "  [PASS] RESET survives a crash at write #$n (exactly one)"
+            else
+                echo "  [FAIL] RESET survives a crash at write #$n (got $nr)"; fail=$((fail+1))
+            fi
+        done
+    else
+        echo "  [SKIP] CDC crash checks (nasm not found)"
+    fi
+else
+    echo "  [SKIP] CDC checks (python3 not found)"
+fi
+
 if [[ $fail -gt 0 ]]; then echo; echo "$fail check(s) failed."; exit 1; fi
 echo; echo "All checks passed."
