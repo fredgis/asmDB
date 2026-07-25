@@ -78,6 +78,7 @@ writing a database in assembly.
 - [Connect from your app](#connect-from-your-app-python--c--c)
 - [Engine specification](#engine-specification)
 - [Roadmap & SaaS plan](#roadmap--saas-plan)
+- [Changelog](#changelog) — what changed, newest first
 - [Project layout](#project-layout)
 
 ## Why it's interesting
@@ -660,6 +661,173 @@ region in rather than walking already-resident RAM — about **26 % slower** on 
 full `FIND`, more on a sparsely populated table. That is the next item: a
 **persisted dense status directory** so a scan streams a few MiB instead of
 touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
+
+## Changelog
+
+Newest first. Every entry is collapsed — click one to expand it.
+
+<details>
+<summary><b>Copy-on-write store mapping</b> — open 7–9× faster, 200× less memory <code>867844c</code></summary>
+
+The slot region is no longer a 1 GiB allocation that gets read from disk before
+the first command. It is **mapped copy-on-write** from the `.dat`
+(`CreateFileMapping(PAGE_WRITECOPY)` + `MapViewOfFile(FILE_MAP_COPY)` on Windows,
+`mmap(MAP_PRIVATE)` on Linux) behind two new primitives, `os_map_cow` and
+`os_filesize`.
+
+| 1 000 000 rows | before | after |
+|---|--:|--:|
+| open + `COUNT` | 684 ms | **104 ms** |
+| peak working set | 1 029 MB | **5 MB** |
+| `BENCH` in-RAM insert | 11.8 M rows/s | 11.7 M rows/s (unchanged) |
+
+Opening a brand-new database went from 575 ms to 72 ms, and open time no longer
+depends on the database's contents at all.
+
+- **Durability is untouched.** The mapping is *private*, so writes to the store
+  never reach the file: the `.dat` still changes only through the explicit
+  `write_at`/`fsync` paths. A *shared* mapping would have broken the WAL
+  contract, since the OS could flush an uncommitted page at any moment.
+- The mapping is created **after** `wal_recover`, because recovery writes to the
+  file directly and a private mapping is not guaranteed to see writes made
+  afterwards.
+- Truncation detection moved to an explicit `os_filesize` check — cheaper than
+  reading 1 GiB to see if it came up short, and necessary because
+  `CreateFileMapping` would otherwise silently grow a truncated file to fit.
+- **Known cost:** a full scan (`SELECT *`, `FIND`, `RANGE`, `TRUNCATE`) now
+  faults the region in, ≈26 % slower on a full `FIND`. The fix — a *persisted*
+  status directory — is the next roadmap item.
+
+All 61 checks passed unchanged, which is the signal that mattered for a change
+this deep in the storage path.
+</details>
+
+<details>
+<summary><b>WAL frame checksums, a tested abort path, better open diagnostics</b> <code>09946f2</code></summary>
+
+- **CRC-32 on every WAL frame.** Table-driven CRC-32 (IEEE, reflected, poly
+  `0xEDB88320`) built once at startup and verified byte-for-byte against
+  `zlib.crc32`. The checksum is written and flushed in the *same* operation as
+  the `COMMIT01` marker, so a frame can never be committed without one. Frame
+  magic is now `ASMWAL02`; legacy `ASMWAL01` frames still replay, so upgrading a
+  binary never discards an already-acknowledged transaction.
+- A committed frame whose bytes no longer match its checksum is **neither
+  replayed** (corrupt rows) **nor discarded** (silent loss of an acknowledged
+  transaction): the engine refuses to open, keeps the `.wal`, and prints the two
+  ways out.
+- **The abort path is now actually tested.** A `%ifdef FAULT_INJECT` hook makes
+  the *n*-th durable write fail, simulating `ENOSPC`. It contributes zero bytes
+  to the shipping binary. The tests assert the engine aborts, says why, does
+  *not* print `transaction committed`, and leaves a committed WAL that a normal
+  binary then replays — which also proves the writer's CRC is the one the reader
+  expects.
+- **Open-time diagnostics.** `[ERR] incompatible database format` now names the
+  file and prints this build's version / record size / capacity next to the
+  file's, then says what to do. Read failures get their own message instead of
+  claiming a durable write failed.
+- Dropped the conservative `TRUNCATE` admission check, which double-counted rows
+  the transaction had already captured and could refuse truncates that fit.
+</details>
+
+<details>
+<summary><b>I/O error propagation, file validation, undo de-duplication</b> <code>3996800</code></summary>
+
+A reliability pass over the whole engine. No new features, no schema change,
+no new dependencies.
+
+- **I/O errors propagate.** `os_pread`/`os_pwrite` return `-1` on error; Windows
+  now checks the seek *and* the transfer and clears the byte counter first (it
+  could return a stale count from a previous call). A zero-byte write counts as
+  a failure. Durable paths abort via `io_fatal` instead of acknowledging — the
+  engine never prints `[ OK ]` after a failed write.
+- **Undo captures are de-duplicated.** A slot is captured at most once per
+  transaction, keeping the first pre-image. The 4096-entry limit now bounds
+  *distinct rows*, not statements: rewriting one row 5 000 times used to fail at
+  write 4 097, and `ROLLBACK` now restores the original image rather than an
+  intermediate one.
+- **An invalid `.dat` is never silently reinitialized.** Only a 0-byte file
+  creates a new database; a partial header, bad magic, mismatched
+  version/record-size/capacity, `count > CAPACITY`, or a truncated slot region
+  are each refused with a distinct message, leaving the file untouched.
+- **`BACKUP`/`RESTORE` hardened.** `BACKUP` checks every write and the final
+  flush. `RESTORE` validates the snapshot completely — including a probe of the
+  *last* byte of the record region — **before** overwriting a single byte of the
+  live table. `BENCH` is now refused inside a transaction.
+- Found while auditing: `parse_u64` silently wrapped (`18446744073709551617`
+  parsed as id 1); `TRUNCATE` inside a transaction could leave the table
+  half-cleared; `wal_recover` did not bound entry slot indices, so a corrupt
+  frame could write at an arbitrary file offset; `io_fatal` was reached by
+  `jcc` with a misaligned stack and crashed instead of exiting 1; the path that
+  *creates* the `.dat` did not load the slot region, so rows replayed from a WAL
+  predating the file were counted but not visible; and `make_wal.py` still used
+  the old 64-byte record layout, meaning WAL recovery was effectively untested.
+- Tests grew from 20 to 61 checks per platform.
+</details>
+
+<details>
+<summary><b>Linux ELF64 port, <code>TRUNCATE</code>, and the stdin BOM fixes</b> <code>09ce053</code> · <code>8598a1f</code> · <code>0ddaf12</code> · <code>4c52647</code></summary>
+
+- **Linux ELF64 port.** A hand-built ELF header and a raw-`syscall` backend sit
+  behind a thin `os_*` platform layer, so one source builds both a Windows PE64
+  and a Linux ELF64. CI runs the ELF natively on Ubuntu.
+- **`TRUNCATE`** command, transaction-aware.
+- **Fixed partial-I/O data loss.** A single `ReadFile`/`pread` is not guaranteed
+  to transfer a large request, and the 1 GiB region routinely came back short —
+  which silently dropped records whose slot lived past the prefix. Both paths
+  now loop.
+- **Fixed piped-stdin corruption on Windows CI.** pwsh prepends a UTF-8 BOM to
+  the first piped line, and writes it as a *separate* pipe write, so the first
+  `ReadFile` returned only the 3 BOM bytes. The reader skips a leading BOM once
+  and retries when that empties the buffer.
+</details>
+
+<details>
+<summary><b>Transactional-database principles, 2M-row scale, SaaS repositioning</b> <code>4493be7</code> · <code>7061530</code> · <code>7993439</code></summary>
+
+- Repositioned asmdb as a **general-purpose transactional database** that
+  happens to expose an MCP server — agent memory is one example workload, not
+  the product.
+- Implemented the transactional-database principles in assembly (all but
+  security & observability, which belong to the hosted layer): `BACKUP`/
+  `RESTORE`, an exclusive single-writer lock, a `RANGE` access path, and an
+  `id ≥ 1` CHECK constraint. Added the coverage table.
+- **Scaled to 2M rows**: capacity raised to `2^22` slots (a 1 GiB region) on a
+  **sparse** `.dat`, so an empty database still costs kilobytes.
+- Rewrote the SaaS plan around **one micro-container per instance**, and added
+  the web-app connectivity guide. Every diagram is now coloured Mermaid.
+</details>
+
+<details>
+<summary><b>MCP server, agent-memory schema, engine spec &amp; SaaS plan</b> <code>d97bbe2</code> · <code>f6352e7</code></summary>
+
+- **MCP server** (Node) exposing the engine as a set of generic CRUD tools, plus
+  Python / C# / C stdio client examples.
+- Reworked the record into a general 256-byte shape: numeric `value`, automatic
+  `created`/`updated` timestamps, a short `tag`, and free-text `content`.
+- Wrote **`docs/ENGINE.md`**, the byte-level technical specification, and
+  **`docs/SAAS.md`**, the productization plan.
+- Code audit with all recommendations applied.
+</details>
+
+<details>
+<summary><b>Benchmarks, catalog commands, and the visual identity</b> <code>bc9237a</code> · <code>afd9293</code> · <code>cd866ed</code></summary>
+
+- **`BENCH`** command timing the engine from the inside with
+  `QueryPerformanceCounter`, plus a harness that compares the same workloads
+  against SQLite.
+- Catalog commands: `SCHEMA`, `TYPES`, `TABLES`, `DATABASES`.
+- CLI polish, generated logo/icon/banner, terminal screenshot, and the rewritten
+  README with engine internals.
+</details>
+
+<details>
+<summary><b>The engine itself</b> <code>e594842</code></summary>
+
+The first working database: PE64 emitted by NASM alone (no linker, no CRT), a
+REPL over stdin/stdout with ASCII-art presentation, an open-addressing hash
+store over fixed 256-byte records, disk persistence, a write-ahead log with
+`BEGIN`/`COMMIT`/`ROLLBACK`, and idempotent crash recovery at startup.
+</details>
 
 ## Project layout
 
