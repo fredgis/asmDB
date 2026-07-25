@@ -44,7 +44,7 @@ Rules that apply everywhere:
 - Extra whitespace between tokens is ignored. A leading UTF-8 BOM on the stream
   is skipped, so piping from any shell/editor is safe.
 - Colors are emitted only when `stdin` **and** `stdout` are both a terminal; when
-  either is redirected (a pipe, a file, CI) the output is plain ASCII.
+  either is redirected (a pipe, a file, any non-TTY consumer) the output is plain ASCII.
 - Numbers must end on a token boundary: `DELETE 42junk` is a syntax error, not a
   deletion of row 42. An input line longer than 511 bytes is refused rather than
   truncated and executed.

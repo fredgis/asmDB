@@ -10,7 +10,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exe="$root/build/asmdb"
 
 if [[ "${1:-}" != "--no-build" || ! -x "$exe" ]]; then
-    "$root/build.sh"
+    "$root/scripts/build.sh"
 fi
 [[ -x "$exe" ]] || { echo "asmdb not found at $exe" >&2; exit 1; }
 

@@ -45,7 +45,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $exe  = Join-Path $root 'build\asmdb.exe'
 if (-not (Test-Path $exe)) {
     Write-Host '>> building asmdb.exe ...' -ForegroundColor Cyan
-    & powershell -ExecutionPolicy Bypass -File (Join-Path $root 'build.ps1') | Out-Host
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\build.ps1') | Out-Host
 }
 if (-not (Test-Path $exe)) { throw "asmdb.exe not found at $exe - build it first." }
 if ($BatchSize -gt 4096) { $BatchSize = 4096 }   # UNDO_MAX

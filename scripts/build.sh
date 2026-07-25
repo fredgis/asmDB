@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# build.sh - Build asmdb for Linux with NASM alone (no linker, no CRT).
+# scripts/build.sh - Build asmdb for Linux with NASM alone (no linker, no CRT).
 #
-#   ./build.sh          # assemble src/main.asm -> build/asmdb  (hand-built ELF64)
-#   ./build.sh --run    # build then run
+#   ./scripts/build.sh          # assemble src/main.asm -> build/asmdb  (hand-built ELF64)
+#   ./scripts/build.sh --run    # build then run
 #
-# The Windows PE64 is built with build.ps1; this script cross-assembles the
+# The Windows PE64 is built with scripts/build.ps1; this script cross-assembles the
 # ELF64 image by defining LINUX (main.asm then includes elf.inc + os_linux.inc).
 set -euo pipefail
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 nasm="${NASM:-nasm}"
 command -v "$nasm" >/dev/null 2>&1 || {
     echo "nasm not found. Install with: sudo apt-get install -y nasm" >&2

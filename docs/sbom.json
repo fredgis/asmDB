@@ -14,10 +14,6 @@
       {
         "name": "source.mcp.lockfile",
         "value": "mcp/package-lock.json"
-      },
-      {
-        "name": "source.ci.workflow",
-        "value": ".github/workflows/ci.yml"
       }
     ]
   },
@@ -42,8 +38,8 @@
           "value": "not pinned"
         },
         {
-          "name": "ci.nasm.source",
-          "value": "ubuntu apt package and Windows choco package"
+          "name": "build.tool.source",
+          "value": "local developer or test machine installation"
         },
         {
           "name": "third.party.runtime.dependencies",

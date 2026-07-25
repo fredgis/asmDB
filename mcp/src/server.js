@@ -39,8 +39,8 @@ if (!existsSync(EXE)) {
   console.error(`[asmdb-mcp] engine not found at ${EXE}`);
   const buildHint =
     platform() === "win32"
-      ? "build it first: powershell -ExecutionPolicy Bypass -File build.ps1"
-      : "build it first from the repository root (for example: ./build.sh or make)";
+      ? "build it first: powershell -ExecutionPolicy Bypass -File .\\scripts\\build.ps1"
+      : "build it first from the repository root (for example: ./scripts/build.sh or make)";
   console.error(`[asmdb-mcp] ${buildHint}`);
   process.exit(1);
 }

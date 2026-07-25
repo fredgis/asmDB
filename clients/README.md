@@ -43,7 +43,7 @@ returns to the human-readable table format.
 | C#       | [`csharp/AsmdbClient.cs`](csharp/AsmdbClient.cs)   | `ProcessStartInfo.ArgumentList` with redirected stdio |
 | C        | [`c/asmdb_client.c`](c/asmdb_client.c)             | `CreateProcess` on Windows, `fork`/`execv` on POSIX; no shell |
 
-Build the engine first (`.\build.ps1` on Windows or `./build.sh` on Linux).
+Build the engine first (`.\scripts\build.ps1` on Windows or `./scripts/build.sh` on Linux).
 
 ### Python
 

@@ -56,7 +56,7 @@ Four consequences worth stating plainly before designing anything:
    orders has two instances, and keeping them consistent is a saga or a
    coordinator in the control plane — a decision to take early, not after.
 4. **Security is entirely the service layer's.** The engine has no notion of a
-   user. See [`SECURITY.md`](../SECURITY.md) for the engine's actual threat
+   user. See [`SECURITY.md`](SECURITY.md) for the engine's actual threat
    model — it is short, and that is the point.
 
 ---
@@ -677,7 +677,7 @@ flowchart TB
         C1 --> C2 --> C3 --> C4 --> C5
     end
 
-    G0{{"GATE 0<br/>contracts frozen, CI green"}}:::gate
+    G0{{"GATE 0<br/>contracts frozen, local checks pass"}}:::gate
 
     subgraph W1["WAVE 1 — A LIVE INSTANCE (3 agents in parallel)"]
         direction LR
@@ -730,7 +730,7 @@ and one deliverable, and is **done** only when its column-3 test passes.
 |---|---|---|---|
 | **A** data plane | `saas/sidecar/` | supervises one `asmdb` process; HTTP + engine protocol; spawns `--reader` sessions for reads; emits usage events; health and readiness | a container serves CRUD over HTTP, survives an engine crash, and reports the right row after a restart |
 | **C** provisioner | `saas/provisioner/` | instance lifecycle API and state machine; `instance_id → endpoint`; hibernate/resume | create → use → hibernate → resume → destroy, driven only through the API, with state reconciled after a control-plane restart |
-| **I** platform | `saas/infra/` | Bicep modules, container registry, cluster, environments, CI/CD | one command builds the image and rolls a change to dev; `main` deploys automatically |
+| **I** platform | `saas/infra/` | Bicep modules, container registry, cluster, environments, deployment scripts | one command builds the image and rolls a change to dev |
 | **B** edge | `saas/gateway/` | TLS termination, API keys then OIDC, per-tenant routing, rate limits, quotas | an unauthenticated call is refused, a tenant cannot reach another tenant's instance, and a quota actually bites |
 | **D** durability | `saas/durability/` | snapshot + `.cdc` shipping to Blob, restore, PITR, backup watermark contract | a deliberately destroyed instance is restored to a point in time, verified by row count **and** `VERIFY` |
 | **F** observability | `saas/observability/` | metrics, traces, structured logs, dashboards, alert rules, runbooks | a fault injected in staging pages a human, and the runbook resolves it |

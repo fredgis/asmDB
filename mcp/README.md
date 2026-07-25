@@ -93,7 +93,7 @@ node src/server.js       # speaks MCP over stdio
 npm test                 # end-to-end test against a scratch database
 ```
 
-Build the engine first (`powershell -ExecutionPolicy Bypass -File build.ps1`
+Build the engine first (`powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1`
 from the repo root on Windows) so `build/asmdb.exe` exists. On non-Windows
 platforms the default executable name is `build/asmdb`.
 

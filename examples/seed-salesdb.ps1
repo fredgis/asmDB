@@ -35,7 +35,7 @@ $exe  = Join-Path $root 'build\asmdb.exe'
 
 if ($Rebuild -or -not (Test-Path $exe)) {
     Write-Host '>> building asmdb.exe ...' -ForegroundColor Cyan
-    & powershell -ExecutionPolicy Bypass -File (Join-Path $root 'build.ps1') | Out-Host
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\build.ps1') | Out-Host
 }
 if (-not (Test-Path $exe)) { throw "asmdb.exe not found at $exe - build it first." }
 

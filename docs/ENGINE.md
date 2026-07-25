@@ -144,9 +144,9 @@ phdr:
 
 Because `p_filesz == p_memsz`, every buffer is **file-initialised** (there is no
 separate `.bss`), which keeps the loader trivial and the ELF fully static. The
-1 GiB record region comes from an `mmap` syscall at startup. `tests/validate_elf.py`
-asserts these invariants in CI, and the smoke suite runs the ELF **natively on
-Ubuntu**.
+1 GiB record region comes from an `mmap` syscall at startup.
+`tests/validate_elf.py` asserts these invariants, and `tests/smoke.sh` runs the
+ELF **natively on Linux**.
 
 ### 2.3 The `os_*` platform layer
 
@@ -193,8 +193,8 @@ callers never see the difference.
 | `os_isatty` | `GetConsoleMode` | `ioctl(TCGETS)` (16) |
 | `os_exit` | `ExitProcess` | `exit_group` (231) |
 
-Build/run helpers live in `build.ps1` (`-Run` launches the REPL; `-Linux`
-cross-emits the ELF) and `build.sh` (native Linux build).
+Build/run helpers live in `scripts/build.ps1` (`-Run` launches the REPL;
+`-Linux` cross-emits the ELF) and `scripts/build.sh` (native Linux build).
 
 ---
 
@@ -884,7 +884,7 @@ recall. This is one workload the record shape suits — not the only one.
 | 15 | `BACKUP`/`RESTORE` snapshot commands | ✅ done |
 | 16 | Single-writer lock + unlimited concurrent snapshot readers | ✅ done |
 | 17 | 1 GiB capacity (`2^22` slots) on **sparse** `.dat`; 2M-row benchmark vs SQLite | ✅ done |
-| 18 | **Linux ELF64 port**: hand-built ELF header + raw-`syscall` backend behind the `os_*` layer; `TRUNCATE` command; CI runs the ELF natively on Ubuntu | ✅ done |
+| 18 | **Linux ELF64 port**: hand-built ELF header + raw-`syscall` backend behind the `os_*` layer; `TRUNCATE` command; the Linux smoke suite runs the ELF natively | ✅ done |
 
 Everything below is **future work** — listed to set direction honestly, not to
 imply it exists. The current engine is a single-table row store with one hash

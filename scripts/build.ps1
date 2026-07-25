@@ -1,9 +1,9 @@
-# build.ps1 - Build asmdb with NASM alone (no linker, no CRT).
+# scripts/build.ps1 - Build asmdb with NASM alone (no linker, no CRT).
 #
-#   .\build.ps1            # build src\main.asm -> build\asmdb.exe  (Windows PE64)
-#   .\build.ps1 -Run       # build then run
-#   .\build.ps1 -Linux     # cross-assemble the Linux ELF64 -> build\asmdb
-#   .\build.ps1 -Poc       # build the poc\hello.asm proof-of-concept instead
+#   .\scripts\build.ps1            # build src\main.asm -> build\asmdb.exe  (Windows PE64)
+#   .\scripts\build.ps1 -Run       # build then run
+#   .\scripts\build.ps1 -Linux     # cross-assemble the Linux ELF64 -> build\asmdb
+#   .\scripts\build.ps1 -Poc       # build the poc\hello.asm proof-of-concept instead
 #
 [CmdletBinding()]
 param(
@@ -13,7 +13,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
+$root = Split-Path -Parent $PSScriptRoot
 
 function Find-Nasm {
     $candidates = @(

@@ -94,8 +94,27 @@ A [`FIND`](docs/COMMANDS.md#find) or
 [`SELECT <id>`](docs/COMMANDS.md#select) is O(1). Full details in
 [Data model & supported types](#data-model--supported-types).
 
+## asmdb Cloud
+
+asmdb Cloud is the same engine run as a managed service, with **asmdb.cloud** as
+the intended public domain. You create a database and get a real isolated asmdb
+instance, reachable through the REST data API, an MCP endpoint for AI agents and
+a CLI. The free, standard and premium tiers are planned to buy latency and
+headroom, not features, because every tier runs the identical engine.
+
+<p align="center">
+  <img src="docs/assets/asmdb-cloud-home.png" alt="asmdb Cloud homepage" width="90%">
+</p>
+
+The service is not generally available yet, and pricing is not set; the site
+intentionally says "pricing at GA". The full design is in
+[`docs/SAAS.md`](docs/SAAS.md): provisioning, instance isolation, the
+HTTP/MCP/CLI access layer, metering, backups, security boundaries, operations
+and the rollout plan.
+
 ## Table of contents
 
+- [asmdb Cloud](#asmdb-cloud) — hosted asmdb instances, API surfaces and service design
 - [What fits, and what is enforced](#what-fits-and-what-is-enforced) — capacity, schema and hard limits
 - [Why it's interesting](#why-its-interesting)
 - [Quickstart](#quickstart)
@@ -140,8 +159,8 @@ A [`FIND`](docs/COMMANDS.md#find) or
 **Windows** — requires x64 + NASM 3.x (`winget install --id NASM.NASM -e`):
 
 ```powershell
-.\build.ps1                 # -> build\asmdb.exe
-.\build.ps1 -Run            # build, then launch the REPL
+.\scripts\build.ps1                 # -> build\asmdb.exe
+.\scripts\build.ps1 -Run            # build, then launch the REPL
 .\build\asmdb.exe SalesDB SalesTransactions
 ```
 
@@ -194,14 +213,14 @@ TTY check — so a `CreateFileW` on Windows and an `openat` syscall on Linux are
 **Linux** — requires NASM + a GNU toolchain (`sudo apt-get install nasm`), then:
 
 ```bash
-./build.sh                        # -> build/asmdb   (hand-built ELF64)
+./scripts/build.sh                # -> build/asmdb   (hand-built ELF64)
 ./build/asmdb SalesDB SalesTransactions
 ```
 
-`build.ps1 -Linux` produces the same ELF from Windows for cross-building. The ELF
-is validated in CI (`tests/validate_elf.py`) and its smoke suite runs **natively
-on Ubuntu** — see [ENGINE.md §11](docs/ENGINE.md) for the ELF layout and the full
-Windows↔Linux syscall mapping.
+`scripts/build.ps1 -Linux` produces the same ELF from Windows for cross-building.
+Validate it with `python tests/validate_elf.py build/asmdb`; run the Linux smoke
+suite with `tests/smoke.sh`. See [ENGINE.md §11](docs/ENGINE.md) for the ELF
+layout and the full Windows↔Linux syscall mapping.
 
 ## Commands
 
@@ -740,7 +759,7 @@ Two documents, deliberately kept in separate lanes:
 | **Machine interface** | ✅ `FORMAT TSV` + `PAGE` — full-fidelity rows, never truncated, for clients that must not parse a picture |
 | **Portability** | ✅ Windows PE64 + Linux ELF64 from one source, behind a thin `os_*` layer |
 | **Integration** | ✅ MCP server (generic CRUD tools) + Python / C# / C stdio clients |
-| **Security** | ⚠️ no auth, no encryption, no audit log; the binary is a single RWX image at a fixed address — see [`SECURITY.md`](SECURITY.md) |
+| **Security** | ⚠️ no auth, no encryption, no audit log; the binary is a single RWX image at a fixed address — see [`docs/SECURITY.md`](docs/SECURITY.md) |
 | **Tests** | ✅ 151 checks on Windows and the same battery on Linux, plus 24 for the MCP server — fault-injected I/O failures, crash windows, format fuzzing |
 | **Next up** | 🔜 **secondary indexes** — a full `FIND` costs ~900 ms whatever the row count, and a status directory was prototyped and measured *worse* on populated tables. Then SIMD scans and multi-writer MVCC |
 
@@ -886,18 +905,18 @@ nothing stored`, matching the rule already applied to over-long input lines. The
 documentation said 40 and 176 throughout; it now says 39 and 175, and the MCP
 server enforces the same numbers.
 
-**A `SECURITY.md` that is honest rather than flattering.** The binary is a single
-segment that is readable, writable *and* executable, loaded at a fixed address
-with no ASLR; the engine has no authentication, no encryption and no audit log;
-CRC32 detects accidental corruption, not an attacker; and `flock` on Linux is
-advisory, so the single-writer guarantee assumes cooperating processes. All of it
-is written down, with a supported-versions table and a disclosure process.
+**A [`docs/SECURITY.md`](docs/SECURITY.md) that is honest rather than
+flattering.** The binary is a single segment that is readable, writable *and*
+executable, loaded at a fixed address with no ASLR; the engine has no
+authentication, no encryption and no audit log; CRC32 detects accidental
+corruption, not an attacker; and `flock` on Linux is advisory, so the
+single-writer guarantee assumes cooperating processes. All of it is written
+down, with a supported-versions table and a disclosure process.
 
-Also: a CycloneDX `sbom.json` covering the three layers (engine — no
+Also: a CycloneDX [`docs/sbom.json`](docs/sbom.json) covering the three layers (engine — no
 dependencies at all, MCP server, tooling) with `docs/SBOM.md` explaining it; a
 dependency-free fuzz harness that corrupts `.dat`, `.wal` and `.cdc` and asserts
-the engine never reports success on damaged input, wired into CI; and a
-least-privilege `permissions:` block on the workflow.
+the engine never reports success on damaged input.
 
 Tests: 143 checks on Windows, the same battery on Linux, 24 for the MCP server.
 
@@ -985,7 +1004,7 @@ simultaneous readers against a live writer.
 <summary><b>1.2.0</b> — machine protocol, integrity checks, and a full external audit</summary>
 
 A 26-point external audit went over the whole project — engine, MCP server,
-example clients, CI and documentation. This release closes the findings that
+example clients, local test scripts and documentation. This release closes the findings that
 could lose or leak data, and adds the two things the audit showed were missing
 outright: a way to read the database without parsing a human table, and a way
 to ask the engine whether its own file still makes sense.
@@ -1068,8 +1087,7 @@ shell, so a quote or a `;` in any field became shell syntax — it now uses
 `ArgumentList` instead of concatenating into a re-parsed string. The Python
 client reads `FORMAT TSV` and picks its executable from the platform.
 
-**CI** runs the MCP suite and a dependency audit, and every third-party action is
-pinned to a commit SHA.
+The MCP suite and dependency audit are run locally; there is no repository CI.
 
 A latent bug found on the way: `u64_to_dec` pushed `rdi` *after* overwriting it,
 so it returned with the caller's register replaced by the output buffer. No
@@ -1318,13 +1336,13 @@ no new dependencies.
 
 - **Linux ELF64 port.** A hand-built ELF header and a raw-`syscall` backend sit
   behind a thin `os_*` platform layer, so one source builds both a Windows PE64
-  and a Linux ELF64. CI runs the ELF natively on Ubuntu.
+  and a Linux ELF64. The Linux smoke suite runs the ELF natively.
 - **`TRUNCATE`** command, transaction-aware.
 - **Fixed partial-I/O data loss.** A single `ReadFile`/`pread` is not guaranteed
   to transfer a large request, and the 1 GiB region routinely came back short —
   which silently dropped records whose slot lived past the prefix. Both paths
   now loop.
-- **Fixed piped-stdin corruption on Windows CI.** pwsh prepends a UTF-8 BOM to
+- **Fixed piped-stdin corruption in PowerShell pipelines.** pwsh prepends a UTF-8 BOM to
   the first piped line, and writes it as a *separate* pipe write, so the first
   `ReadFile` returned only the 3 BOM bytes. The reader skips a leading BOM once
   and retries when that empties the buffer.
@@ -1432,10 +1450,10 @@ asmdb/
   clients/      stdio client examples: Python, C#, C
   examples/     seed-salesdb.ps1 sample loader, bench.ps1 + bench_sqlite.py
   tests/        smoke.ps1 / smoke.sh, validate_elf.py, make_wal.py, cdc_dump.py
-  docs/         ENGINE.md spec, SAAS.md plan, COMMANDS.md dictionary, assets/
+  scripts/      build.ps1 / build.sh helpers
+  docs/         ENGINE.md spec, SAAS.md plan, COMMANDS.md dictionary,
+                SECURITY.md, SBOM.md, sbom.json, assets/
   poc/          minimal 752-byte PE64 proof-of-concept
-  build.ps1     locates NASM, assembles the PE64 (or the ELF64 with -Linux)
-  build.sh      assembles the Linux ELF64 natively
 ```
 
 See [`docs/ENGINE.md`](docs/ENGINE.md) for the full engine specification and

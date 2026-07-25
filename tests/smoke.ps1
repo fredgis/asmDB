@@ -14,7 +14,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $exe  = Join-Path $root 'build\asmdb.exe'
 
 if (-not $NoBuild -or -not (Test-Path $exe)) {
-    & powershell -ExecutionPolicy Bypass -File (Join-Path $root 'build.ps1') | Out-Host
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\build.ps1') | Out-Host
 }
 if (-not (Test-Path $exe)) { throw "asmdb.exe not found at $exe" }
 
