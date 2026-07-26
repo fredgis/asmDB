@@ -640,6 +640,41 @@ func TestUpgradeBackupFailureAborts(t *testing.T) {
 	}
 }
 
+func TestUpgradePrepareUnauthorizedAbortsWithoutChangingImage(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	oldImage := "reg.azurecr.io/asmdb-instance:1.5.0"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "free", Image: oldImage, ContainerAppName: "db-test"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/exec" {
+			t.Fatal("upgrade must not use the general exec route for backup")
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	prov := &fakeProvisioner{internalEndpoint: server.URL, states: map[string]liveState{}}
+	api := newAPI(store, prov, testStatsConfig(), allowVerifier())
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/upgrade", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(prov.upgraded) != 0 {
+		t.Fatalf("upgrade called after prepare failure: %#v", prov.upgraded)
+	}
+	got, _ := store.Get(context.Background(), id)
+	if got.Image != oldImage {
+		t.Fatalf("image = %q, want %q", got.Image, oldImage)
+	}
+}
+
 func TestUpgradeRevisionFailureLeavesRecordedImageUnchanged(t *testing.T) {
 	store := newMemoryStore()
 	id := "db_abcdefghijklmnopqrstuvwx"
