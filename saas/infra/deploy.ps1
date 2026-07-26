@@ -278,10 +278,24 @@ $registryName = Get-OutputValue $outputs 'registryName'
 $registryLoginServer = Get-OutputValue $outputs 'registryLoginServer'
 $controlPlaneImage = "$registryLoginServer/asmdb-controlplane:$Tag"
 
+if ($SkipBuild) {
+    # The tag now comes from the engine version, so -SkipBuild can name an image
+    # that was never built. Deploying it does not fail loudly: Container Apps
+    # accepts the reference, the pull fails with MANIFEST_UNKNOWN, and the
+    # revision sits unhealthy for ten minutes before anything says so. Check
+    # first, and refuse before touching the live app.
+    foreach ($repo in @('asmdb-instance', 'asmdb-controlplane')) {
+        $tags = Invoke-AzJson @('acr', 'repository', 'show-tags', '--name', $registryName, '--repository', $repo)
+        if ($null -eq $tags -or -not (@($tags) -contains $Tag)) {
+            throw "-SkipBuild was given, but '$repo`:$Tag' is not in registry '$registryName'. Run without -SkipBuild to build it, or pass -Tag with a tag that exists."
+        }
+    }
+    Write-Host ">> both images exist at tag $Tag" -ForegroundColor Green
+}
+
 if (-not $SkipBuild) {
     if (-not (Test-Path -LiteralPath $InstanceDockerfile)) { throw "Missing Dockerfile: $InstanceDockerfile. The sidecar image cannot be built yet." }
     if (-not (Test-Path -LiteralPath $ControlPlaneDockerfile)) { throw "Missing Dockerfile: $ControlPlaneDockerfile. The control-plane image cannot be built yet." }
-
     Push-Location $RepoRoot
     try {
         # Tagged twice on purpose: the version tag is what the platform pins and
