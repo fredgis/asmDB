@@ -1,8 +1,19 @@
 param(
-    [string]$Tag = 'latest',
+    # The release tag for both images. Defaults to the engine version read from
+    # src/asmdb.inc, which is what makes an upgrade detectable at all: the
+    # control plane offers an upgrade when an instance's recorded image differs
+    # from the current one, and a tag of 'latest' never differs from itself. It
+    # also keeps the binaries on the download page and the engine running in
+    # instances on the same version by construction.
+    [string]$Tag = '',
     [switch]$SkipBuild,
     [switch]$SkipApim,
     [switch]$WhatIf,
+
+    # Custom gateway hostname. Must already resolve by CNAME to the gateway
+    # before it is passed: the managed certificate is only issued once that
+    # record is visible from the internet.
+    [string]$CustomDomain = 'www.asmdb.cloud',
 
     # Microsoft Entra ID objects backing the console sign-in. None of these are
     # secrets — the browser flow is authorization-code with PKCE, so there is no
@@ -90,11 +101,74 @@ function Get-DeploymentErrorSummary {
     return 'No failed deployment operation details were returned by Azure.'
 }
 
-function Invoke-GroupDeployment([string]$Description, [string]$ControlPlaneImage) {
-    $parameters = @("tag=$Tag", "location=$Location", "deployApim=$(-not $SkipApim)")
-    if (-not [string]::IsNullOrWhiteSpace($ControlPlaneImage)) {
-        $parameters += "controlPlaneImage=$ControlPlaneImage"
+function Get-CustomDomainCertificate {
+    # Read straight from the ACME store on disk rather than through the
+    # Posh-ACME module: this script runs under Windows PowerShell, the module is
+    # installed for PowerShell 7, and Import-Module silently finds nothing there.
+    # That mismatch cost one deployment that reported success while quietly
+    # leaving the custom hostname unconfigured.
+    if ([string]::IsNullOrWhiteSpace($CustomDomain)) { return @{ Pfx = ''; Password = '' } }
+
+    $store = Join-Path $env:LOCALAPPDATA 'Posh-ACME'
+    if (-not (Test-Path $store)) {
+        Write-Host ">> no ACME store; leaving the custom hostname untouched" -ForegroundColor Yellow
+        return @{ Pfx = ''; Password = '' }
     }
+    $dir = Get-ChildItem $store -Recurse -Directory -Filter $CustomDomain -ErrorAction SilentlyContinue |
+           Where-Object { Test-Path (Join-Path $_.FullName 'fullchain.pfx') } |
+           Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $dir) {
+        Write-Host ">> no certificate for $CustomDomain in the ACME store; leaving the custom hostname untouched" -ForegroundColor Yellow
+        Write-Host '   issue one with the procedure in docs/SAAS.md' -ForegroundColor Yellow
+        return @{ Pfx = ''; Password = '' }
+    }
+
+    $order = Get-Content (Join-Path $dir.FullName 'order.json') -Raw | ConvertFrom-Json
+    $password = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($order.PfxPassB64U.Replace('-', '+').Replace('_', '/')))
+    $expires = [datetime]$order.CertExpires
+    $daysLeft = [int]($expires - (Get-Date)).TotalDays
+    if ($daysLeft -lt 0) {
+        throw "The certificate for $CustomDomain expired on $expires. Renew it before deploying - see docs/SAAS.md section 8b."
+    }
+    $colour = if ($daysLeft -le 21) { 'Red' } elseif ($daysLeft -le 40) { 'Yellow' } else { 'Green' }
+    Write-Host (">> certificate for {0} expires {1:yyyy-MM-dd} ({2} days left)" -f $CustomDomain, $expires, $daysLeft) -ForegroundColor $colour
+    if ($daysLeft -le 21) {
+        Write-Host '>> RENEW SOON - procedure in docs/SAAS.md section 8b' -ForegroundColor Red
+    }
+    return @{
+        Pfx      = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $dir.FullName 'fullchain.pfx')))
+        Password = $password
+    }
+}
+
+function Invoke-GroupDeployment([string]$Description, [string]$ControlPlaneImage) {
+    $values = [ordered]@{
+        tag           = $Tag
+        location      = $Location
+        deployApim    = (-not $SkipApim)
+        customDomain  = $CustomDomain
+    }
+    $certificate = Get-CustomDomainCertificate
+    if ($certificate.Pfx) {
+        $values['customDomainPfx'] = $certificate.Pfx
+        $values['customDomainPfxPassword'] = $certificate.Password
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ControlPlaneImage)) {
+        $values['controlPlaneImage'] = $ControlPlaneImage
+    }
+
+    # Written to a file rather than passed on the command line. The certificate
+    # is several kilobytes of base64 and putting it in an argument runs into
+    # both length limits and quoting, which is how one deployment failed with a
+    # wall of base64 in the error message rather than anything readable.
+    $shaped = [ordered]@{}
+    foreach ($k in $values.Keys) { $shaped[$k] = @{ value = $values[$k] } }
+    $paramFile = Join-Path ([IO.Path]::GetTempPath()) ("asmdb-params-{0}.json" -f [guid]::NewGuid().ToString('N'))
+    @{
+        '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+        contentVersion = '1.0.0.0'
+        parameters     = $shaped
+    } | ConvertTo-Json -Depth 10 | Set-Content -Path $paramFile -Encoding utf8
 
     Write-Host ''
     Write-Host $Description
@@ -102,14 +176,20 @@ function Invoke-GroupDeployment([string]$Description, [string]$ControlPlaneImage
         Write-Host 'APIM Developer SKU creation commonly takes 30-45 minutes. Waiting with a 90-minute budget and printing progress...'
     }
 
-    $deploymentArgs = @(
-        'deployment', 'group', 'create',
-        '--resource-group', $ResourceGroup,
-        '--name', $DeploymentName,
-        '--template-file', $TemplateFile,
-        '--parameters'
-    ) + $parameters + @('--no-wait')
-    Invoke-Az $deploymentArgs
+    try {
+        $deploymentArgs = @(
+            'deployment', 'group', 'create',
+            '--resource-group', $ResourceGroup,
+            '--name', $DeploymentName,
+            '--template-file', $TemplateFile,
+            '--parameters', "@$paramFile",
+            '--no-wait'
+        )
+        Invoke-Az $deploymentArgs
+    } finally {
+        # The file holds the certificate password; it does not outlive the call.
+        Remove-Item $paramFile -Force -ErrorAction SilentlyContinue
+    }
 
     $deadline = (Get-Date).AddMinutes(90)
     $started = Get-Date
@@ -131,6 +211,18 @@ function Invoke-GroupDeployment([string]$Description, [string]$ControlPlaneImage
 
 Require-AzCli
 
+if ([string]::IsNullOrWhiteSpace($Tag)) {
+    $engineHeader = Join-Path $RepoRoot 'src\asmdb.inc'
+    if (-not (Test-Path $engineHeader)) { throw "Cannot read the engine version: $engineHeader not found." }
+    $header = Get-Content $engineHeader -Raw
+    $major = [regex]::Match($header, '%define\s+ENGINE_MAJOR\s+(\d+)').Groups[1].Value
+    $minor = [regex]::Match($header, '%define\s+ENGINE_MINOR\s+(\d+)').Groups[1].Value
+    $patch = [regex]::Match($header, '%define\s+ENGINE_PATCH\s+(\d+)').Groups[1].Value
+    if (-not $major -or -not $minor -or -not $patch) { throw "Could not parse ENGINE_MAJOR/MINOR/PATCH from $engineHeader." }
+    $Tag = "$major.$minor.$patch"
+}
+Write-Host ">> release tag: $Tag" -ForegroundColor Cyan
+
 $account = Invoke-AzJson @('account', 'show')
 if (-not $account) { throw 'Azure CLI is not logged in. Run az login --tenant <tenant-id> first.' }
 if ($account.tenantId -ne $TenantId) {
@@ -151,7 +243,7 @@ if ($group.location -ne $Location) { throw "Resource group '$ResourceGroup' is i
 Test-ExistingEnvironmentCanMovePrivate
 
 if ($WhatIf) {
-    $whatIfParameters = @("tag=$Tag", "location=$Location", "deployApim=$(-not $SkipApim)")
+    $whatIfParameters = @("tag=$Tag", "location=$Location", "deployApim=$(-not $SkipApim)", "customDomain=$CustomDomain")
     $whatIfArgs = @(
         'deployment', 'group', 'what-if',
         '--resource-group', $ResourceGroup,
@@ -161,6 +253,23 @@ if ($WhatIf) {
     ) + $whatIfParameters
     Invoke-Az $whatIfArgs
     return
+}
+
+# Read before anything is deployed. The template owns the container app, so a
+# deployment replaces its environment variables wholesale and the script puts
+# them back afterwards; reading the secret after that point always finds
+# nothing and mints a new one. A new secret invalidates every per-instance
+# introspection token derived from it, so stats would break on every existing
+# database on every redeploy — silently, since nothing errors.
+$existingPlatformSecret = $null
+$existingApp = az containerapp show --name asmdb-cp --resource-group $ResourceGroup --output json 2>$null
+if ($existingApp) {
+    $parsed = $existingApp | ConvertFrom-Json
+    foreach ($e in @($parsed.properties.template.containers[0].env)) {
+        if ($e -and $e.PSObject.Properties.Name -contains 'name' -and $e.name -eq 'ASMDB_PLATFORM_SECRET') {
+            if ($e.PSObject.Properties.Name -contains 'value') { $existingPlatformSecret = $e.value }
+        }
+    }
 }
 
 $deployment = Invoke-GroupDeployment 'Deploying infrastructure with placeholder control-plane image...' $null
@@ -175,8 +284,11 @@ if (-not $SkipBuild) {
 
     Push-Location $RepoRoot
     try {
-        Invoke-Az @('acr', 'build', '--registry', $registryName, '--image', "asmdb-instance:$Tag", '--file', 'saas\sidecar\Dockerfile', '.')
-        Invoke-Az @('acr', 'build', '--registry', $registryName, '--image', "asmdb-controlplane:$Tag", '--file', 'saas\controlplane\Dockerfile', '.')
+        # Tagged twice on purpose: the version tag is what the platform pins and
+        # what makes an upgrade detectable, and 'latest' is the convenience tag
+        # for anyone pulling by hand.
+        Invoke-Az @('acr', 'build', '--registry', $registryName, '--image', "asmdb-instance:$Tag", '--image', 'asmdb-instance:latest', '--file', 'saas\sidecar\Dockerfile', '.')
+        Invoke-Az @('acr', 'build', '--registry', $registryName, '--image', "asmdb-controlplane:$Tag", '--image', 'asmdb-controlplane:latest', '--file', 'saas\controlplane\Dockerfile', '.')
     }
     finally {
         Pop-Location
@@ -195,18 +307,15 @@ $instancePublicBase = Get-OutputValue $outputs 'instancePublicBase'
 # survive redeployment: regenerating it would invalidate every derived token and
 # silently break stats on every existing database. So it is generated once, on
 # the first deployment that finds it missing, and read back thereafter.
-$existing = Invoke-AzJson @('containerapp', 'show', '--name', 'asmdb-cp', '--resource-group', $ResourceGroup)
-$platformSecret = $null
-foreach ($e in @($existing.properties.template.containers[0].env)) {
-    if ($e -and $e.PSObject.Properties.Name -contains 'name' -and $e.name -eq 'ASMDB_PLATFORM_SECRET') {
-        if ($e.PSObject.Properties.Name -contains 'value') { $platformSecret = $e.value }
-    }
-}
+# survive redeployment: regenerating it would invalidate every derived token and
+# silently break stats on every existing database. It was captured before the
+# deployment ran, because the deployment itself clears the variable.
+$platformSecret = $existingPlatformSecret
 if (-not $platformSecret) {
     $bytes = New-Object byte[] 32
     [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $platformSecret = [Convert]::ToBase64String($bytes)
-    Write-Host '>> generated a new platform secret (first deployment)'
+    Write-Host '>> generated a new platform secret (none was set)' -ForegroundColor Yellow
 } else {
     Write-Host '>> reusing the existing platform secret'
 }

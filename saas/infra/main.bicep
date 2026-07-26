@@ -4,6 +4,18 @@ param deployApim bool = true
 param publisherEmail string = 'admin@asmdb.dev'
 param publisherName string = 'asmdb'
 
+// Custom gateway hostname, e.g. 'www.asmdb.cloud'. Must already resolve by
+// CNAME to the gateway before deployment.
+param customDomain string = ''
+
+// The certificate for that hostname, as a base64 PFX, plus its password.
+// Supplied by deploy.ps1 from the ACME store — never written down here and
+// never committed. Empty leaves any existing hostname configuration alone.
+@secure()
+param customDomainPfx string = ''
+@secure()
+param customDomainPfxPassword string = ''
+
 // The control-plane image only exists after `az acr build` has run, and that
 // build needs the registry this template creates. So the first pass deploys the
 // app against a public placeholder and the second pass swaps in the real image.
@@ -706,15 +718,37 @@ resource apim 'Microsoft.ApiManagement/service@2024-05-01' = if (deployApim) {
     name: 'Developer'
     capacity: 1
   }
-  properties: {
-    publisherEmail: publisherEmail
-    publisherName: publisherName
-    publicIpAddressId: apimPublicIp.id
-    virtualNetworkType: 'External'
-    virtualNetworkConfiguration: {
-      subnetResourceId: apimSubnet.id
+  properties: union(
+    {
+      publisherEmail: publisherEmail
+      publisherName: publisherName
+      publicIpAddressId: apimPublicIp.id
+      virtualNetworkType: 'External'
+      virtualNetworkConfiguration: {
+        subnetResourceId: apimSubnet.id
+      }
+    },
+    // The custom hostname is only managed when a certificate is supplied.
+    // Managed certificates cannot be used here: Azure refuses new managed
+    // certificate requests with ManagedCertificateConfigurationTemporaryDisabled,
+    // and in any case they validate over CNAME, which a zone apex cannot have.
+    // So the certificate is brought in — Let's Encrypt, renewed every 90 days,
+    // procedure in docs/SAAS.md. When no certificate is passed this object is
+    // empty and ARM leaves any existing hostname configuration untouched, which
+    // is what keeps a routine redeploy from tearing the domain down.
+    (empty(customDomain) || empty(customDomainPfx)) ? {} : {
+      hostnameConfigurations: [
+        {
+          type: 'Proxy'
+          hostName: customDomain
+          encodedCertificate: customDomainPfx
+          certificatePassword: customDomainPfxPassword
+          defaultSslBinding: true
+          negotiateClientCertificate: false
+        }
+      ]
     }
-  }
+  )
 }
 
 resource apimApi 'Microsoft.ApiManagement/service/apis@2024-05-01' = if (deployApim) {
@@ -974,8 +1008,10 @@ output storageAccountName string = storage.name
 output fileStorageAccountName string = fileStorage.name
 output instanceStorageName string = instanceStorage.name
 output apimName string = deployApim ? apim!.name : ''
-output apimGatewayUrl string = deployApim ? apim!.properties.gatewayUrl : ''
+output apimGatewayUrl string = deployApim ? (empty(customDomain) ? apim!.properties.gatewayUrl : 'https://${customDomain}') : ''
 // When APIM is skipped, this falls back to the internal Container Apps environment domain for private/VNet-local testing.
-output instancePublicBase string = deployApim ? '${apim!.properties.gatewayUrl}/db' : 'https://${environment.properties.defaultDomain}'
+// The base a customer is handed at creation. It must be the hostname the
+// customer can actually reach, so it follows the custom domain once one exists.
+output instancePublicBase string = deployApim ? (empty(customDomain) ? '${apim!.properties.gatewayUrl}/db' : 'https://${customDomain}/db') : 'https://${environment.properties.defaultDomain}'
 output vnetName string = vnet.name
 output controlPlaneInternalFqdn string = controlPlane.properties.configuration.ingress.fqdn

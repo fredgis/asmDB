@@ -52,6 +52,7 @@ Four consequences are worth keeping visible:
 6. [Instance lifecycle, storage and isolation](#6-instance-lifecycle-storage-and-isolation)
 7. [Observability, stats and costs](#7-observability-stats-and-costs)
 8. [Installation and deployment](#8-installation-and-deployment)
+8b. [⚠️ **ALERT** — the TLS certificate expires every 90 days](#8b-️-alert--the-tls-certificate-expires-every-90-days)
 9. [Durability, upgrade and recovery](#9-durability-upgrade-and-recovery)
 10. [Limits and non-goals](#10-limits-and-non-goals)
 11. [Verified smoke checks](#11-verified-smoke-checks)
@@ -333,6 +334,190 @@ A VNet cannot be added to an existing Container Apps environment. Moving an
 existing environment onto a VNet means deleting its apps and the environment
 first. The deployment script detects that shape and refuses rather than
 half-applying a private-network migration.
+
+---
+
+## 8b. ⚠️ ALERT — the TLS certificate expires every 90 days
+
+> **`www.asmdb.cloud` is served with a Let's Encrypt certificate that is valid
+> for 90 days. If nobody renews it, the site stops loading in every browser
+> — not degraded, not slow: refused.** The certificate deployed on
+> 2026-07-26 expires on **2026-10-23**. Renew it before then.
+
+### Why this is manual rather than automatic
+
+Two things force it, and neither is a shortcut:
+
+1. **Azure will not issue a managed certificate.** Adding one fails with
+   `ManagedCertificateConfigurationTemporaryDisabled` — Microsoft suspended new
+   managed-certificate requests, announced through 2026-06-30 and still in force
+   past that date. The certificate therefore has to be brought in.
+2. **The apex cannot hold the certificate.** DNS forbids a `CNAME` at a zone
+   apex, so `asmdb.cloud` is an OVH redirection to `www.asmdb.cloud`, and the
+   certificate covers the `www` host that actually terminates TLS.
+
+`deploy.ps1` prints the days remaining on every run and turns red at 21 days.
+It **refuses to deploy** with an expired certificate rather than pushing a
+broken hostname.
+
+### Renewal procedure
+
+Run this on the machine that holds the ACME account. It takes about five
+minutes, most of which is waiting for DNS.
+
+**1 — ask Let's Encrypt for a new challenge**
+
+```powershell
+Import-Module Posh-ACME
+Set-PAServer LE_PROD
+New-PAOrder -Domain 'www.asmdb.cloud' -Force
+$auth = Get-PAOrder | Get-PAAuthorization
+Get-KeyAuthorization $auth.DNS01Token -ForDNS      # <- the value to publish
+```
+
+**2 — publish it at OVH**
+
+OVH control panel → `asmdb.cloud` → **DNS zone** → *Add an entry*:
+
+| Field | Value |
+|---|---|
+| Type | `TXT` |
+| Subdomain | `_acme-challenge.www` |
+| Value | the string printed by step 1 |
+
+The full record must read `_acme-challenge.www.asmdb.cloud`. If one is already
+there from a previous renewal, **edit it** rather than adding a second — two
+TXT records with different values is a common way to fail validation.
+
+**3 — wait for it to be visible, then finish**
+
+```powershell
+Resolve-DnsName _acme-challenge.www.asmdb.cloud -Type TXT -Server 8.8.8.8
+
+Send-ChallengeAck $auth.DNS01Url
+New-PACertificate -Domain 'www.asmdb.cloud' -PfxPass (New-Guid).Guid
+```
+
+**4 — deploy it**
+
+```powershell
+.\saas\infra\deploy.ps1 -SkipBuild
+```
+
+`deploy.ps1` reads the new certificate out of the local ACME store, base64-encodes
+it and passes it as a secure parameter. **The certificate is never written into
+the template, a parameter file, or the repository.** Applying a hostname change
+on the Developer SKU interrupts the gateway briefly — a few minutes, once.
+
+**5 — check**
+
+```powershell
+(Invoke-WebRequest https://www.asmdb.cloud/healthz).StatusCode          # 200
+```
+
+### Making it stop being manual
+
+The step that needs a human is publishing the TXT record, and only because OVH
+is driven by hand here. Create an **OVH API token** with write access to the
+`asmdb.cloud` zone and Posh-ACME will publish and clean up the record itself
+(`-Plugin OVH`), at which point renewal is one scheduled command with nothing to
+type. Until that exists, this page is the procedure.
+
+---
+
+## 8c. Releasing a new engine version
+
+One version number drives everything: the binaries on the download page, the
+image instances run, and whether an upgrade is offered. It lives in
+**`src/asmdb.inc`**:
+
+```nasm
+%define ENGINE_MAJOR 1
+%define ENGINE_MINOR 5
+%define ENGINE_PATCH 0
+```
+
+`deploy.ps1` reads it and uses it as the release tag. That is not cosmetic. The
+control plane offers an upgrade when an instance's recorded image differs from
+the current `ASMDB_IMAGE`, so **a tag of `latest` would make upgrades
+impossible** — `latest` never differs from itself. Pinning the version tag is
+what makes the upgrade path work at all.
+
+It also makes the download page and the running fleet agree by construction:
+both binaries are assembled from the same source tree inside the same image
+that serves the site, so `/downloads/` cannot advertise a build that is not the
+one the platform is running.
+
+### The procedure
+
+**1 — bump the version and make the change**
+
+Edit `ENGINE_MAJOR` / `ENGINE_MINOR` / `ENGINE_PATCH` in `src/asmdb.inc`. The
+pre-1.0 rule in that file still applies to the on-disk `DB_VERSION`, which moves
+almost never and only when the layout changes.
+
+**2 — prove it before shipping it**
+
+```powershell
+.\scripts\build.ps1
+.\tests\smoke.ps1          # must report 151 checks, 0 failures
+```
+
+and on Linux, `./scripts/build.sh && ./tests/smoke.sh`. A release that has not
+run the suite is not a release.
+
+**3 — record it**
+
+Update the changelog in `README.md`. Every behaviour-changing commit does this;
+a release doubly so.
+
+**4 — deploy**
+
+```powershell
+.\saas\infra\deploy.ps1
+```
+
+which, without further arguments:
+
+- reads the version from `src/asmdb.inc` and prints it as the release tag;
+- assembles both binaries and both images from that source;
+- pushes each image twice, as `<version>` and as `latest`;
+- points `ASMDB_IMAGE` at the **version** tag.
+
+**5 — what happens on its own**
+
+- `/downloads/manifest.json` and the two binaries beneath it are the new
+  version. The page reads the manifest, so it cannot claim otherwise.
+- Every instance still running the previous tag now reports
+  `"upgradeAvailable": true`, with `engine` showing what it runs and
+  `availableEngine` what it could run.
+- New databases are created on the new version.
+
+**6 — existing databases upgrade when their owner asks**
+
+`POST /api/v1/databases/{id}/upgrade` takes a `BACKUP` first and aborts if that
+fails, then moves the container app to the new image. The volume is NFS and
+persists, so the new engine opens the existing files; if the on-disk format
+moved, the engine's own `--upgrade` path migrates them.
+
+Upgrading **restarts the instance and interrupts connections**. The engine holds
+an exclusive lock and runs at `maxReplicas: 1`, so the replacement cannot open
+the database until the outgoing process releases it. This is not zero-downtime
+and is not presented as such. Nobody is upgraded without asking.
+
+### Rolling back
+
+Deploy with the previous tag explicitly:
+
+```powershell
+.\saas\infra\deploy.ps1 -Tag 1.5.0
+```
+
+The image is still in the registry, so this points `ASMDB_IMAGE` back and the
+same upgrade endpoint moves an instance onto it. **A rollback across a
+`DB_VERSION` change is not safe** — an older engine refuses a newer file rather
+than guessing at it, which is the correct behaviour and the reason the backup in
+step 6 is taken before anything moves.
 
 ---
 

@@ -1,5 +1,34 @@
-# Build context must be the repository root:
+# The ACR build context is the repository root:
 #   az acr build --file saas/controlplane/Dockerfile .
+
+# Both shipping binaries are assembled here, from the same source tree the site
+# describes, so a download can never be a different build from the one the page
+# is talking about. nasm -f bin emits the final image directly in both cases —
+# there is no linker involved, so cross-assembling the Windows PE64 on Linux is
+# not cross-compilation, it is just writing different bytes.
+FROM alpine:3.20 AS binaries
+RUN apk add --no-cache nasm
+WORKDIR /src
+COPY src/ src/
+RUN set -eu; \
+    nasm -f bin        -I src/ src/main.asm -o asmdb.exe; \
+    nasm -f bin -dLINUX -I src/ src/main.asm -o asmdb; \
+    chmod +x asmdb; \
+    major=$(sed -n 's/.*%define ENGINE_MAJOR \([0-9]*\).*/\1/p' src/asmdb.inc); \
+    minor=$(sed -n 's/.*%define ENGINE_MINOR \([0-9]*\).*/\1/p' src/asmdb.inc); \
+    patch=$(sed -n 's/.*%define ENGINE_PATCH \([0-9]*\).*/\1/p' src/asmdb.inc); \
+    version="$major.$minor.$patch"; \
+    mkdir -p /out; \
+    cp asmdb.exe "/out/asmdb-$version-windows-x64.exe"; \
+    cp asmdb     "/out/asmdb-$version-linux-x64"; \
+    printf '{\n  "version": "%s",\n  "builds": [\n' "$version" > /out/manifest.json; \
+    printf '    { "os": "Windows", "arch": "x64", "format": "PE64", "file": "asmdb-%s-windows-x64.exe", "bytes": %s, "sha256": "%s" },\n' \
+        "$version" "$(wc -c < asmdb.exe)" "$(sha256sum asmdb.exe | cut -d" " -f1)" >> /out/manifest.json; \
+    printf '    { "os": "Linux", "arch": "x64", "format": "ELF64", "file": "asmdb-%s-linux-x64", "bytes": %s, "sha256": "%s" }\n' \
+        "$version" "$(wc -c < asmdb)" "$(sha256sum asmdb | cut -d" " -f1)" >> /out/manifest.json; \
+    printf '  ]\n}\n' >> /out/manifest.json; \
+    cat /out/manifest.json
+
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 
@@ -17,6 +46,7 @@ RUN addgroup -S asmdb && adduser -S -G asmdb asmdb
 WORKDIR /app
 COPY --from=build /out/controlplane /app/controlplane
 COPY site/ /app/site/
+COPY --from=binaries /out/ /app/site/downloads/
 USER asmdb
 EXPOSE 8080
 ENTRYPOINT ["/app/controlplane"]
