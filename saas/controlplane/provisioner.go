@@ -402,7 +402,21 @@ func (p *azureProvisioner) StopContainerApp(ctx context.Context, in instance) er
 	})
 }
 
+// clearInheritedRevisionSuffix removes any revision suffix already present in a
+// template. An upgrade reads the app, changes the image and writes it back, so a
+// suffix left by an out-of-band update would travel with it — and Azure refuses
+// to create a second revision with a suffix that already exists. That failure is
+// permanent and names a field the control plane never sets, which makes it very
+// hard to attribute.
+func clearInheritedRevisionSuffix(app armappcontainers.ContainerApp) armappcontainers.ContainerApp {
+	if app.Properties != nil && app.Properties.Template != nil {
+		app.Properties.Template.RevisionSuffix = nil
+	}
+	return app
+}
+
 func (p *azureProvisioner) CreateOrUpdateContainerApp(ctx context.Context, in instance, app armappcontainers.ContainerApp) error {
+	app = clearInheritedRevisionSuffix(app)
 	poller, err := p.apps.BeginCreateOrUpdate(ctx, p.resourceGroup, in.ContainerAppName, app, nil)
 	if err != nil {
 		return err

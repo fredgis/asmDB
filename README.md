@@ -7,8 +7,8 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). The 1.6.0 PE64 build is 43,749 bytes;
-    the 1.6.0 ELF64 build is 52,221 bytes. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). The 1.6.2 PE64 build is 43,749 bytes;
+    the 1.6.2 ELF64 build is 52,221 bytes. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -117,10 +117,6 @@ management API.
 Three tiers, priced from Azure list rates at 15 % margin on run — the derivation,
 the assumptions and the ways the model breaks are in
 [`docs/COST.md`](docs/COST.md).
-
-<p align="center">
-  <img src="docs/assets/asmdb-cloud-tiers.png" alt="asmdb Cloud pricing tiers: free at $0, standard at $15 a month, premium at $49 a month" width="90%">
-</p>
 
 Those prices do **not** buy the workstation benchmark above. Hosted tiers get
 0.25 vCPU (`free`), 0.5 vCPU (`standard`) or 1 vCPU (`premium`), and every
@@ -467,7 +463,7 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the PE64 binary is 43,749 bytes at 1.6.0 and the 1.6.0
+which is why the PE64 binary is 43,749 bytes at 1.6.2 and the 1.6.2
 ELF64 binary is 52,221 bytes — and why a million-row database needs only a few
 MB of RAM.
 
@@ -865,7 +861,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.6.0 · 1.5.3 · 1.5.2 · 1.5.1 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.6.2 · 1.6.1 · 1.6.0 · 1.5.3 · 1.5.2 · 1.5.1 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -876,7 +872,7 @@ Two numbers are tracked separately and should not be confused:
 
 | | What it is | How often it moves | Effect |
 |---|---|---|---|
-| **Engine version** | the software (`1.6.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
+| **Engine version** | the software (`1.6.2`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
 | **Storage format** | the byte layout of `<db>.dat` (`2`) | rarely | decides whether a file can be opened, and what `--upgrade` migrates |
 
 Run `VERSION` inside the REPL to see both, plus which engine last wrote the open
@@ -884,6 +880,56 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+  <summary><b>1.6.2</b> — an upgrade no longer inherits the revision it must replace</summary>
+
+  **A field the control plane never sets could stop every upgrade.** Upgrading
+  reads the container app, changes the image and writes it back, so a revision
+  suffix already present in the template travelled with it. Azure refuses to
+  create a second revision with a suffix that already exists, so the write
+  failed:
+
+  ```
+  Field 'template.revisionsuffix' is invalid with details:
+  'Invalid value: "v160182757": revision with suffix v160182757 already exists.'
+  ```
+
+  The upgrade rolled back correctly and the database was never at risk, but the
+  failure was permanent: once any out-of-band operation had pinned a suffix, no
+  later upgrade could succeed. The error named a field this code does not touch,
+  which is what made it hard to attribute. The suffix is now cleared before every
+  write and Azure allocates a fresh one.
+
+</details>
+
+<details>
+  <summary><b>1.6.1</b> — a database that needs recovery can start again</summary>
+
+  **Five seconds to open a database.** That was the sidecar's startup budget,
+  and it was measured on a workstation where opening is instant. On the hosted
+  service the data sits on Azure Files NFS, the `.dat` is a gigabyte and not
+  sparse there, and an open that follows an abrupt stop must first finish an
+  interrupted whole-table operation before it can answer.
+
+  The consequence was not a slow start but a permanent one. Container Apps never
+  revives a revision that failed to become healthy, so an instance whose engine
+  needed more than five seconds — precisely the instance that had just been
+  interrupted and most needed to recover — could not come back at all. Found by
+  killing revisions during an upgrade and watching a healthy database become
+  unstartable.
+
+  The budget is now five minutes, and `ASMDB_START_TIMEOUT` overrides it, so an
+  operator can bring up a database on unusually slow storage without shipping an
+  image. A start in progress logs its progress every fifteen seconds, because a
+  silent wait is indistinguishable from a hang.
+
+  Also in this release: running text on the site was constrained to a measure
+  much narrower than the sections around it, leaving a thin column in a wide
+  page. It now uses a wider measure — around 95 characters, not the full
+  viewport, because a 200-character line is worse than the problem it fixes.
+
+</details>
 
 <details>
   <summary><b>1.6.0</b> — the table is sized for the machine it runs on</summary>

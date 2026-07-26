@@ -76,6 +76,7 @@
 
   /* ---- measure ---------------------------------------------------------- */
   --measure:       64ch;
+  --measure-wide:  58rem;
   --measure-tight: 50ch;
   --shell:         74rem;
   --shell-wide:    88rem;

@@ -26,7 +26,27 @@ var (
 	restartMaxBackoff       = 5 * time.Second
 	restartMaxAttempts      = 6
 	restartSleep            = time.Sleep
+	// Opening a database on network storage, and finishing an interrupted
+	// whole-table operation, are both minutes-scale on the hosted service.
+	defaultEngineStartTimeout = 5 * time.Minute
 )
+
+// engineStartTimeout is how long the engine may take to open the database and
+// print its banner. ASMDB_START_TIMEOUT overrides it (any duration Go accepts,
+// such as "90s" or "10m") so a database on unusually slow storage can be
+// brought up without shipping a new image.
+func engineStartTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("ASMDB_START_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		logJSON("warn", "engine_start_timeout_invalid", map[string]any{
+			"value":    v,
+			"fallback": defaultEngineStartTimeout.String(),
+		})
+	}
+	return defaultEngineStartTimeout
+}
 
 var (
 	errEngineBusy        = errors.New("engine is busy")
@@ -345,7 +365,19 @@ func (e *Engine) startEngineLocked(db string) error {
 
 	go e.watch(cmd, done)
 
-	deadline := time.After(5 * time.Second)
+	// The engine prints its banner once the database is open. That can take far
+	// longer than a local open suggests: the hosted data lives on Azure Files
+	// NFS, the .dat is a gigabyte and not sparse there, and an open that follows
+	// an abrupt kill has to finish an interrupted whole-table operation before
+	// it can answer. Five seconds was enough on a workstation and hopeless on
+	// the service — and because a Container Apps revision that never becomes
+	// healthy is never revived, a database that needed recovery could not start
+	// again at all. The budget is generous by default and configurable so an
+	// operator can raise it without a release.
+	deadline := time.After(engineStartTimeout())
+	started := time.Now()
+	progress := time.NewTicker(15 * time.Second)
+	defer progress.Stop()
 	bannerSeen := false
 	for {
 		select {
@@ -364,10 +396,18 @@ func (e *Engine) startEngineLocked(db string) error {
 				e.clearFailedStartLocked(cmd)
 				return errors.New(statusDetail(line))
 			}
+		case <-progress.C:
+			// A silent wait is indistinguishable from a hang. Say what is
+			// happening so a slow recovery is not mistaken for a dead engine.
+			logJSON("info", "engine_starting", map[string]any{
+				"waitedSeconds": int(time.Since(started).Seconds()),
+				"budgetSeconds": int(engineStartTimeout().Seconds()),
+				"bannerSeen":    bannerSeen,
+			})
 		case <-deadline:
 			e.clearFailedStartLocked(cmd)
 			_ = cmd.Process.Kill()
-			return errors.New("engine startup timed out")
+			return fmt.Errorf("engine startup timed out after %s", engineStartTimeout())
 		}
 	}
 

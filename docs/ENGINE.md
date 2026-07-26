@@ -97,7 +97,7 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **43,749-byte PE64** at 1.6.0 whose only
+- The result is a single self-contained **43,749-byte PE64** at 1.6.2 whose only
   dependency is `kernel32.dll`. The configured record region (sparse on disk) is
   **not** in the exe — it is obtained from `VirtualAlloc` at startup.
 

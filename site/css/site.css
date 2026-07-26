@@ -196,7 +196,7 @@ a { color: inherit; }
 .hero__lede {
   font-size: var(--text-lg);
   color: var(--color-ink-2);
-  max-width: var(--measure);
+  max-width: min(100%, var(--measure-wide));
   margin-top: var(--space-xl);
 }
 .hero__lede strong { color: var(--color-ink); font-weight: 600; }
@@ -289,7 +289,7 @@ a { color: inherit; }
 }
 .sec__sub {
   margin-top: var(--space-lg);
-  max-width: var(--measure);
+  max-width: min(100%, var(--measure-wide));
   color: var(--color-ink-3);
 }
 .sec__sub a {
@@ -361,7 +361,7 @@ figcaption {
 .row:last-child { border-bottom: 0; }
 .row__k { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--color-accent); }
 .row__t { font-size: var(--text-xl); margin-bottom: var(--space-sm); }
-.row__b { color: var(--color-ink-3); max-width: var(--measure); }
+.row__b { color: var(--color-ink-3); max-width: min(100%, var(--measure-wide)); }
 @media (max-width: 700px) { .row { grid-template-columns: minmax(0, 1fr); gap: var(--space-sm); } }
 
 /* ============================== MCP block ================================= */
@@ -501,7 +501,7 @@ figcaption {
   font-size: var(--text-sm);
   color: var(--color-ink-4);
   margin-top: var(--space-lg);
-  max-width: var(--measure);
+  max-width: min(100%, var(--measure-wide));
 }
 .tier-capabilities {
   margin-top: var(--space-xl);

@@ -1,6 +1,6 @@
 # Connecting to asmdb from your application
 
-Current engine: **1.6.0**, storage format **2**. The binaries are 43,749 bytes
+Current engine: **1.6.2**, storage format **2**. The binaries are 43,749 bytes
 (PE64) and 52,221 bytes (ELF64), and downloads are published at
 <https://www.asmdb.cloud/downloads/> with SHA-256 hashes in the manifest.
 
@@ -18,7 +18,7 @@ All examples honor `ASMDB_EXE`; when it is not set they look in `..\..\build`.
 asmdb <database> [table]      # commands in on stdin, results out on stdout
 ```
 
-Since 1.6.0 every command terminates with `[ OK ]` or `[ERR]`. Stdio clients
+Since 1.6.2 every command terminates with `[ OK ]` or `[ERR]`. Stdio clients
 may therefore read one response per command; older engines missed terminators on
 `HELP`, `SCHEMA`, `VERSION` and empty `SELECT *`, which could desynchronise a
 stream reader.
