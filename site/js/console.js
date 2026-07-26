@@ -7,7 +7,8 @@
   var ADMIN_GROUP = "ASMDB_ADMIN";
   var POLL_BASE_MS = 5000;
   var POLL_MAX_MS = 30000;
-  var PREVIEW_LIMIT = "20";
+  var PREVIEW_LIMIT = "5";
+  var STATS_MISS_THRESHOLD = 3;
   var TOKEN_SESSION_PREFIX = "asmdb.instanceToken.";
 
   function id(name) { return document.getElementById(name); }
@@ -44,7 +45,13 @@
   var metricCpu = id("metric-cpu");
   var metricMemory = id("metric-memory");
   var metricMemoryDetail = id("metric-memory-detail");
+  var memoryMeterWrap = id("memory-meter-wrap");
+  var memoryMeter = id("memory-meter");
+  var memoryMeterNote = id("memory-meter-note");
   var metricStorage = id("metric-storage");
+  var storageMeterWrap = id("storage-meter-wrap");
+  var storageMeter = id("storage-meter");
+  var storageMeterNote = id("storage-meter-note");
   var navVersion = id("nav-version");
   var heroVersion = id("hero-version");
   var footVersion = id("foot-version");
@@ -85,7 +92,10 @@
   var history = [];
   var historyAt = 0;
   var statsPrevious = Object.create(null);
+  var statsCache = Object.create(null);
+  var statsMisses = Object.create(null);
   var pollTimer = 0;
+  var previewRequestId = 0;
   var revealTimer = 0;
   var pollDelay = POLL_BASE_MS;
   var loadingList = false;
@@ -122,6 +132,13 @@
   }
   function applyRoute() {
     var view = routeFromHash();
+    var previousView = activeView;
+    if (previousView === "create" && view !== "create") { clearCreateResult(); }
+    if (previousView === "access" && view !== "access") {
+      clearRotatedTokenOutput();
+      resetTokenReveal();
+      updateTokenHeld(false);
+    }
     activeView = view;
     Array.prototype.forEach.call(document.querySelectorAll("[data-console-view]"), function (panel) {
       panel.hidden = panel.getAttribute("data-console-view") !== view;
@@ -146,6 +163,8 @@
 
   function showSignedOut(status, detail, state) {
     stopPolling();
+    clearCreateResult();
+    clearRotatedTokenOutput();
     authPanel.hidden = false;
     consoleApp.hidden = true;
     setAuthPanel(status || "Not signed in.", detail || "Sign in to create databases and open the console.", state);
@@ -434,21 +453,37 @@
       return Number((u * 10000n) / t) / 100;
     } catch (e) { return null; }
   }
-  function setRowsMeter(rows, capacity) {
-    var percent = percentFromDecimalStrings(rows, capacity);
-    if (percent == null || percent <= 0) {
-      rowsMeter.style.width = "0";
-      rowsMeter.removeAttribute("data-tiny");
-      rowsMeterWrap.setAttribute("data-empty", "true");
+  function setMeter(wrap, fill, used, total, label) {
+    if (!wrap || !fill) { return; }
+    var percent = percentFromDecimalStrings(used, total);
+    if (percent == null) {
+      fill.style.width = "0";
+      fill.removeAttribute("data-tiny");
+      wrap.setAttribute("data-empty", "true");
+      wrap.setAttribute("aria-valuemin", "0");
+      wrap.setAttribute("aria-valuemax", String(total || 0));
+      wrap.setAttribute("aria-valuenow", "0");
+      wrap.setAttribute("aria-valuetext", label ? label + " unavailable" : "unavailable");
       return;
     }
-    rowsMeterWrap.removeAttribute("data-empty");
+    wrap.removeAttribute("data-empty");
     var width = percent;
     if (width > 0 && width < 0.7) { width = 0.7; }
     if (width > 100) { width = 100; }
-    rowsMeter.style.width = width + "%";
-    if (percent > 0 && percent < 0.1) { rowsMeter.setAttribute("data-tiny", "true"); }
-    else { rowsMeter.removeAttribute("data-tiny"); }
+    fill.style.width = width + "%";
+    if (percent > 0 && percent < 0.1) { fill.setAttribute("data-tiny", "true"); }
+    else { fill.removeAttribute("data-tiny"); }
+    wrap.setAttribute("aria-valuemin", "0");
+    wrap.setAttribute("aria-valuemax", String(total));
+    wrap.setAttribute("aria-valuenow", String(used || 0));
+    wrap.setAttribute("aria-valuetext", (label ? label + ": " : "") + percent.toFixed(percent < 1 ? 2 : 1) + "% actual use");
+  }
+  function setRowsMeter(rows, capacity) {
+    setMeter(rowsMeterWrap, rowsMeter, rows, capacity, "rows");
+  }
+  function clearMeter(wrap, fill, note) {
+    setMeter(wrap, fill, "0", "0", "");
+    if (note) { note.textContent = ""; }
   }
   function databaseLabel(db) { return db && (db.name || db.id) || "database"; }
   function databaseEngine(db) {
@@ -483,6 +518,8 @@
     if (metricMemoryDetail) { metricMemoryDetail.textContent = label === "asleep" ? "working set unavailable while asleep" : "working set unavailable"; }
     metricStorage.textContent = "allocated storage —";
     setRowsMeter("0", "0");
+    clearMeter(memoryMeterWrap, memoryMeter, memoryMeterNote);
+    clearMeter(storageMeterWrap, storageMeter, storageMeterNote);
   }
   function renderStatsEmpty() {
     monitorState.textContent = "—";
@@ -493,38 +530,209 @@
     if (metricMemoryDetail) { metricMemoryDetail.textContent = "working set unavailable"; }
     metricStorage.textContent = "allocated storage —";
     setRowsMeter("0", "0");
+    clearMeter(memoryMeterWrap, memoryMeter, memoryMeterNote);
+    clearMeter(storageMeterWrap, storageMeter, storageMeterNote);
   }
-  function renderStats(db, payload) {
+  function secondsAgo(ts) {
+    return Math.max(0, Math.round((Date.now() - ts) / 1000));
+  }
+  function statsTransientReason(value) {
+    var text = String(value == null ? "" : value);
+    return /timeout|timed.?out|busy|unknown|temporar|retry|unreachable|waking|cold|sample/i.test(text);
+  }
+  function statsPayloadIsTransient(payload) {
+    if (!payload) { return false; }
+    return payload.transient === true ||
+      payload.temporary === true ||
+      payload.retryable === true ||
+      payload.unknown === true ||
+      payload.statsUnknown === true ||
+      payload.status === "busy" ||
+      payload.availableReason === "transient" ||
+      statsTransientReason(payload.reason || payload.code || payload.status || payload.message);
+  }
+  function statsPayloadIsStale(payload) {
+    if (!payload) { return false; }
+    var stats = payload.stats || {};
+    return payload.stale === true || stats.stale === true || payload.status === "busy" || stats.status === "busy";
+  }
+  function statsPayloadStatus(payload, stats, meta) {
+    var status = String((payload && payload.status) || (stats && stats.status) || "");
+    if (status === "busy") { return "busy"; }
+    if (meta.stale || statsPayloadIsStale(payload)) { return "stale"; }
+    return stats && stats.engine ? "engine " + stats.engine : "running";
+  }
+  function statsSampleAgeText(payload, meta) {
+    var stats = payload && payload.stats || {};
+    var age = payload && payload.sampleAgeSeconds != null ? payload.sampleAgeSeconds : stats.sampleAgeSeconds;
+    if (age != null && age !== "") {
+      var n = Number(age);
+      if (isFinite(n)) { return String(Math.max(0, Math.round(n))) + "s ago"; }
+    }
+    if (meta.sampledAt) { return secondsAgo(meta.sampledAt) + "s ago"; }
+    return "earlier";
+  }
+  function statsErrorIsTransient(e) {
+    return !!(e && (e.timedOut || e.code === "timeout" || e.code === "cold_start" ||
+      statsTransientReason(e.code || e.message)));
+  }
+  function statsMissReason(e) {
+    if (!e) { return "sample missed"; }
+    if (e.timedOut || e.code === "timeout") { return "stats probe timed out while the instance may be busy"; }
+    return e.message || e.reason || e.code || "sample missed";
+  }
+  function renderStatsMiss(db, reason, transient) {
+    if (!db) { renderStatsEmpty(); return; }
+    var idValue = db.id;
+    var misses = (statsMisses[idValue] || 0) + 1;
+    statsMisses[idValue] = misses;
+    var cached = statsCache[idValue];
+    if (cached && (transient || misses < STATS_MISS_THRESHOLD)) {
+      renderStats(db, cached.payload, {
+        stale: true,
+        sampledAt: cached.sampledAt,
+        cpuText: cached.cpuText,
+        reason: reason,
+        misses: misses
+      });
+      return;
+    }
+    if (!cached && (transient || misses < STATS_MISS_THRESHOLD)) {
+      monitorState.textContent = transient ? "busy" : "waiting";
+      metricRows.textContent = "No sample yet";
+      metricRowsHint.textContent = "Latest stats sample missed: " + reason + ". Waiting for a successful sample.";
+      metricCpu.textContent = "—";
+      metricMemory.textContent = "No sample yet";
+      if (metricMemoryDetail) { metricMemoryDetail.textContent = "stats probe did not return a sample yet"; }
+      metricStorage.textContent = "allocated storage —";
+      setRowsMeter("0", "0");
+      clearMeter(memoryMeterWrap, memoryMeter, memoryMeterNote);
+      clearMeter(storageMeterWrap, storageMeter, storageMeterNote);
+      return;
+    }
+    renderStatsUnavailable(reason || "unavailable");
+  }
+  function firstValue(obj, names) {
+    for (var i = 0; i < names.length; i += 1) {
+      if (obj && obj[names[i]] != null && obj[names[i]] !== "") { return obj[names[i]]; }
+    }
+    return null;
+  }
+  function memoryReservationValues(obj) {
+    return {
+      reserved: firstValue(obj, ["reservedBytes"]),
+      used: firstValue(obj, ["actualUsedBytes"])
+    };
+  }
+  function storageReservationValues(obj) {
+    return {
+      reserved: firstValue(obj, ["dataReservedBytes"]),
+      used: firstValue(obj, ["dataUsedBytes"])
+    };
+  }
+  function renderReservationBar(wrap, fill, note, used, reserved, label, noteText) {
+    if (used == null || reserved == null) {
+      clearMeter(wrap, fill, note);
+      return false;
+    }
+    setMeter(wrap, fill, used, reserved, label);
+    if (note) { note.textContent = noteText; }
+    return true;
+  }
+  function renderStats(db, payload, meta) {
+    meta = meta || {};
     if (!db) { renderStatsEmpty(); return; }
     if (isAsleep(db)) { renderStatsUnavailable(db.state); return; }
     if (!payload) {
-      monitorState.textContent = "waiting";
-      metricRows.textContent = "No sample yet";
-      metricRowsHint.textContent = "Rows are shown against capacity when the first stats sample arrives.";
-      metricCpu.textContent = "—";
-      metricMemory.textContent = "No sample yet";
-      if (metricMemoryDetail) { metricMemoryDetail.textContent = "waiting for working set sample"; }
-      metricStorage.textContent = "allocated storage —";
-      setRowsMeter("0", "0");
+      var cached = statsCache[db.id];
+      if (cached) {
+        renderStats(db, cached.payload, {
+          stale: true,
+          sampledAt: cached.sampledAt,
+          cpuText: cached.cpuText,
+          reason: "waiting for the next stats sample",
+          misses: statsMisses[db.id] || 0
+        });
+      } else {
+        monitorState.textContent = "waiting";
+        metricRows.textContent = "No sample yet";
+        metricRowsHint.textContent = "Rows are shown against capacity when the first stats sample arrives.";
+        metricCpu.textContent = "—";
+        metricMemory.textContent = "No sample yet";
+        if (metricMemoryDetail) { metricMemoryDetail.textContent = "waiting for working set sample"; }
+        metricStorage.textContent = "allocated storage —";
+        setRowsMeter("0", "0");
+        clearMeter(memoryMeterWrap, memoryMeter, memoryMeterNote);
+        clearMeter(storageMeterWrap, storageMeter, storageMeterNote);
+      }
       return;
     }
-    if (payload.available === false) { renderStatsUnavailable(payload.reason); return; }
+    var hasStatsPayload = payload.stats || payload.rows != null;
+    if (payload.available === false) {
+      if (statsPayloadIsTransient(payload) && !hasStatsPayload) {
+        renderStatsMiss(db, payload.message || payload.reason || "stats sample unavailable right now", true);
+        return;
+      }
+      if (!statsPayloadIsTransient(payload)) {
+        renderStatsUnavailable(payload.reason);
+        return;
+      } else {
+        meta = Object.assign({}, meta, { stale: true });
+      }
+    }
+    if (statsPayloadIsTransient(payload) && !payload.stats && payload.rows == null) {
+      renderStatsMiss(db, payload.message || payload.reason || "stats sample unavailable right now", true);
+      return;
+    }
     var stats = payload.stats || payload;
     var rows = stats.rows || "0";
-    var capacity = stats.capacity || "4194304";
-    var rowsPercent = percentFromDecimalStrings(rows, capacity);
-    monitorState.textContent = stats.engine ? "engine " + stats.engine : "running";
-    metricRows.textContent = formatDecimalString(rows) + " / " + formatDecimalString(capacity);
-    metricRowsHint.textContent = rowsPercent == null ? "capacity unavailable" : rowsPercent.toFixed(rowsPercent < 1 ? 2 : 1) + " % of row capacity";
-    setRowsMeter(rows, capacity);
-    var memory = stats.memory || {};
-    var workingSet = memory.workingSetBytes != null && memory.workingSetBytes !== "" ? memory.workingSetBytes : memory.usedBytes;
-    metricMemory.textContent = formatBytes(workingSet) + " working set / " + formatBytes(memory.limitBytes);
-    if (metricMemoryDetail) {
-      metricMemoryDetail.textContent = "total " + formatBytes(memory.usedBytes) + "; reclaimable " + formatBytes(memory.reclaimableBytes);
+    var capacity = stats.capacity;
+    var hasCapacity = capacity != null && capacity !== "";
+    var rowsPercent = hasCapacity ? percentFromDecimalStrings(rows, capacity) : null;
+    var isStale = meta.stale || statsPayloadIsStale(payload);
+    monitorState.textContent = statsPayloadStatus(payload, stats, Object.assign({}, meta, { stale: isStale }));
+    metricRows.textContent = hasCapacity ? formatDecimalString(rows) + " / " + formatDecimalString(capacity) : formatDecimalString(rows);
+    metricRowsHint.textContent = hasCapacity
+      ? (rowsPercent == null ? "capacity unavailable" : rowsPercent.toFixed(rowsPercent < 1 ? 2 : 1) + " % of row capacity")
+      : "Capacity ceiling unknown for this sample.";
+    if (isStale) {
+      metricRowsHint.textContent += " · stale sample as of " + statsSampleAgeText(payload, meta);
+      if (meta.reason) { metricRowsHint.textContent += "; latest probe missed: " + meta.reason; }
     }
-    metricStorage.textContent = "allocated storage " + formatBytes((stats.storage || {}).dataBytes);
-    metricCpu.textContent = cpuText(db.id, stats.cpu || {});
+    if (hasCapacity) { setRowsMeter(rows, capacity); }
+    else { setRowsMeter("0", "0"); }
+    var memory = stats.memory || {};
+    var memoryReservation = memoryReservationValues(memory);
+    var workingSet = memory.workingSetBytes != null && memory.workingSetBytes !== "" ? memory.workingSetBytes : memory.usedBytes;
+    if (renderReservationBar(memoryMeterWrap, memoryMeter, memoryMeterNote, memoryReservation.used, memoryReservation.reserved, "memory", "Reservation is allocated up front; fill is dirty anonymous memory.")) {
+      metricMemory.textContent = formatBytes(memoryReservation.used) + " actual / " + formatBytes(memoryReservation.reserved) + " reserved";
+      if (metricMemoryDetail) {
+        metricMemoryDetail.textContent = "reclaimable " + formatBytes(memory.reclaimableBytes);
+        if (workingSet != null && workingSet !== "") { metricMemoryDetail.textContent += "; working set " + formatBytes(workingSet); }
+        if (isStale) { metricMemoryDetail.textContent += "; stale sample retained"; }
+      }
+    } else {
+      metricMemory.textContent = formatBytes(workingSet) + " working set / " + formatBytes(memory.limitBytes);
+      if (metricMemoryDetail) {
+        metricMemoryDetail.textContent = "total " + formatBytes(memory.usedBytes) + "; reclaimable " + formatBytes(memory.reclaimableBytes);
+        if (isStale) { metricMemoryDetail.textContent += "; stale sample retained"; }
+      }
+    }
+    var storage = stats.storage || {};
+    var storageReservation = storageReservationValues(storage);
+    if (renderReservationBar(storageMeterWrap, storageMeter, storageMeterNote, storageReservation.used, storageReservation.reserved, "storage", "Azure Files NFS allocates .dat up front; fill is record bytes.")) {
+      metricStorage.textContent = "storage " + formatBytes(storageReservation.used) + " actual / " + formatBytes(storageReservation.reserved) + " reserved";
+    } else {
+      metricStorage.textContent = "allocated storage " + formatBytes(storage.dataBytes);
+    }
+    var cpuValue = isStale ? (meta.cpuText || metricCpu.textContent || "—") : cpuText(db.id, stats.cpu || {});
+    metricCpu.textContent = cpuValue;
+    if (!isStale) {
+      statsMisses[db.id] = 0;
+      statsCache[db.id] = { payload: payload, sampledAt: Date.now(), cpuText: cpuValue };
+    } else if (!statsCache[db.id]) {
+      statsCache[db.id] = { payload: payload, sampledAt: Date.now(), cpuText: cpuValue };
+    }
   }
   function cpuText(idValue, cpu) {
     var usage = cpu.usageUsec;
@@ -606,12 +814,20 @@
     }
     return null;
   }
+  function databaseWithoutToken(db) {
+    var clean = Object.assign({}, db);
+    delete clean.token;
+    return clean;
+  }
   function selectDatabase(db, options) {
     options = options || {};
     var previousId = currentDb && currentDb.id;
     var nextId = db && db.id;
     var refreshOnly = !!options.refresh || (previousId && nextId && previousId === nextId && options.reset !== true);
-    if (previousId !== nextId) { clearDatabaseScopedMessages(nextId); }
+    if (previousId !== nextId) {
+      resetTokenReveal();
+      clearDatabaseScopedMessages(nextId);
+    }
     currentDb = db ? Object.assign({}, currentDb && currentDb.id === db.id ? currentDb : {}, db) : null;
     currentSelectionId = currentDb ? currentDb.id : "";
     if (currentDb) {
@@ -625,6 +841,7 @@
       }
       updateTokenHeld();
     } else {
+      termToken.value = "";
       updateTokenHeld();
     }
     updateSelectedChrome();
@@ -632,15 +849,25 @@
     if (refreshOnly) { return; }
     renderStats(currentDb, null);
     showTerminal(currentDb, { reset: true });
+    if (activeView === "database") { loadPreview(); }
     if (currentDb && options.route) { setHash(options.route); }
   }
+  function clearTokenOutput(container) {
+    if (!container) { return; }
+    container.hidden = true;
+    container.textContent = "";
+    container.removeAttribute("data-state");
+    container.removeAttribute("data-db-id");
+  }
+  function clearCreateResult() {
+    clearTokenOutput(createTokenOutput);
+    say("Ready. Pick a name and tier, then create.");
+  }
+  function clearRotatedTokenOutput() {
+    clearTokenOutput(rotatedTokenOutput);
+  }
   function clearDatabaseScopedMessages(nextId) {
-    if (rotatedTokenOutput) {
-      rotatedTokenOutput.hidden = true;
-      rotatedTokenOutput.textContent = "";
-      rotatedTokenOutput.removeAttribute("data-state");
-      rotatedTokenOutput.removeAttribute("data-db-id");
-    }
+    clearRotatedTokenOutput();
     if (benchResult) { benchResult.textContent = "No bench run yet."; }
     if (previewRows) {
       previewStatus.textContent = "—";
@@ -649,8 +876,8 @@
     clearTokenNeeded();
     say(nextId ? "Ready. Selected database changed." : "Ready. Select a database.", "ok");
   }
-  function renderPreviewMessage(message) {
-    previewStatus.textContent = "—";
+  function renderPreviewMessage(message, status) {
+    previewStatus.textContent = status || "—";
     previewRows.innerHTML = '<tr><td colspan="5">' + esc(message) + '</td></tr>';
   }
   function renderPreviewRows(rows) {
@@ -686,6 +913,8 @@
     } catch (e) { /* session memory is best effort */ }
     tokenById = Object.create(null);
     if (currentDb) { delete currentDb.token; }
+    termToken.value = "";
+    resetTokenReveal();
     updateTokenHeld();
   }
   function maskToken(token) {
@@ -700,7 +929,12 @@
     if (!token) {
       tokenHeld.hidden = true;
       tokenMask.textContent = "none";
-      if (tokenReveal) { tokenReveal.hidden = true; }
+      tokenHeld.removeAttribute("data-revealed");
+      if (tokenReveal) {
+        tokenReveal.hidden = true;
+        tokenReveal.textContent = "Reveal for 10s";
+        tokenReveal.setAttribute("aria-pressed", "false");
+      }
       return;
     }
     tokenHeld.hidden = false;
@@ -756,7 +990,7 @@
     if (!idValue || !token) { return; }
     tokenById[idValue] = token;
     writeSessionToken(idValue, token);
-    if (currentDb && currentDb.id === idValue) { currentDb.token = token; }
+    if (currentDb && currentDb.id === idValue) { delete currentDb.token; }
   }
   function rememberInstanceToken(token) {
     if (!currentDb || !token) { return; }
@@ -779,7 +1013,40 @@
       '<span class="token-copy-row"><button class="btn btn--ghost" type="button" data-dismiss-token-output>Dismiss token from this screen</button></span>'
     ].join("\n");
   }
+  function previewFailureMessage(e) {
+    if (e && e.code === "cold_start") {
+      return "The instance is still waking after 45 seconds. Try preview again.";
+    }
+    if (e && e.code === "timeout") {
+      return "Preview request timed out while waiting for the instance. This does not mean the database failed; try again.";
+    }
+    if (e && e.status) {
+      return "Preview request failed (" + e.status + "): " + (e.message || "request unavailable");
+    }
+    return "Preview request failed: " + ((e && e.message) || "request unavailable");
+  }
+  function fetchPreviewRows(endpoint, token) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, 30000);
+    return fetch(endpoint.replace(/\/$/, "") + "/v1/rows?limit=" + PREVIEW_LIMIT + "&offset=0", {
+      signal: ctl.signal,
+      headers: { "Authorization": "Bearer " + token, "accept": "application/json" }
+    }).then(function (r) {
+      clearTimeout(timer);
+      return jsonFromResponse(r);
+    }).catch(function (e) {
+      clearTimeout(timer);
+      if (e.name === "AbortError") {
+        var t = new Error("the instance did not answer within 30 seconds");
+        t.code = "timeout";
+        throw t;
+      }
+      throw e;
+    });
+  }
   function loadPreview() {
+    var requestId = previewRequestId + 1;
+    previewRequestId = requestId;
     if (!currentDb || !currentDb.endpoint) {
       renderPreviewMessage("Open a database from Access first.");
       return Promise.resolve();
@@ -789,22 +1056,24 @@
     var label = databaseLabel(currentDb);
     var token = tokenForDatabase(dbId);
     if (!token) {
-      renderPreviewMessage("Paste the instance token in Access to preview rows for " + label + ".");
+      renderPreviewMessage("No token held for this database. Paste the instance token in Access to preview rows for " + label + ".", "token needed");
       return Promise.resolve();
     }
-    previewStatus.textContent = "loading";
+    renderPreviewMessage("Loading the first " + PREVIEW_LIMIT + " rows for " + label + "…", "loading");
     return withColdRetry(function () {
-      return fetch(endpoint.replace(/\/$/, "") + "/v1/rows?limit=" + PREVIEW_LIMIT + "&offset=0", {
-        headers: { "Authorization": "Bearer " + token, "accept": "application/json" }
-      }).then(jsonFromResponse);
+      return fetchPreviewRows(endpoint, token);
     }, function () {
-      previewStatus.textContent = "waking";
-      renderPreviewMessage("Waking the instance. Azure returned a cold-start page; retrying…");
+      if (previewRequestId !== requestId || !currentDb || currentDb.id !== dbId) { return; }
+      renderPreviewMessage("Waking the instance. Azure returned a cold-start page; retrying…", "waking");
     })
-      .then(function (data) { renderPreviewRows((data && data.rows) || []); })
+      .then(function (data) {
+        if (previewRequestId !== requestId || !currentDb || currentDb.id !== dbId) { return; }
+        renderPreviewRows((data && data.rows) || []);
+      })
       .catch(function (e) {
-        previewStatus.textContent = e && e.code === "cold_start" ? "waking" : "unavailable";
-        renderPreviewMessage(e && e.code === "cold_start" ? "The instance is still waking after 45 seconds. Try preview again." : (e && e.message ? e.message : "Preview unavailable."));
+        if (previewRequestId !== requestId || !currentDb || currentDb.id !== dbId) { return; }
+        previewStatus.textContent = e && e.code === "cold_start" ? "waking" : (e && e.code === "timeout" ? "timeout" : "unavailable");
+        renderPreviewMessage(previewFailureMessage(e), previewStatus.textContent);
       });
   }
   function loadDatabases(options) {
@@ -816,8 +1085,10 @@
       .then(function (data) {
         loadingList = false;
         pollDelay = POLL_BASE_MS;
-        databases = (data && data.databases) || [];
-        databases.forEach(function (db) { if (db.token) { tokenById[db.id] = db.token; } });
+        databases = ((data && data.databases) || []).map(function (db) {
+          if (db.token) { rememberInstanceTokenFor(db.id, db.token); }
+          return databaseWithoutToken(db);
+        });
         var selected = currentDb && findDb(currentDb.id);
         var refreshingSelected = !!selected;
         if (!selected && options.selectFirst && databases.length) { selected = databases[0]; }
@@ -837,12 +1108,22 @@
   function refreshSelectedStats() {
     if (!currentDb) { renderStats(null, null); return Promise.resolve(); }
     if (isAsleep(currentDb)) { renderStatsUnavailable(currentDb.state); return Promise.resolve(); }
-    monitorState.textContent = "loading";
-    return request("/databases/" + encodeURIComponent(currentDb.id) + "/stats", { method: "GET" })
-      .then(function (data) { renderStats(currentDb, data); })
-      .catch(function () {
+    var db = currentDb;
+    var cached = statsCache[db.id];
+    monitorState.textContent = cached ? "refreshing" : "loading";
+    return request("/databases/" + encodeURIComponent(db.id) + "/stats", { method: "GET" })
+      .then(function (data) {
+        if (!currentDb || currentDb.id !== db.id) { return; }
+        if (data && data.available === false && statsPayloadIsTransient(data)) {
+          renderStatsMiss(db, data.message || data.reason || "stats sample unavailable right now", true);
+          return;
+        }
+        renderStats(db, data);
+      })
+      .catch(function (e) {
         pollDelay = Math.min(POLL_MAX_MS, pollDelay * 2);
-        renderStatsUnavailable("unavailable");
+        if (!currentDb || currentDb.id !== db.id) { return; }
+        renderStatsMiss(db, statsMissReason(e), statsErrorIsTransient(e));
       });
   }
   function renderCosts(data) {
@@ -927,6 +1208,7 @@
     termMeta.textContent = "Selected " + db.id + ". Commands use the instance token, not the Entra token.";
     var token = tokenForDatabase(db.id);
     if (token) { termToken.value = token; }
+    else { termToken.value = ""; }
     // A command in flight owns the terminal's state and its input. A poll that
     // lands mid-command must not flip "running" back to "ready", nor re-enable
     // controls the command handler deliberately disabled — that is the flicker
@@ -1003,8 +1285,13 @@
       })
       .catch(function (e) {
         clearTimeout(wake);
-        setTerminalState("transport error");
-        writeTerminal(["[ERR] " + (e.code || "error"), "      " + e.message, ""]);
+        if (e && e.code === "timeout") {
+          setTerminalState("timeout");
+          writeTerminal(["[WARN] timeout", "      " + e.message + "; the instance may still be processing the command. Try again.", ""]);
+        } else {
+          setTerminalState("transport error");
+          writeTerminal(["[ERR] " + (e.code || "error"), "      " + e.message, ""]);
+        }
       })
       .then(function () {
         termCommand.disabled = false;
@@ -1014,20 +1301,24 @@
   }
   function renderCreated(d) {
     if (d.token) {
-      tokenById[d.id] = d.token;
-      writeSessionToken(d.id, d.token);
+      rememberInstanceTokenFor(d.id, d.token);
     }
-    var tokenMarkup = oneTimeTokenMarkup(d, "database created", "This is the only time the token will be shown in clear text.");
-    if (createTokenOutput) {
-      createTokenOutput.hidden = false;
-      createTokenOutput.innerHTML = tokenMarkup;
-      createTokenOutput.setAttribute("data-state", "ok");
+    if (activeView === "create") {
+      var tokenMarkup = oneTimeTokenMarkup(d, "database created", "This is the only time the token will be shown in clear text.");
+      if (createTokenOutput) {
+        createTokenOutput.hidden = false;
+        createTokenOutput.innerHTML = tokenMarkup;
+        createTokenOutput.setAttribute("data-state", "ok");
+      }
+      say("Database created. Copy the one-time token above now, then dismiss it or leave Create.", "ok");
+    } else {
+      clearCreateResult();
     }
-    say(tokenMarkup, "ok");
+    var clean = databaseWithoutToken(d);
     var existing = findDb(d.id);
-    if (existing) { Object.assign(existing, d); }
-    else { databases.unshift(d); }
-    selectDatabase(d);
+    if (existing) { Object.assign(existing, clean); }
+    else { databases.unshift(clean); }
+    selectDatabase(clean);
   }
   function sampleCommands() {
     var base = String(Date.now()) + "0";
@@ -1068,8 +1359,8 @@
       })
       .then(function () { refreshSelectedStats(); })
       .catch(function (e) {
-        previewStatus.textContent = e.code === "cold_start" ? "waking" : "unavailable";
-        renderPreviewMessage((e && e.message) || "Sample load failed.");
+        previewStatus.textContent = e && e.code === "cold_start" ? "waking" : (e && e.code === "timeout" ? "timeout" : "unavailable");
+        renderPreviewMessage(e && e.code === "timeout" ? "Sample load timed out while waiting for the instance. This does not mean the database failed; try preview again." : ((e && e.message) || "Sample load failed."), previewStatus.textContent);
       })
       .then(function () { loadSampleBtn.disabled = false; });
   }
@@ -1100,7 +1391,7 @@
     if (!token) { throw new Error("token rotation did not return a token"); }
     rememberInstanceTokenFor(db.id, token);
     if (currentDb && currentDb.id === db.id) { updateTokenHeld(); }
-    if (rotatedTokenOutput && currentDb && currentDb.id === db.id) {
+    if (rotatedTokenOutput && currentDb && currentDb.id === db.id && activeView === "access") {
       var display = Object.assign({}, db, currentDb, { token: token });
       rotatedTokenOutput.hidden = false;
       rotatedTokenOutput.setAttribute("data-db-id", db.id);
@@ -1112,7 +1403,7 @@
       rotatedTokenOutput.setAttribute("data-state", "ok");
     }
     clearTokenNeeded();
-    if (currentDb && currentDb.id === db.id) {
+    if (currentDb && currentDb.id === db.id && activeView === "access") {
       say("New token returned for " + esc(databaseLabel(db)) + ". The instance may still be restarting; update every client that used the previous token.", "ok");
     }
   }
@@ -1123,7 +1414,7 @@
       delete currentDb.token;
       termToken.value = "";
       updateTokenHeld();
-      if (rotatedTokenOutput) {
+      if (rotatedTokenOutput && activeView === "access") {
         rotatedTokenOutput.hidden = false;
         rotatedTokenOutput.removeAttribute("data-state");
         rotatedTokenOutput.setAttribute("data-db-id", db.id);
@@ -1136,7 +1427,9 @@
           "Wait for the instance to finish restarting, refresh the database state, then rotate again if you still do not have a working token. A 401 from the old token means the first rotation completed server-side."
         ].join("\n");
       }
-      say("Token rotation status unknown for " + esc(databaseLabel(db)) + ". It may still be running; do not assume the old token still works.", "ok");
+      if (activeView === "access") {
+        say("Token rotation status unknown for " + esc(databaseLabel(db)) + ". It may still be running; do not assume the old token still works.", "ok");
+      }
     }
   }
   function rotateCurrentToken() {
@@ -1158,7 +1451,7 @@
     var db = Object.assign({}, currentDb);
     rotateTokenBtn.disabled = true;
     rotateTokenBtn.textContent = "rotating…";
-    if (rotatedTokenOutput) { rotatedTokenOutput.hidden = true; rotatedTokenOutput.textContent = ""; }
+    clearRotatedTokenOutput();
     request("/databases/" + encodeURIComponent(db.id) + "/rotate-token", { method: "POST" })
       .then(function (data) { renderRotatedToken(data, db); })
       .catch(function (e) {
@@ -1166,7 +1459,7 @@
           renderRotationTimeout(db);
           return;
         }
-        if (rotatedTokenOutput && currentDb && currentDb.id === db.id) {
+        if (rotatedTokenOutput && currentDb && currentDb.id === db.id && activeView === "access") {
           rotatedTokenOutput.hidden = false;
           rotatedTokenOutput.setAttribute("data-db-id", db.id);
           rotatedTokenOutput.innerHTML = '<span class="err">[ERR]</span> ' + esc(e.code || "error") + "\n      " + esc(e.message || "token rotation failed");
@@ -1246,9 +1539,15 @@
         loadPreview();
       })
       .catch(function (e) {
-        setTerminalState("transport error");
-        benchResult.textContent = (e && e.message) || "BENCH failed.";
-        writeTerminal(["[ERR] " + (e.code || "error"), "      " + ((e && e.message) || "BENCH failed."), ""]);
+        if (e && e.code === "timeout") {
+          setTerminalState("timeout");
+          benchResult.textContent = "BENCH timed out waiting for the instance; the database may still be processing it.";
+          writeTerminal(["[WARN] timeout", "      " + e.message + "; the instance may still be processing BENCH.", ""]);
+        } else {
+          setTerminalState("transport error");
+          benchResult.textContent = (e && e.message) || "BENCH failed.";
+          writeTerminal(["[ERR] " + (e.code || "error"), "      " + ((e && e.message) || "BENCH failed."), ""]);
+        }
       })
       .then(function () {
         benchRun.disabled = false;
@@ -1276,6 +1575,16 @@
       done("copy unavailable");
     }
   }
+  function resetTokenReveal() {
+    if (revealTimer) {
+      clearTimeout(revealTimer);
+      revealTimer = 0;
+    }
+    if (tokenReveal) {
+      tokenReveal.textContent = "Reveal for 10s";
+      tokenReveal.setAttribute("aria-pressed", "false");
+    }
+  }
   function setTokenReveal(on) {
     if (revealTimer) {
       clearTimeout(revealTimer);
@@ -1293,12 +1602,12 @@
     if (copy) { copyTokenFor(copy.getAttribute("data-copy-token-for"), copy); return; }
     var dismiss = e.target.closest("[data-dismiss-token-output]");
     if (dismiss) {
-      container.hidden = true;
-      container.textContent = "";
+      clearTokenOutput(container);
     }
   }
 
   createBtn.addEventListener("click", function () {
+    clearCreateResult();
     var name = (nameEl.value || "").trim();
     if (!/^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$/.test(name)) {
       say('<span class="err">[ERR]</span> invalid_request\n      name must be 2–40 chars: lowercase letters, digits and hyphens,\n      starting and ending with a letter or digit', "error");

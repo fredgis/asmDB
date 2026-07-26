@@ -179,6 +179,57 @@ os_cmdline:
     pop  rbp
     ret
 
+; os_getenv(rcx = name) -> rax = pointer to value, or 0 if missing/empty.
+; Scans the envp vector left on the initial process stack.
+os_getenv:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x40
+    mov  [rbp-8], rbx
+    mov  [rbp-16], rsi
+    mov  [rbp-24], rdi
+    mov  [rbp-32], r12
+    mov  r12, rcx                    ; name
+    mov  rsi, [rel g_sp0]            ; -> argc
+    mov  rbx, [rsi]                  ; argc
+    lea  rsi, [rsi+8]                ; argv[0]
+    lea  rsi, [rsi+rbx*8+8]          ; envp[0], past argv NULL
+.env:
+    mov  rdi, [rsi]
+    test rdi, rdi
+    jz   .none
+    mov  r8, r12                     ; name cursor
+    mov  r9, rdi                     ; env cursor
+.cmp:
+    mov  al, [r8]
+    test al, al
+    jz   .name_end
+    cmp  al, [r9]
+    jne  .next
+    inc  r8
+    inc  r9
+    jmp  .cmp
+.name_end:
+    cmp  byte [r9], '='
+    jne  .next
+    lea  rax, [r9+1]
+    cmp  byte [rax], 0
+    je   .none
+    jmp  .done
+.next:
+    add  rsi, 8
+    jmp  .env
+.none:
+    xor  eax, eax
+.done:
+    mov  r12, [rbp-32]
+    mov  rdi, [rbp-24]
+    mov  rsi, [rbp-16]
+    mov  rbx, [rbp-8]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; --------------------------------- memory -----------------------------------
 
 ; os_alloc(rcx = size) -> rax = zeroed pointer, or 0 on failure

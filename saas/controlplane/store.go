@@ -19,14 +19,26 @@ import (
 var errNotFound = errors.New("not found")
 
 type instance struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	Tier             string    `json:"tier"`
-	Image            string    `json:"image,omitempty"`
-	Engine           string    `json:"engine,omitempty"`
-	TokenHash        string    `json:"token_hash"`
-	CreatedAt        time.Time `json:"created_at"`
-	ContainerAppName string    `json:"container_app_name"`
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	Tier             string     `json:"tier"`
+	Image            string     `json:"image,omitempty"`
+	Engine           string     `json:"engine,omitempty"`
+	EngineSource     string     `json:"engine_source,omitempty"`
+	StorageFormat    string     `json:"storage_format,omitempty"`
+	Operation        *operation `json:"operation,omitempty"`
+	TokenHash        string     `json:"token_hash"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ContainerAppName string     `json:"container_app_name"`
+}
+
+type operation struct {
+	Type         string    `json:"type"`
+	State        string    `json:"state"`
+	StartedAt    time.Time `json:"started_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Error        string    `json:"error,omitempty"`
+	PendingToken string    `json:"pendingToken,omitempty"`
 }
 
 type store interface {

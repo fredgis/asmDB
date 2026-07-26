@@ -46,7 +46,8 @@ reachable from the internet.
 **The file share is not in this fixed table.** Premium Files is billed on
 provisioned capacity, but a live one-row database on Azure Files NFS allocated
 1,073,742,336 bytes. The engine's sparse `.dat` behaviour on local filesystems
-does not carry through to this share, so storage is a per-database variable cost.
+does not carry through to this share: the hosted service reserves the full tier
+table on disk at creation, so storage is a per-database variable cost.
 
 ---
 
@@ -65,7 +66,10 @@ distinguishes a replica that is *serving a request* from one that is merely
 
 The tier is the container size, and the sizes are not free choices: Consumption
 accepts only fixed vCPU/memory pairs at a 1:2 ratio, and **0.25 vCPU / 0.5 GiB
-is the floor**. There is nothing smaller to sell. The only lever below it is not
+is the floor**. This is verified against the Azure API, not inferred from portal
+field bounds: `0.1 vCPU / 0.2 GiB` and `0.25 vCPU / 0.25 GiB` both pass the
+portal's input range but are rejected on save with
+`ContainerAppInvalidResourceTotal`. The only lever below 0.25 / 0.5 is not
 running at all, which is what scale-to-zero does.
 
 Assumed usage — stated so it can be argued with:
@@ -76,9 +80,23 @@ Assumed usage — stated so it can be argued with:
 | `standard` | 0.5 vCPU / 1 GiB | 200 | 0 (scales to zero) | **10.80** |
 | `premium` | 1 vCPU / 2 GiB | 200 | 530 (always warm) | **38.77** |
 
-Each database also needs about **1 GiB** provisioned on the Premium Files NFS
-share. At **$0.192 / GiB / month**, storage adds **$0.192 per database per
-month**.
+Tier-dependent table sizing changes this. The `.dat` file is
+`HDR + CAPACITY × 256 B`, so a smaller table is a smaller file, and since NFS
+does not honour sparseness that reduction is real from day one rather than
+theoretical:
+
+| Tier | Table | File on the share | Storage / month |
+|---|---:|---:|---:|
+| `free` | 2^19 slots | 128 MiB | $0.024 |
+| `standard` | 2^21 slots | 512 MiB | $0.096 |
+| `premium` | 2^22 slots | 1 GiB | $0.192 |
+
+That is also what sets the per-account caps. The provisioned share is 100 GiB,
+which holds roughly **800 `free`, 200 `standard` or 100 `premium` databases in
+total, across every account**. A per-account `premium` cap of 100 would let a
+single customer take the whole platform, so the cap is **10**. These caps are
+capacity controls derived from provisioning, not marketing dials: raising one
+means growing the share first.
 
 `premium` costs 3.6× `standard` for 2× the CPU because it never scales to zero:
 about $21 of its bill is a replica sitting idle so the first request does not
@@ -115,23 +133,24 @@ A ceiling worth knowing: a Container Apps environment holds **500 apps**, so
 database number 500 needs a second environment. That is a step change in the
 fixed cost, not a gradual one.
 
-Capacity now scales with the share: about **100 databases per 100 GiB**.
+Capacity now scales with the tier table: about **800 free, 200 standard or 100
+premium databases per 100 GiB**.
 
 ---
 
 ## 4. The free tier is paid for by the paid tiers
 
-A `free` database is not free to run — it costs about **$1.20/month** all in
-($0.54 compute + $0.47 amortised fixed + $0.192 storage). That has to come from
+A `free` database is not free to run — it costs about **$1.03/month** all in
+($0.54 compute + $0.47 amortised fixed + $0.024 storage). That has to come from
 somewhere.
 
 Assuming a mix of **60 % free / 30 % standard / 10 % premium** at 300 databases:
 
-- 180 free instances × $1.2045 = **$216.81/month** of unfunded cost
-- carried by 120 paying instances = **$1.81 per paying database**
+- 180 free instances × about $1.03 = **about $186/month** of unfunded cost
+- carried by 120 paying instances = **about $1.55 per paying database**
 
 If the free tier proves more popular than 60 %, this number is the first thing
-that moves. At 80 % free it becomes about $4.82 per paying database and the standard
+that moves. At 80 % free it becomes about $4.15 per paying database and the standard
 tier's margin is gone. **The three-instance cap on the free tier is a pricing
 control, not a technical limit.**
 
@@ -144,31 +163,61 @@ Cost per paying database, then **+15 % margin on run**:
 | | `standard` | `premium` |
 |---|---:|---:|
 | Compute | 10.80 | 38.77 |
-| Storage | 0.192 | 0.192 |
+| Storage | 0.096 | 0.192 |
 | Fixed, amortised at 300 | 0.47 | 0.47 |
-| Free-tier subsidy | 1.81 | 1.81 |
-| **Cost** | **13.27** | **41.24** |
-| +15 % | 15.26 | 47.43 |
+| Free-tier subsidy | 1.55 | 1.55 |
+| **Cost** | **12.92** | **40.98** |
+| +15 % | 14.86 | 47.13 |
 | **Price** | **$15 / month** | **$49 / month** |
 
-| Tier | Price | What it buys |
-|---|---|---|
-| `free` | **$0** | 0.25 vCPU / 0.5 GiB, sleeps when idle, max 3 per account |
-| `standard` | **$15 / month** | 0.5 vCPU / 1 GiB, sleeps when idle, max 20 per account |
-| `premium` | **$49 / month** | 1 vCPU / 2 GiB, always warm — no cold start, max 100 per account |
+| Tier | Price | What it buys | Max rows |
+|---|---|---|---:|
+| `free` | **$0** | 0.25 vCPU / 0.5 GiB, sleeps when idle, max 3 per account | 393 216 |
+| `standard` | **$15 / month** | 0.5 vCPU / 1 GiB, sleeps when idle, max 20 per account | 1 572 864 |
+| `premium` | **$49 / month** | 1 vCPU / 2 GiB, always warm — no cold start, max 10 per account | 3 145 728 |
 
-Every tier runs the identical engine, with the same 4 194 304-row ceiling and
-the same durability. Tiers buy **latency and headroom, not features**. There is
-no paid feature flag anywhere in the codebase and there is not meant to be one.
-The published **$15** and **$49** prices still hold: storage adds about 19 cents
-per database per month, which is noise against the standard and premium tiers.
+Every tier runs the identical engine and the same durability. Tiers buy
+**latency and headroom, not features**. There is no paid feature flag anywhere
+in the codebase and there is not meant to be one.
+
+Do not read the README's workstation benchmark as a tier guarantee. The public
+engine number is an in-RAM insert loop on one workstation core; hosted tiers get
+0.25, 0.5 or 1.0 Container Apps vCPU, plus REST/gateway overhead. Per-tier
+throughput figures are not published yet. `free` and `standard` also scale to
+zero, so the first request after idling waits for a container start; `premium`
+stays warm, and that avoided cold start is part of what its price buys.
+
+The row ceiling is headroom, not a feature flag either — it is a direct
+consequence of the memory the tier is given. The slot table is mapped
+copy-on-write, so on a local sparse filesystem a mostly empty database consumes
+only touched pages. In the hosted service, however, the cgroup working-set
+counter includes file-backed page cache from that mapping; it is a reservation
+and reclaimable-cache signal, not private memory pressure. A 4 194 304-slot
+table is exactly 1 GiB of addressable table, which is why every tier used to
+allocate 1 GiB and why `free`, with 0.5 GiB, was provisioned below the engine's
+own table. Each tier now gets the largest table its memory can safely carry, and
+the usable row count is that slot count capped by the engine's 0.75 load factor:
+
+| Tier | Memory | Slots | Table | Usable rows |
+|---|---:|---:|---:|---:|
+| `free` | 0.5 GiB | 2^19 = 524 288 | 128 MiB | 393 216 |
+| `standard` | 1 GiB | 2^21 = 2 097 152 | 512 MiB | 1 572 864 |
+| `premium` | 2 GiB | 2^22 = 4 194 304 | 1 GiB | 3 145 728 |
+
+The capacity is recorded in the database file header at creation, so upgrading a
+tier grows the table through the engine's existing migration path rather than
+reshaping a live file underneath a running instance.
+
+The published **$15** and **$49** prices still hold: storage is 9.6 cents for
+standard and 19.2 cents for premium per database per month, which is noise
+against the standard and premium tiers.
 
 ---
 
 ## 6. What would break this
 
 - **Fewer than 150 databases.** At 50, fixed cost alone is $2.84 per database
-  and `standard` earns $9 a month against about $19.18 of cost. The model is a
+  and `standard` earns $9 a month against about $18.93 of cost. The model is a
   volume model; below volume it loses money.
 - **A free tier that is too popular.** See §4.
 - **`premium` customers who are genuinely busy.** The 200 active hours assumed

@@ -15,6 +15,115 @@ strcpy_z:
 .done:
     ret
 
+; str_eq_z(rcx = a, rdx = b) -> rax = 1 if NUL-terminated strings match
+str_eq_z:
+    mov  r8, rcx
+    mov  r9, rdx
+.l:
+    mov  al, [r8]
+    cmp  al, [r9]
+    jne  .no
+    test al, al
+    jz   .yes
+    inc  r8
+    inc  r9
+    jmp  .l
+.yes:
+    mov  eax, 1
+    ret
+.no:
+    xor  eax, eax
+    ret
+
+; capacity_set(rcx = slots, rdx = hash shift)
+capacity_set:
+    mov  [rel g_capacity], rcx
+    mov  rax, rcx
+    dec  rax
+    mov  [rel g_cap_mask], rax
+    mov  [rel g_cap_shift], dl
+    mov  rax, rcx
+    shl  rax, REC_SHIFT
+    mov  [rel g_region_bytes], rax
+    shr  rax, SPARSE_SHIFT
+    mov  [rel g_region_chunks], rax
+    mov  rax, rcx
+    mov  [rel g_hdr+16], rax
+    ret
+
+; capacity_from_header(rcx = slots) -> rax = 1 if supported, else 0
+capacity_from_header:
+    cmp  rcx, CAP_SMALL
+    je   .small
+    cmp  rcx, CAP_MEDIUM
+    je   .medium
+    cmp  rcx, CAP_LARGE
+    je   .large
+    xor  eax, eax
+    ret
+.small:
+    mov  edx, SHIFT_SMALL
+    call capacity_set
+    mov  eax, 1
+    ret
+.medium:
+    mov  edx, SHIFT_MEDIUM
+    call capacity_set
+    mov  eax, 1
+    ret
+.large:
+    mov  edx, SHIFT_LARGE
+    call capacity_set
+    mov  eax, 1
+    ret
+
+; capacity_from_env() - choose creation/upgrade destination capacity.
+; ASMDB_CAPACITY values are case-sensitive: small, medium, large.
+; Missing, empty, or unknown values fall back to large.
+capacity_from_env:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    lea  rcx, [rel s_env_capacity]
+    call os_getenv
+    test rax, rax
+    jz   .large
+    cmp  byte [rax], 0
+    je   .large
+    mov  [rbp-8], rax
+    mov  rcx, rax
+    lea  rdx, [rel s_cap_small]
+    call str_eq_z
+    test rax, rax
+    jnz  .small
+    mov  rcx, [rbp-8]
+    lea  rdx, [rel s_cap_medium]
+    call str_eq_z
+    test rax, rax
+    jnz  .medium
+    mov  rcx, [rbp-8]
+    lea  rdx, [rel s_cap_large]
+    call str_eq_z
+    test rax, rax
+    jnz  .large
+    jmp  .large
+.small:
+    mov  ecx, CAP_SMALL
+    mov  edx, SHIFT_SMALL
+    jmp  .set
+.medium:
+    mov  ecx, CAP_MEDIUM
+    mov  edx, SHIFT_MEDIUM
+    jmp  .set
+.large:
+    mov  ecx, CAP_LARGE
+    mov  edx, SHIFT_LARGE
+.set:
+    call capacity_set
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; strcpy_n(rdi = dest, rsi = src, rcx = count) - copy src until NUL, zero-pad to
 ; exactly count bytes. Clobbers rax, r8, r10.
 strcpy_n:
@@ -191,6 +300,8 @@ db_write_header:
     mov  [rbp-16], rdi
     mov  rax, [rel g_count]
     mov  [rel g_hdr+24], rax
+    mov  rax, [rel g_capacity]
+    mov  [rel g_hdr+16], rax
     mov  rax, [rel g_seq]
     mov  [rel g_hdr+HDR_SEQ], rax    ; CDC watermark
     mov  rax, [rel g_reset_pend]
@@ -441,10 +552,10 @@ db_init_names:
 ;   0 bytes                      -> brand-new database (create)
 ;   1 .. HDR_SIZE-1 bytes        -> partially written header  -> refuse
 ;   bad magic                    -> not an asmdb file         -> refuse
-;   version/REC_SIZE/CAPACITY    -> incompatible build        -> refuse
-;   count > CAPACITY             -> corrupt header            -> refuse
+;   version/REC_SIZE/capacity    -> incompatible build        -> refuse
+;   count > capacity             -> corrupt header            -> refuse
 ;   slot region shorter than     -> truncated data region     -> refuse
-;   CAPACITY*REC_SIZE
+;   capacity*REC_SIZE
 ; The WAL is only opened and replayed once the header is known good, so a
 ; corrupt .dat is never written to.
 db_open:
@@ -475,12 +586,13 @@ db_open:
     jne  .format
     cmp  dword [rel g_hdr_read+12], REC_SIZE
     jne  .format
-    mov  rax, CAPACITY
-    cmp  [rel g_hdr_read+16], rax
-    jne  .format
+    mov  rcx, [rel g_hdr_read+16]
+    call capacity_from_header
+    test rax, rax
+    jz   .format
     ; live count must be inside the table
     mov  rax, [rel g_hdr_read+24]
-    mov  rdx, CAPACITY
+    mov  rdx, [rel g_capacity]
     cmp  rax, rdx
     ja   .corrupt
     mov  [rel g_count], rax
@@ -563,6 +675,7 @@ db_open:
     ; the logical size to the full region without allocating/zeroing 1 GiB.
     mov  rcx, [rel g_dat_handle]
     call os_set_sparse
+    call capacity_from_env
     mov  qword [rel g_count], 0
     mov  qword [rel g_writer_ver], ENGINE_VERSION   ; we are creating it
     call cdc_lineage_make            ; a brand-new database, a brand-new lineage
@@ -579,7 +692,8 @@ db_open:
     call db_write_header
     ; extend the (sparse) file to header + full slot region; holes read as zero
     mov  rcx, [rel g_dat_handle]
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
     call os_truncate
     test rax, rax
     jnz  io_fatal
@@ -606,11 +720,13 @@ db_open:
     call os_filesize
     test rax, rax
     js   io_fatal_read
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
     cmp  rax, rdx
     jb   .corrupt                    ; data region truncated
     mov  rcx, [rel g_dat_handle]
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
     call os_map_cow
     test rax, rax
     jz   .mapfail
@@ -656,7 +772,7 @@ db_open:
     call put_u64
     lea  rcx, [rel s_fmt_cap]
     call puts
-    mov  ecx, CAPACITY
+    mov  rcx, [rel g_capacity]
     call put_u64
     lea  rcx, [rel s_fmt_slots]
     call puts
@@ -734,6 +850,7 @@ db_upgrade:
     mov  rax, [rel g_hdr]
     cmp  rax, [rel g_hdr_read]       ; 8-byte magic
     jne  .badsrc
+    call capacity_from_env           ; destination size (default large)
     ; ---- report what we found ----
     lea  rcx, [rel s_upg_srcfmt]
     call puts
@@ -759,7 +876,7 @@ db_upgrade:
     call put_u64
     lea  rcx, [rel s_upg_caps]
     call puts
-    mov  ecx, CAPACITY
+    mov  rcx, [rel g_capacity]
     call put_u64
     lea  rcx, [rel s_upg_slots]
     call puts
@@ -768,7 +885,7 @@ db_upgrade:
     ja   .cant                       ; written by a NEWER build - never guess
     cmp  dword [rel g_hdr_read+12], REC_SIZE
     jne  .cant                       ; a different record layout has no path
-    mov  rax, CAPACITY
+    mov  rax, [rel g_capacity]
     cmp  [rel g_hdr_read+16], rax
     jne  .migrate
     cmp  dword [rel g_hdr_read+8], DB_VERSION
@@ -782,6 +899,10 @@ db_upgrade:
     mov  qword [rel g_reset_seq], 0
     mov  r13, [rel g_hdr_read+16]    ; old capacity
     mov  rax, [rel g_hdr_read+24]    ; live rows the source claims to hold
+    cmp  rax, r13
+    ja   .badsrc
+    cmp  rax, [rel g_capacity]
+    ja   .nospace
     mov  [rbp-88], rax
     ; ---- create the destination ----
     lea  rdi, [rel g_bakname]
@@ -803,7 +924,8 @@ db_upgrade:
     mov  rcx, rax
     call os_set_sparse
     mov  rcx, [rel g_dat_handle]
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
     call os_truncate
     test rax, rax
     jnz  io_fatal
@@ -816,7 +938,8 @@ db_upgrade:
     call db_write_header
     ; map the destination as the live store and rehash into it
     mov  rcx, [rel g_dat_handle]
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
     call os_map_cow
     test rax, rax
     jz   .nodest
@@ -902,9 +1025,9 @@ db_upgrade:
     ; ---- persist the rebuilt table ----
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
-    mov  r8, CAPACITY*REC_SIZE
+    mov  r8, [rel g_region_bytes]
     call write_at
-    mov  rdx, CAPACITY*REC_SIZE
+    mov  rdx, [rel g_region_bytes]
     cmp  rax, rdx
     jne  io_fatal
     call db_write_header
@@ -1028,7 +1151,13 @@ snap_refresh:
     call read_at
     cmp  rax, HDR_SIZE
     jne  io_fatal_read
+    mov  rcx, [rel g_hdr_read+16]
+    call capacity_from_header
+    test rax, rax
+    jz   io_fatal_read
     mov  rax, [rel g_hdr_read+24]
+    cmp  rax, [rel g_capacity]
+    ja   io_fatal_read
     mov  [rel g_count], rax
     mov  rax, [rel g_hdr_read+HDR_SEQ]
     mov  [rel g_seq], rax
@@ -1063,9 +1192,10 @@ db_open_reader:
     jne  .badver
     cmp  dword [rel g_hdr_read+12], REC_SIZE
     jne  .badver
-    mov  rax, CAPACITY
-    cmp  [rel g_hdr_read+16], rax
-    jne  .badver
+    mov  rcx, [rel g_hdr_read+16]
+    call capacity_from_header
+    test rax, rax
+    jz   .badver
     lea  rsi, [rel g_hdr_read+HDR_TABLE]
     lea  rdi, [rel g_tablename]
     mov  rcx, TABLE_MAX
@@ -1076,11 +1206,13 @@ db_open_reader:
     call os_filesize
     test rax, rax
     js   io_fatal_read
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
     cmp  rax, rdx
     jb   .corrupt
     mov  rcx, [rel g_dat_handle]
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
     call os_map_read
     test rax, rax
     jz   .mapfail
@@ -1199,7 +1331,7 @@ bulk_clear_table:
     mov  [rbp-8], rbx
     xor  rbx, rbx
 .loop:
-    cmp  rbx, CAPACITY
+    cmp  rbx, [rel g_capacity]
     jae  .done
     mov  rax, rbx
     shl  rax, REC_SHIFT
@@ -1300,7 +1432,7 @@ region_scan_used:
     mov  [rbp-8], rbx
     xor  rbx, rbx
 .loop:
-    cmp  rbx, REGION_CHUNKS
+    cmp  rbx, [rel g_region_chunks]
     jae  .done
     mov  rcx, rbx
     shl  rcx, SPARSE_SHIFT
@@ -1340,7 +1472,7 @@ region_write_sparse:
     mov  [rbp-16], rcx               ; overwrite mode
     xor  rbx, rbx
 .loop:
-    cmp  rbx, REGION_CHUNKS
+    cmp  rbx, [rel g_region_chunks]
     jae  .done
     mov  rcx, rbx
     shl  rcx, SPARSE_SHIFT

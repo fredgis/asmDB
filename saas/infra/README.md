@@ -54,7 +54,7 @@ The custom domain uses the Let's Encrypt certificate found in the local Posh-ACM
 
 Approximate cost drivers are APIM Developer, Log Analytics ingestion/retention, ACR Premium, private endpoints, the Container Apps environment/control-plane replica, storage capacity/transactions, and any `db-*` Container Apps created by the control plane. The control plane is pinned to one 0.5 CPU / 1 Gi replica.
 
-The durable instance volume is one shared Premium Azure Files NFS 4.1 share with `shareQuota: 100`. Premium Files has a 100 GiB minimum allocation; in `swedencentral` the Azure Retail Prices API reports Premium LRS provisioned storage at about USD 0.19 per GB-month, so the baseline share is about USD 19/month before transaction/burst charges. The live share does not honour sparseness, so each database occupies about 1 GiB.
+The durable instance volume is one shared Premium Azure Files NFS 4.1 share with `shareQuota: 100`. Premium Files has a 100 GiB minimum allocation; in `swedencentral` the Azure Retail Prices API reports Premium LRS provisioned storage at about USD 0.19 per GB-month, so the baseline share is about USD 19/month before transaction/burst charges. The live share does not honour sparseness, so each database occupies its full tier table from creation: about 128 MiB for free, 512 MiB for standard or 1 GiB for premium.
 
 ## Tear down
 
@@ -63,4 +63,3 @@ The durable instance volume is one shared Premium Azure Files NFS 4.1 share with
 ```
 
 Use `-Force` to skip the prompt. The teardown deletes the platform resources and every `db-*` Container App, but never deletes the `<service-resource-group>` resource group.
-

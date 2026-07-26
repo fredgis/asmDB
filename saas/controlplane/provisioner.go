@@ -30,8 +30,8 @@ type provisioner interface {
 	Create(context.Context, instance, string) (string, error)
 	GetState(context.Context, instance) (liveState, error)
 	Delete(context.Context, instance) error
-	RotateToken(context.Context, instance, string) error
-	UpgradeImage(context.Context, instance, string) error
+	RotateToken(context.Context, instance, string, func(string)) error
+	UpgradeImage(context.Context, instance, string, func(string)) error
 	ReplicaAverages(context.Context, instance, time.Time, time.Time, time.Duration) ([]replicaSample, error)
 	Endpoint(instance) string
 	InternalEndpoint(instance) string
@@ -48,12 +48,31 @@ type tierSpec struct {
 	MinReplicas int32
 	MaxReplicas int32
 	Quota       int
+	// Capacity names the engine's slot-table size. The table is anonymous
+	// memory, not a file mapping, so its size is charged against the tier's
+	// memory allowance: a 2^22-slot table is exactly 1 GiB of RAM. Sizing it
+	// per tier is what keeps the smallest tier from allocating a table larger
+	// than the memory it was given.
+	Capacity string
+	// MaxRows is the usable row count, which is the slot count capped by the
+	// 0.75 load factor the engine enforces. It is published to customers, so
+	// it must match what the engine actually refuses to exceed.
+	MaxRows int
 }
 
+// Quota is a per-account cap. It is bounded by what the platform can actually
+// serve, not by what sounds generous: every instance keeps its own file on the
+// shared NFS volume, and Azure Files NFS does not honour sparseness, so a
+// database occupies its full table size on disk from the day it is created.
+// With a 100 GiB share that is roughly 800 free, 200 standard or 100 premium
+// databases in total — across every account. A per-account premium cap of 100
+// would therefore let a single customer consume the entire platform, which is a
+// promise the service cannot keep. Raising these caps requires growing the
+// share first.
 var tierSpecs = map[string]tierSpec{
-	"free":     {CPU: 0.25, Memory: "0.5Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 3},
-	"standard": {CPU: 0.5, Memory: "1Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 20},
-	"premium":  {CPU: 1.0, Memory: "2Gi", MinReplicas: 1, MaxReplicas: 1, Quota: 100},
+	"free":     {CPU: 0.25, Memory: "0.5Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 3, Capacity: "small", MaxRows: 393216},
+	"standard": {CPU: 0.5, Memory: "1Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 20, Capacity: "medium", MaxRows: 1572864},
+	"premium":  {CPU: 1.0, Memory: "2Gi", MinReplicas: 1, MaxReplicas: 1, Quota: 10, Capacity: "large", MaxRows: 3145728},
 }
 
 type azureProvisioner struct {
@@ -153,6 +172,10 @@ func (p *azureProvisioner) buildContainerApp(in instance, token string) (armappc
 		{Name: to.Ptr("ASMDB_NAME"), Value: to.Ptr("main")},
 		{Name: to.Ptr("ASMDB_DATA"), Value: to.Ptr("/data")},
 		{Name: to.Ptr("PORT"), Value: to.Ptr("8080")},
+		// Only consulted when the engine creates the database file; on every
+		// later start the capacity recorded in the file header wins, so
+		// changing this variable never silently reshapes an existing database.
+		{Name: to.Ptr("ASMDB_CAPACITY"), Value: to.Ptr(spec.Capacity)},
 	}
 	if p.platformSecret != "" {
 		env = append(env, &armappcontainers.EnvironmentVar{
@@ -243,22 +266,22 @@ func (p *azureProvisioner) Delete(ctx context.Context, in instance) error {
 	return err
 }
 
-func (p *azureProvisioner) RotateToken(ctx context.Context, in instance, token string) error {
-	return p.updateContainerApp(ctx, in, func(container *armappcontainers.Container) {
+func (p *azureProvisioner) RotateToken(ctx context.Context, in instance, token string, progress func(string)) error {
+	return p.updateContainerApp(ctx, in, progress, func(container *armappcontainers.Container) {
 		setContainerEnv(container, "ASMDB_TOKEN", token)
 	})
 }
 
-func (p *azureProvisioner) UpgradeImage(ctx context.Context, in instance, image string) error {
-	return p.updateContainerApp(ctx, in, func(container *armappcontainers.Container) {
+func (p *azureProvisioner) UpgradeImage(ctx context.Context, in instance, image string, progress func(string)) error {
+	return p.updateContainerApp(ctx, in, progress, func(container *armappcontainers.Container) {
 		container.Image = to.Ptr(image)
 	})
 }
 
-func (p *azureProvisioner) updateContainerApp(ctx context.Context, in instance, update func(*armappcontainers.Container)) error {
+func (p *azureProvisioner) updateContainerApp(ctx context.Context, in instance, progress func(string), update func(*armappcontainers.Container)) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 	defer cancel()
-	return updateContainerAppStopThenStart(ctx, p, in, update)
+	return updateContainerAppStopThenStart(ctx, p, in, progress, update)
 }
 
 type containerAppUpdateBackend interface {
@@ -269,7 +292,7 @@ type containerAppUpdateBackend interface {
 	WaitContainerAppReady(context.Context, instance) error
 }
 
-func updateContainerAppStopThenStart(ctx context.Context, backend containerAppUpdateBackend, in instance, update func(*armappcontainers.Container)) error {
+func updateContainerAppStopThenStart(ctx context.Context, backend containerAppUpdateBackend, in instance, progress func(string), update func(*armappcontainers.Container)) error {
 	previous, err := backend.GetContainerApp(ctx, in)
 	if err != nil {
 		return err
@@ -292,6 +315,7 @@ func updateContainerAppStopThenStart(ctx context.Context, backend containerAppUp
 	// still alive, and the outgoing revision is not retired until the new one is
 	// healthy. Stop first, then update, then start and wait for readiness.
 	if !containerAppIsStopped(previous) {
+		reportProgress(progress, "stopping")
 		if err := backend.StopContainerApp(ctx, in); err != nil {
 			return fmt.Errorf("stop instance before update: %w", err)
 		}
@@ -309,13 +333,21 @@ func updateContainerAppStopThenStart(ctx context.Context, backend containerAppUp
 	if err := backend.CreateOrUpdateContainerApp(ctx, in, app); err != nil {
 		return rollbackContainerAppUpdate(ctx, backend, in, restore, fmt.Errorf("apply instance update: %w", err))
 	}
+	reportProgress(progress, "starting")
 	if err := backend.StartContainerApp(ctx, in); err != nil {
 		return rollbackContainerAppUpdate(ctx, backend, in, restore, fmt.Errorf("start updated instance: %w", err))
 	}
+	reportProgress(progress, "verifying_health")
 	if err := backend.WaitContainerAppReady(ctx, in); err != nil {
 		return rollbackContainerAppUpdate(ctx, backend, in, restore, fmt.Errorf("updated instance did not become healthy: %w", err))
 	}
 	return nil
+}
+
+func reportProgress(progress func(string), state string) {
+	if progress != nil {
+		progress(state)
+	}
 }
 
 func rollbackContainerAppUpdate(ctx context.Context, backend containerAppUpdateBackend, in instance, restore armappcontainers.ContainerApp, cause error) error {

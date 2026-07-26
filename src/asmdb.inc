@@ -30,12 +30,16 @@
 ; ---- Row-kind tag (stored in REC_KIND; reserved for future use) ----
 %define KIND_GENERIC 0
 
-; ---- Hash table (v1: fixed power-of-two capacity) ----
-; CAPACITY = 2^22 slots x 256 B = a 1 GiB record region, sized so the table can
-; hold millions of rows below the 0.75 load-factor cap (BENCH tops out at 3.1M).
-; The .dat file is created sparse (see db_open), so an empty DB costs ~0 on disk.
-%define CAPACITY   4194304
-%define CAP_SHIFT  42        ; 64 - log2(CAPACITY) = 64 - 22
+; ---- Hash table capacities (chosen per database, persisted in the header) ---
+; ASMDB_CAPACITY is consulted only when creating a new database. Supported
+; values are case-sensitive: small, medium, large. Unknown/empty means large.
+%define CAP_SMALL    524288
+%define CAP_MEDIUM   2097152
+%define CAP_LARGE    4194304
+%define CAP_DEFAULT  CAP_LARGE
+%define SHIFT_SMALL  45        ; 64 - log2(CAP_SMALL)  = 64 - 19
+%define SHIFT_MEDIUM 43        ; 64 - log2(CAP_MEDIUM) = 64 - 21
+%define SHIFT_LARGE  42        ; 64 - log2(CAP_LARGE)  = 64 - 22
 %define GOLDEN     0x9E3779B97F4A7C15
 
 ; ---- Buffers ----
@@ -53,7 +57,7 @@
 ; as file holes instead of a gigabyte of zeros.
 %define SPARSE_SHIFT   20         ; 1 MiB chunks
 %define SPARSE_CHUNK   (1 << SPARSE_SHIFT)
-%define REGION_CHUNKS  ((CAPACITY*REC_SIZE) >> SPARSE_SHIFT)
+%define REGION_CHUNKS_MAX ((CAP_LARGE*REC_SIZE) >> SPARSE_SHIFT)
 ; Reader mode: buffered output so a command can be replayed when a commit lands
 ; underneath it, and a bound on how many times that is worth doing.
 %define CAP_BUF_SIZE   0x400000   ; 4 MiB
@@ -119,8 +123,8 @@
 ; HDR_ENGINE purely for diagnostics: it tells you which build touched a
 ; database, without ever affecting whether it can be opened.
 %define ENGINE_MAJOR 1
-%define ENGINE_MINOR 5
-%define ENGINE_PATCH 3
+%define ENGINE_MINOR 6
+%define ENGINE_PATCH 0
 %define ENGINE_VERSION ((ENGINE_MAJOR << 16) | (ENGINE_MINOR << 8) | ENGINE_PATCH)
 
 ; ---- On-disk ----

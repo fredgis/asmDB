@@ -690,7 +690,7 @@ cmd_truncate:
     mov  [rbp-40], rax               ; undo watermark, to unwind a refusal
     xor  rbx, rbx
 .cap:
-    cmp  rbx, CAPACITY
+    cmp  rbx, [rel g_capacity]
     jae  .marked
     mov  rax, rbx
     shl  rax, REC_SHIFT
@@ -721,7 +721,7 @@ cmd_truncate:
     xor  rbx, rbx                    ; index
     mov  qword [rbp-32], 0           ; removed count
 .loop:
-    cmp  rbx, CAPACITY
+    cmp  rbx, [rel g_capacity]
     jae  .loopend
     mov  rax, rbx
     shl  rax, REC_SHIFT
@@ -908,7 +908,7 @@ cmd_page:
     call parse_u64
     test rdx, rdx
     jz   .syntax
-    mov  rcx, CAPACITY
+    mov  rcx, [rel g_capacity]
     cmp  rax, rcx
     ja   .syntax
     mov  [rel g_page_offset], rax
@@ -974,7 +974,7 @@ cmd_select:
     call list_full
     test rax, rax
     jnz  .aend
-    cmp  rbx, CAPACITY
+    cmp  rbx, [rel g_capacity]
     jae  .aend
     mov  rax, rbx
     shl  rax, REC_SHIFT
@@ -1081,7 +1081,7 @@ cmd_verify:
     mov  qword [rbp-40], 0           ; live rows counted
     xor  rbx, rbx
 .loop:
-    cmp  rbx, CAPACITY
+    cmp  rbx, [rel g_capacity]
     jae  .done_scan
     mov  rsi, rbx
     shl  rsi, REC_SHIFT
@@ -1253,7 +1253,7 @@ cmd_find:
     call list_full
     test rax, rax
     jnz  .done_scan
-    cmp  rbx, CAPACITY
+    cmp  rbx, [rel g_capacity]
     jae  .done_scan
     mov  rax, rbx
     shl  rax, REC_SHIFT
@@ -1339,7 +1339,7 @@ cmd_range:
     call list_full
     test rax, rax
     jnz  .done_scan
-    cmp  rbx, CAPACITY
+    cmp  rbx, [rel g_capacity]
     jae  .done_scan
     mov  rax, rbx
     shl  rax, REC_SHIFT
@@ -1538,6 +1538,8 @@ cmd_backup:
     ; then replaying every frame whose commit_seq is greater than this
     mov  rax, [rel g_count]
     mov  [rel g_hdr+24], rax
+    mov  rax, [rel g_capacity]
+    mov  [rel g_hdr+16], rax
     mov  rax, [rel g_seq]
     mov  [rel g_hdr+HDR_SEQ], rax
     mov  qword [rel g_hdr+HDR_RESETP], 0
@@ -1558,7 +1560,8 @@ cmd_backup:
     mov  rcx, rbx
     call os_set_sparse
     mov  rcx, rbx
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
     call os_truncate
     test rax, rax
     jnz  .wfail
@@ -1660,16 +1663,18 @@ restore_apply:
     jne  .badtrunc
     cmp  dword [rel g_hdr_read+12], REC_SIZE
     jne  .badtrunc
-    mov  rax, CAPACITY
+    mov  rax, [rel g_capacity]
     cmp  [rel g_hdr_read+16], rax
     jne  .badtrunc
     mov  rax, [rel g_hdr_read+24]    ; live count
-    mov  rdx, CAPACITY
+    mov  rdx, [rel g_capacity]
     cmp  rax, rdx
     ja   .badtrunc
     mov  [rbp-40], rax               ; keep it: the probe reuses g_hdr_read
     mov  rcx, rbx
-    mov  rdx, HDR_SIZE + CAPACITY*REC_SIZE - 1
+    mov  rdx, HDR_SIZE
+    add  rdx, [rel g_region_bytes]
+    dec  rdx
     lea  r8, [rel g_hdr_read]
     mov  r9, 1
     call os_pread
@@ -1683,9 +1688,9 @@ restore_apply:
     call region_scan_used
     mov  rcx, HDR_SIZE
     mov  rdx, [rel g_table]
-    mov  r8, CAPACITY*REC_SIZE
+    mov  r8, [rel g_region_bytes]
     call read_at
-    mov  rdx, CAPACITY*REC_SIZE
+    mov  rdx, [rel g_region_bytes]
     cmp  rax, rdx
     jne  io_fatal_read               ; the table is half-loaded; do not go on
     mov  rax, [rbp-40]
@@ -1995,7 +2000,9 @@ cmd_bench:
     jnz  .nz
     mov  rax, 100000
 .nz:
-    mov  rcx, (CAPACITY*3)/4          ; cap to keep the load factor < 0.75
+    mov  rcx, [rel g_capacity]
+    shr  rcx, 2
+    imul rcx, rcx, 3                 ; cap to keep the load factor < 0.75
     cmp  rax, rcx
     jbe  .ncap
     mov  rax, rcx
@@ -2011,7 +2018,7 @@ cmd_bench:
     call region_scan_used            ; what the region held before we wipe it
     mov  qword [rel g_count], 0
     mov  rdi, [rel g_table]
-    mov  rcx, CAPACITY*REC_SIZE
+    mov  rcx, [rel g_region_bytes]
     xor  eax, eax
     rep  stosb
     ; capture one timestamp for all synthetic rows (kept out of the timed loop)
@@ -2298,7 +2305,7 @@ cmd_version:
     call puts
     lea  rcx, [rel s_ver_cap]
     call puts
-    mov  ecx, CAPACITY
+    mov  rcx, [rel g_capacity]
     call put_u64
     lea  rcx, [rel s_ver_slots]
     call puts

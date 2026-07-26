@@ -19,13 +19,13 @@ binary or into the on-disk format.
 
 | Dimension | Hard limit | Service consequence |
 |---|---|---|
-| Rows per database | 4 194 304 slots, comfortable to ~3.1 M | A database is a table. Multi-entity applications use multiple instances or their own routing key. |
+| Rows per database | tiered: 393,216 (`free`), 1,572,864 (`standard`), 3,145,728 (`premium`) usable rows | A database is a table. Multi-entity applications use multiple instances or their own routing key. |
 | Row shape | 256 bytes, seven fixed columns | No per-tenant schema; richer shapes are encoded by the client. |
 | `tag` | 39 bytes | Usable as a namespace or partition marker, not arbitrary metadata. |
 | `content` | 175 bytes | Documents, embeddings and blobs live elsewhere; the row holds a reference. |
 | `value` | one `i64` | The only numeric column, and the only one `RANGE` can filter on. |
 | Rows per transaction | 4 096 distinct | Bulk writes must be chunked by the API or the client. |
-| Disk per database | ~1 GiB allocated `.dat` on Azure Files NFS, plus `.wal` and `.cdc` | The durable volume must be real; a Container App filesystem is not enough. |
+| Disk per database | Azure Files NFS allocates the full tier `.dat`: ~128 MiB (`free`), ~512 MiB (`standard`), ~1 GiB (`premium`), plus `.wal` and `.cdc` | The durable volume must be real; a Container App filesystem is not enough. |
 | Concurrency | one writer, unlimited `--reader` sessions | `maxReplicas` is fixed at 1. A second engine process is not extra capacity. |
 | Absent from the engine | no SQL, joins, planner, secondary indexes, auth, encryption or audit log | The platform supplies the controls it can; missing database features are not hidden. |
 
@@ -311,6 +311,13 @@ The sidecar's `/v1/stats` endpoint reports rows and capacity from the engine,
 plus CPU and memory from the container cgroups. It is protected by the
 per-instance platform token described in [§4.1](#41-sidecar).
 
+Read the memory numbers as hosted-container counters, not as the engine's local
+private-RAM footprint. The store is mapped copy-on-write, and cgroup working set
+includes file-backed page cache that can be reclaimed under pressure. A small
+database may therefore report a large working set on Azure Files NFS; that is
+reservation/cache, not proof that the engine faulted the whole table into
+private RAM. The console should present this as reserved versus actually used.
+
 `GET /api/v1/costs` is an estimate, not an invoice. It is computed from the Azure
 Monitor `Replicas` metric, so paused time is excluded by construction. The
 estimate uses list rates; it does not claim to be the bill of record.
@@ -346,14 +353,16 @@ browser, the gateway, the REST layer or network latency.
 The README's nearly 12 million rows/second figure is an in-RAM insert loop on
 one core of a workstation. A hosted `free` instance has 0.25 vCPU, so expect a
 fraction of that. Do not compare the number with the README as if the machines
-were the same.
+were the same. Per-tier throughput figures are not published yet; publish them
+only after measuring each tier rather than extrapolating from vCPU fractions.
 
 Cold start also matters. A `free` or `standard` instance that has scaled to zero
 can spend the first 10-20 seconds starting. Warm the instance first, then run
 `BENCH` and read the throughput line it returns.
 
-The row ceiling is 4,194,304. `BENCH 1000000` consumes roughly a quarter of the
-table's capacity in one command.
+The row ceiling follows the tier: 393,216 usable rows on `free`, 1,572,864 on
+`standard`, and 3,145,728 on `premium`. `BENCH 1000000` therefore fits on
+`standard` and `premium`, but not on `free`.
 
 ---
 
@@ -604,7 +613,7 @@ almost never and only when the layout changes.
 
 ```powershell
 .\scripts\build.ps1
-.\tests\smoke.ps1          # must report 151 checks, 0 failures
+.\tests\smoke.ps1          # must pass with 0 failures
 ```
 
 and on Linux, `./scripts/build.sh && ./tests/smoke.sh`. A release that has not
@@ -759,8 +768,8 @@ flowchart TB
 | Backups beyond provisioned share | Not landed, except the explicit `BACKUP` before upgrade. |
 | Build agent inside VNet | Not landed; ACR public network access remains enabled for workstation builds. |
 | Read replicas / failover | Not landed and incompatible with the current `maxReplicas: 1` instance shape. |
-| Grow the instance share ahead of demand | Not automated. Premium Files bills on provisioned capacity, so capacity must be added before the share fills — roughly 100 databases per 100 GiB. |
-| Revisit the engine's 1 GiB preallocation | Open question. The slot region drives the per-database GiB; a smaller region, or storage that honours sparseness, would change the economics. |
+| Grow the instance share ahead of demand | Not automated. Premium Files bills on provisioned capacity, so capacity must be added before the share fills — roughly 800 free, 200 standard or 100 premium databases per 100 GiB. |
+| Report reserved vs actually used storage/memory | Landed in stats shape, UI still to make it clear. Azure Files NFS reserves the full tier table on disk, while cgroup working set includes reclaimable file-backed cache from the copy-on-write mapping. |
 
 ---
 
@@ -785,22 +794,45 @@ The planned public packaging has three tiers, priced from Azure list rates at **
 The derivation — every rate, every assumption, and what would break the model —
 is in [`COST.md`](COST.md).
 
-| Tier | Price | Size | Behaviour | Cap |
-|---|---|---|---|---|
-| **Free** | $0 | 0.25 vCPU / 0.5 GiB | sleeps when idle | 3 per account |
-| **Standard** | $15/mo | 0.5 vCPU / 1 GiB | sleeps when idle | 20 per account |
-| **Premium** | $49/mo | 1 vCPU / 2 GiB | always warm, no cold start | 100 per account |
+| Tier | Price | Size | Behaviour | Cap | Max rows |
+|---|---|---|---|---|---:|
+| **Free** | $0 | 0.25 vCPU / 0.5 GiB | sleeps when idle | 3 per account | 393 216 |
+| **Standard** | $15/mo | 0.5 vCPU / 1 GiB | sleeps when idle | 20 per account | 1 572 864 |
+| **Premium** | $49/mo | 1 vCPU / 2 GiB | always warm, no cold start | 10 per account | 3 145 728 |
 
-Every tier runs the identical engine, with the same 4 194 304-row ceiling and
-the same durability. Tiers buy **latency and headroom, not features** — there is
-no paid feature flag in the codebase and there is not meant to be one. The site
-may list planned GA rows such as Microsoft Fabric Workload and automated
-backups; those are not deployed capabilities today.
+Every tier runs the identical engine and the same durability. Tiers buy
+**latency and headroom, not features** — there is no paid feature flag in the
+codebase and there is not meant to be one. The site may list planned GA rows
+such as Microsoft Fabric Workload and automated backups; those are not deployed
+capabilities today.
+
+The benchmark headline elsewhere in the repository is not what a hosted tier
+buys. It is an in-RAM insert loop on one workstation core. Hosted tiers provide
+0.25, 0.5 or 1.0 Container Apps vCPU, and data-plane calls also traverse REST or
+MCP plus the gateway. `free` and `standard` sleep when idle and pay a cold start
+on the next request; `premium` stays warm. Customers can run `BENCH` on their
+own instance, but no official per-tier throughput numbers are published yet.
+
+The row ceiling differs by tier because the engine's copy-on-write slot table
+still has a real size: 2^22 slots × 256 B is exactly a 1 GiB table. On local
+sparse filesystems, only touched pages become resident; in asmdb Cloud, Azure
+Files NFS reserves the full tier table on disk and cgroup working set includes
+reclaimable file-backed cache from the mapping. Sizing it per tier is what stops
+`free`, which has 0.5 GiB, from carrying a table larger than its own memory
+budget. The tier selects the table at creation (`ASMDB_CAPACITY`), the size is
+recorded in the file header, and the header wins on every later open — so the
+variable can never reshape an existing database. Usable rows are the slot count
+under the engine's 0.75 load factor: 2^19 → 393 216, 2^21 → 1 572 864,
+2^22 → 3 145 728. Upgrading a tier grows the table through the engine's
+migration path.
 
 The sizes are not free choices. Container Apps Consumption accepts only fixed
 vCPU/memory pairs at a 1:2 ratio and **0.25 vCPU / 0.5 GiB is the floor**, so
-there is nothing smaller to sell; the only lever below it is not running, which
-is what scale-to-zero does.
+there is nothing smaller to sell. This was verified against the Azure API:
+`0.1 vCPU / 0.2 GiB` and `0.25 vCPU / 0.25 GiB` are rejected with
+`ContainerAppInvalidResourceTotal`; the portal's `0.1` minimum is only the
+input control bound. The only lever below 0.25 / 0.5 is not running, which is
+what scale-to-zero does.
 
 `Premium` costs 3.6× `Standard` for 2× the CPU because it never scales to zero.
 About $21/month of its cost is a replica sitting idle so the first request does
@@ -808,7 +840,7 @@ not wait. That is the product.
 
 Two economics worth stating plainly:
 
-- **The free tier is not free to run.** About $1.20/month each, funded by the
+- **The free tier is not free to run.** About $1.03/month each, funded by the
   paying tiers. The three-instance cap is a pricing control, not a technical
   limit.
 - **This is a volume model.** Fixed platform cost is about $142/month before
@@ -817,10 +849,21 @@ Two economics worth stating plainly:
 
 ### Later tiers, not yet built
 
-| Tier | Isolation | Durability/HA | Price model |
-|---|---|---|---|
-| **Premium+** | container, read replica | ≤5 s RPO | usage + reserved capacity |
-| **Enterprise** | Firecracker micro-VM, dedicated nodes | warm standby, residency, SSO, audit export | annual contract + usage |
+Both appear on the pricing page as dimmed cards with every line crossed out, so
+the direction is legible without implying either can be bought today.
+
+| Tier | Price | Size | Max rows | Isolation | Durability/HA | Price model |
+|---|---|---|---:|---|---|---|
+| **Premium+** | $89/mo | 2 vCPU / 4 GiB | 6 291 456 | container, read replica | ≤5 s RPO | usage + reserved capacity |
+| **Enterprise** | contact us | dedicated | — | Firecracker micro-VM, dedicated nodes | warm standby, residency, SSO, audit export | annual contract + usage |
+
+`Premium+` is where more rows live. It is the first size whose memory can hold a
+2^23-slot table — 2 GiB of resident table, twice `premium` — and at $89 it is
+priced from the same basis as the shipped tiers: 2 vCPU / 4 GiB costs $77.55 of
+compute a month, plus storage and amortised fixed cost, plus the 15 % margin.
+That is also the honest answer to "can premium hold more rows without costing
+more": it cannot, because Container Apps sells memory only paired with CPU, so
+the rows come with the next size up.
 
 Ground any latency or throughput claim in the measured
 [README benchmark](../README.md#performance) numbers, and don't promise the

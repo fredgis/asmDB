@@ -21,6 +21,7 @@ const (
 	statsListTimeout     = 3 * time.Second
 	healthCheckTimeout   = 3 * time.Second
 	backupTimeout        = 30 * time.Second
+	operationStaleAfter  = 30 * time.Minute
 	execColdStartBudget  = 45 * time.Second
 	execColdStartBackoff = 2 * time.Second
 	wakeRequestTimeout   = 2 * time.Second
@@ -59,6 +60,9 @@ type databaseResponse struct {
 	CreatedAt        string         `json:"created_at"`
 	Error            string         `json:"error,omitempty"`
 	Stats            *statsResponse `json:"stats,omitempty"`
+	StorageFormat    string         `json:"storageFormat,omitempty"`
+	EngineSource     string         `json:"engineSource,omitempty"`
+	Operation        *operation     `json:"operation,omitempty"`
 	UpgradeAvailable bool           `json:"upgradeAvailable"`
 	AvailableEngine  string         `json:"availableEngine,omitempty"`
 	AvailableImage   string         `json:"availableImage,omitempty"`
@@ -90,15 +94,16 @@ type statsResponse struct {
 }
 
 type healthResponse struct {
-	Status string `json:"status"`
-	Engine string `json:"engine"`
-	Rows   int64  `json:"rows"`
+	Status        string `json:"status"`
+	Engine        string `json:"engine"`
+	StorageFormat string `json:"storageFormat"`
+	Rows          int64  `json:"rows"`
 }
 
 type prepareUpgradeResponse struct {
-	OK     bool   `json:"ok"`
-	Backup string `json:"backup,omitempty"`
-	Detail string `json:"detail,omitempty"`
+	OK     bool            `json:"ok"`
+	Backup json.RawMessage `json:"backup,omitempty"`
+	Detail string          `json:"detail,omitempty"`
 }
 
 type versionResponse struct {
@@ -192,6 +197,10 @@ func (a *api) handleDatabase(w http.ResponseWriter, r *http.Request) {
 		a.handleRotateToken(w, r, parts[0])
 		return
 	}
+	if len(parts) == 3 && parts[1] == "rotate-token" && parts[2] == "commit" {
+		a.handleRotateTokenCommit(w, r, parts[0])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "stats" {
 		a.handleStats(w, r, parts[0])
 		return
@@ -279,6 +288,7 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 		Tier:             req.Tier,
 		Image:            a.cfg.Image,
 		Engine:           engineFromImage(a.cfg.Image),
+		EngineSource:     "image",
 		TokenHash:        tokenHash(token),
 		CreatedAt:        a.now(),
 		ContainerAppName: containerAppName(id),
@@ -388,6 +398,19 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
 		return
 	}
+	in = a.expireStaleOperation(context.Background(), in)
+	if operationActive(in.Operation) {
+		if in.Operation.Type == "rotate-token" && in.Operation.State == "pending_ack" && in.Operation.PendingToken != "" {
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"operation": in.Operation,
+				"token":     in.Operation.PendingToken,
+				"warning":   "Token rotation is prepared but not committed. Store this token, then call /rotate-token/commit to apply it.",
+			})
+			return
+		}
+		writeError(w, http.StatusConflict, "operation_in_progress", "database operation already in progress", in.Operation.Type+" "+in.Operation.State)
+		return
+	}
 
 	token, err := generateAccessToken()
 	if err != nil {
@@ -395,31 +418,82 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 
-	previous := in
-	in.TokenHash = tokenHash(token)
-	// Rotation is intentionally not idempotent: each successful call mints a
-	// different token and invalidates the previous one. We save the new hash
-	// before updating the app because the old plaintext token is unavailable;
-	// if Azure rejects the update, we restore the previous hash so failure
-	// leaves the old token working instead of returning a token the instance
-	// will not accept.
+	in.Operation = &operation{Type: "rotate-token", State: "pending_ack", StartedAt: a.now(), UpdatedAt: a.now(), PendingToken: token}
+	// Rotation is deliberately two-phase. Preparing stores the new plaintext
+	// token inside the authenticated operation but does not change the app or
+	// token hash. Only /rotate-token/commit applies it. If the client gives up
+	// before acknowledgement, the old token still works; if it gives up later,
+	// the new token remains visible on the operation.
 	if err := a.store.Save(context.Background(), in); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
 		return
 	}
-	if err := a.provisioner.RotateToken(r.Context(), in, token); err != nil {
-		if restoreErr := a.store.Save(context.Background(), previous); restoreErr != nil {
-			writeError(w, http.StatusBadGateway, "bad_gateway", "rotate token failed and restoring metadata failed", err.Error()+"; restore: "+restoreErr.Error())
-			return
-		}
-		writeError(w, http.StatusBadGateway, "bad_gateway", "update instance token", err.Error())
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"operation": in.Operation,
+		"token":     token,
+		"warning":   "Token rotation is prepared but not committed. Store this token, then call /rotate-token/commit to apply it.",
+	})
+}
+
+func (a *api) handleRotateTokenCommit(w http.ResponseWriter, r *http.Request, id string) {
+	if !idPattern.MatchString(id) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	if !a.authorized(w, r) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, rotateTokenResponse{
-		Token:   token,
-		Warning: "Token rotation restarts the instance and briefly interrupts active connections.",
+	in, err := a.store.Get(r.Context(), id)
+	if errors.Is(err, errNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		return
+	}
+	in = a.expireStaleOperation(context.Background(), in)
+	if in.Operation == nil || in.Operation.Type != "rotate-token" || in.Operation.State != "pending_ack" || in.Operation.PendingToken == "" {
+		writeError(w, http.StatusConflict, "invalid_request", "no prepared token rotation to commit", "")
+		return
+	}
+	token := in.Operation.PendingToken
+	in.Operation.State = "stopping"
+	in.Operation.UpdatedAt = a.now()
+	if err := a.store.Save(context.Background(), in); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
+		return
+	}
+	go a.runRotateToken(in, token)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"operation": in.Operation,
+		"token":     token,
+		"warning":   "Token rotation is applying asynchronously. The token remains visible on the operation until completion.",
 	})
+}
+
+func (a *api) runRotateToken(in instance, token string) {
+	progress := func(state string) { a.updateOperationState(context.Background(), in.ID, state, "") }
+	if err := a.provisioner.RotateToken(context.Background(), in, token, progress); err != nil {
+		a.updateOperationState(context.Background(), in.ID, "failed", "token rotation failed; the previous token may still be active if rollback completed: "+err.Error())
+		return
+	}
+	updated, err := a.store.Get(context.Background(), in.ID)
+	if err != nil {
+		return
+	}
+	updated.TokenHash = tokenHash(token)
+	updated.Operation = &operation{Type: "rotate-token", State: "done", StartedAt: previousOperationStarted(updated.Operation, a.now()), UpdatedAt: a.now(), PendingToken: token}
+	_ = a.store.Save(context.Background(), updated)
 }
 
 func (a *api) handleStats(w http.ResponseWriter, r *http.Request, id string) {
@@ -477,6 +551,11 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
 		return
 	}
+	in = a.expireStaleOperation(context.Background(), in)
+	if operationActive(in.Operation) {
+		writeError(w, http.StatusConflict, "operation_in_progress", "database operation already in progress", in.Operation.Type+" "+in.Operation.State)
+		return
+	}
 	if !a.upgradeAvailable(in) {
 		writeError(w, http.StatusConflict, "no_upgrade", "database already uses the current engine image", "")
 		return
@@ -485,42 +564,44 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "platform credential is not configured", "")
 		return
 	}
-	state, stateErr := a.provisioner.GetState(r.Context(), in)
-	wasStopped := stateErr == nil && state.State == "stopped"
-	if err := a.backupInstance(r.Context(), in); err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway", "backup failed; upgrade aborted", err.Error())
-		return
-	}
-
-	// This is intentionally not zero-downtime: the engine holds an exclusive
-	// lock and maxReplicas is 1, so the replacement can open the files only
-	// after the outgoing process lets go. We record the new image only after
-	// Azure reports the update done; a failed revision leaves metadata on the
-	// old image so the console still offers the upgrade. If an instance was
-	// stopped, we deliberately wake it to run BACKUP before changing the image:
-	// backup-before-upgrade is safer than silently skipping sleeping databases.
-	if err := a.provisioner.UpgradeImage(r.Context(), in, a.cfg.Image); err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway", "upgrade revision failed", err.Error())
-		return
-	}
-	in.Image = a.cfg.Image
-	in.Engine = engineFromImage(in.Image)
-	if engine, ok := a.refreshEngine(r.Context(), in); ok {
-		in.Engine = engine
-	}
+	now := a.now()
+	in.Operation = &operation{Type: "upgrade", State: "preparing_backup", StartedAt: now, UpdatedAt: now}
 	if err := a.store.Save(context.Background(), in); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
 		return
 	}
 	res := a.responseFor(r.Context(), in)
-	warning := "Upgrade restarts the instance and briefly interrupts active connections."
-	if wasStopped {
-		warning += " The instance was stopped, so it was started to take a backup before applying the upgrade."
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"database": res,
-		"warning":  warning,
+	go a.runUpgrade(in)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"database":  res,
+		"operation": in.Operation,
+		"warning":   "Upgrade runs asynchronously, restarts the instance, and briefly interrupts active connections.",
 	})
+}
+
+func (a *api) runUpgrade(in instance) {
+	ctx := context.Background()
+	if err := a.backupInstance(ctx, in); err != nil {
+		a.updateOperationState(ctx, in.ID, "failed", "backup failed; upgrade aborted before changing the instance: "+err.Error())
+		return
+	}
+	progress := func(state string) { a.updateOperationState(ctx, in.ID, state, "") }
+	if err := a.provisioner.UpgradeImage(ctx, in, a.cfg.Image, progress); err != nil {
+		a.updateOperationState(ctx, in.ID, "failed", "replacement did not become healthy; rolled back to the previous version: "+err.Error())
+		return
+	}
+	updated, err := a.store.Get(ctx, in.ID)
+	if err != nil {
+		return
+	}
+	updated.Image = a.cfg.Image
+	updated.Engine = engineFromImage(updated.Image)
+	updated.EngineSource = "image"
+	if report, ok := a.refreshEngine(ctx, updated); ok {
+		updated = a.applyInstanceReport(ctx, updated, report.Engine, report.StorageFormat)
+	}
+	updated.Operation = &operation{Type: "upgrade", State: "done", StartedAt: previousOperationStarted(updated.Operation, a.now()), UpdatedAt: a.now()}
+	_ = a.store.Save(ctx, updated)
 }
 
 func (a *api) handleWake(w http.ResponseWriter, r *http.Request, id string) {
@@ -763,7 +844,22 @@ func (a *api) fetchStats(ctx context.Context, in instance) statsResponse {
 	if !json.Valid(data) {
 		return unavailableStats("unavailable")
 	}
+	a.recordStatsReport(context.Background(), in, data)
 	return statsResponse{Available: true, Stats: json.RawMessage(data)}
+}
+
+func (a *api) recordStatsReport(ctx context.Context, in instance, data []byte) {
+	var report struct {
+		Engine        string `json:"engine"`
+		StorageFormat string `json:"storageFormat"`
+	}
+	if err := json.Unmarshal(data, &report); err != nil {
+		return
+	}
+	if report.Engine == "" && report.StorageFormat == "" {
+		return
+	}
+	_ = a.store.Save(ctx, a.applyInstanceReport(ctx, in, report.Engine, report.StorageFormat))
 }
 
 func (a *api) backupInstance(ctx context.Context, in instance) error {
@@ -801,26 +897,26 @@ func (a *api) backupInstance(ctx context.Context, in instance) error {
 	return nil
 }
 
-func (a *api) refreshEngine(ctx context.Context, in instance) (string, bool) {
+func (a *api) refreshEngine(ctx context.Context, in instance) (healthResponse, bool) {
 	reqCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(a.provisioner.InternalEndpoint(in), "/")+"/health", nil)
 	if err != nil {
-		return "", false
+		return healthResponse{}, false
 	}
 	resp, err := a.statsClient.Do(req)
 	if err != nil {
-		return "", false
+		return healthResponse{}, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", false
+		return healthResponse{}, false
 	}
 	var health healthResponse
 	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil || health.Engine == "" {
-		return "", false
+		return healthResponse{}, false
 	}
-	return health.Engine, true
+	return health, true
 }
 
 func unavailableStats(reason string) statsResponse {
@@ -836,12 +932,20 @@ func includeStats(r *http.Request) bool {
 }
 
 func (a *api) upgradeAvailable(in instance) bool {
+	current := a.availableEngine()
+	if current == "unknown" {
+		return false
+	}
+	if source := engineSourceForInstance(in); source == "instance" {
+		return engineForInstance(in) != current
+	}
 	_, currentOK := imageTag(a.cfg.Image)
 	_, recordedOK := imageTag(in.Image)
 	return currentOK && recordedOK && in.Image != a.cfg.Image
 }
 
 func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
+	in = a.expireStaleOperation(context.Background(), in)
 	state, err := a.provisioner.GetState(ctx, in)
 	if err != nil {
 		state = liveState{State: "failed", Error: err.Error()}
@@ -856,10 +960,61 @@ func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
 		Endpoint:         a.provisioner.Endpoint(in),
 		CreatedAt:        in.CreatedAt.Format(time.RFC3339),
 		Error:            state.Error,
+		StorageFormat:    in.StorageFormat,
+		EngineSource:     engineSourceForInstance(in),
+		Operation:        in.Operation,
 		UpgradeAvailable: a.upgradeAvailable(in),
 		AvailableEngine:  a.availableEngine(),
 		AvailableImage:   a.availableImage(),
 	}
+}
+
+func (a *api) applyInstanceReport(ctx context.Context, in instance, engine, storageFormat string) instance {
+	engine = strings.TrimSpace(engine)
+	if engine != "" {
+		in.Engine = engine
+		in.EngineSource = "instance"
+		if engine == a.availableEngine() {
+			in.Image = a.cfg.Image
+		}
+	}
+	if strings.TrimSpace(storageFormat) != "" {
+		in.StorageFormat = strings.TrimSpace(storageFormat)
+	}
+	return in
+}
+
+func (a *api) updateOperationState(ctx context.Context, id, state, detail string) {
+	in, err := a.store.Get(ctx, id)
+	if err != nil || in.Operation == nil {
+		return
+	}
+	in.Operation.State = state
+	in.Operation.UpdatedAt = a.now()
+	in.Operation.Error = detail
+	_ = a.store.Save(ctx, in)
+}
+
+func (a *api) expireStaleOperation(ctx context.Context, in instance) instance {
+	if !operationActive(in.Operation) || a.now().Sub(in.Operation.UpdatedAt) <= operationStaleAfter {
+		return in
+	}
+	in.Operation.State = "failed"
+	in.Operation.UpdatedAt = a.now()
+	in.Operation.Error = "operation expired after control-plane restart or timeout; poll state and retry if needed"
+	_ = a.store.Save(ctx, in)
+	return in
+}
+
+func operationActive(op *operation) bool {
+	return op != nil && op.State != "done" && op.State != "failed"
+}
+
+func previousOperationStarted(op *operation, fallback time.Time) time.Time {
+	if op != nil && !op.StartedAt.IsZero() {
+		return op.StartedAt
+	}
+	return fallback
 }
 
 func (a *api) availableEngine() string {
@@ -897,6 +1052,16 @@ func engineForInstance(in instance) string {
 		return in.Engine
 	}
 	return engineFromImage(in.Image)
+}
+
+func engineSourceForInstance(in instance) string {
+	if in.EngineSource != "" {
+		return in.EngineSource
+	}
+	if strings.TrimSpace(in.Engine) != "" && in.Engine != engineFromImage(in.Image) {
+		return "instance"
+	}
+	return "image"
 }
 
 func (a *api) authorized(w http.ResponseWriter, r *http.Request) bool {

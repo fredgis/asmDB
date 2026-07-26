@@ -472,6 +472,30 @@ figcaption {
 .tier__list li::before { content: "→"; color: var(--color-accent-dim); font-family: var(--font-mono); }
 .tier__cta { margin-top: auto; }
 .tier .btn { width: 100%; justify-content: center; }
+/* Roadmap tiers. They are shown so the direction is legible, and dimmed so they
+   cannot be mistaken for something purchasable today: every line is marked with
+   a cross rather than the arrow used by shipped capabilities. */
+.tier--soon {
+  border-style: dashed;
+  background: transparent;
+  opacity: 0.62;
+}
+.tier--soon:hover { border-color: var(--color-rule); }
+.tier--soon .tier__n { color: var(--color-ink-4); }
+.tier--soon .tier__p { color: var(--color-ink-3); }
+.tier__soon {
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  color: var(--color-ink-4);
+  border: 1px solid var(--color-rule);
+  border-radius: var(--radius-sm);
+  padding: 0.1rem 0.4rem;
+  margin-left: var(--space-xs);
+  text-transform: none;
+}
+.tier__list--soon li { color: var(--color-ink-4); }
+.tier__list--soon li::before { content: "\00d7"; color: var(--color-bad); }
+.tier--soon .btn[disabled] { cursor: not-allowed; opacity: 0.75; }
 .tier-note {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
@@ -794,6 +818,10 @@ figcaption {
   border-radius: var(--radius-sm);
   overflow: hidden;
 }
+.metric-bar {
+  position: relative;
+  min-width: 0;
+}
 .meter span {
   display: block;
   height: 100%;
@@ -802,6 +830,9 @@ figcaption {
 }
 .meter span[data-tiny="true"] {
   background: var(--color-accent-dim);
+}
+.metric__bar-note {
+  margin-top: calc(var(--space-xs) * -0.5);
 }
 .field { display: grid; gap: var(--space-xs); margin-bottom: var(--space-lg); }
 .field label { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-ink-3); letter-spacing: 0.04em; }

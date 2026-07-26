@@ -287,7 +287,7 @@ wal_recover:
     add  rax, [rbp-48]
     add  rax, rbx                    ; entry ptr
     mov  rdx, [rax]                  ; slot index
-    mov  rcx, CAPACITY
+    mov  rcx, [rel g_capacity]
     cmp  rdx, rcx
     jae  .impossible                 ; committed but unusable -> stop, keep log
     inc  r12
@@ -295,7 +295,7 @@ wal_recover:
 .chk_done:
     ; also require the live count to be inside the table
     mov  rax, [rbx+16]
-    mov  rcx, CAPACITY
+    mov  rcx, [rel g_capacity]
     cmp  rax, rcx
     ja   .impossible
     ; The frame is committed and applicable. Publish it to the change log first

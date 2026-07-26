@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,10 +21,16 @@ var (
 	longCommandTimeout      = 30 * time.Minute
 	engineUnresponsiveGrace = 30 * time.Second
 	promptDrainTimeout      = 500 * time.Millisecond
+	postFrameDrainTimeout   = 20 * time.Millisecond
 	restartInitialBackoff   = 200 * time.Millisecond
 	restartMaxBackoff       = 5 * time.Second
 	restartMaxAttempts      = 6
 	restartSleep            = time.Sleep
+)
+
+var (
+	errEngineBusy        = errors.New("engine is busy")
+	errEngineUnavailable = errors.New("engine is unavailable")
 )
 
 type waitMode int
@@ -56,13 +63,17 @@ type Engine struct {
 type engineInfo struct {
 	Version       string
 	StorageFormat string
+	RowCapacity   uint64
+	SlotCapacity  uint64
 }
 
 var unknownEngineInfo = engineInfo{Version: "unknown", StorageFormat: "unknown"}
 
 var (
-	versionLineRE = regexp.MustCompile(`(?i)\basmdb\s+([0-9]+(?:\.[0-9]+){1,3})\b`)
-	storageLineRE = regexp.MustCompile(`(?i)storage\s+format\s*:\s*([0-9]+)`)
+	versionLineRE     = regexp.MustCompile(`(?i)\basmdb\s+([0-9]+(?:\.[0-9]+){1,3})\b`)
+	storageLineRE     = regexp.MustCompile(`(?i)storage\s+format\s*:\s*([0-9]+)`)
+	rawCapacityLineRE = regexp.MustCompile(`(?i)\bcapacity\s*:\s*([0-9][0-9_, ]*)\s*slots?\b`)
+	rowCapacityLineRE = regexp.MustCompile(`(?i)\b(?:usable\s+rows?|row\s+capacity|maximum\s+rows?|max\s+rows?)\s*:\s*([0-9][0-9_, ]*)\b`)
 )
 
 func NewEngine(bin, data, name string) (*Engine, error) {
@@ -87,6 +98,45 @@ func (e *Engine) Command(ctx context.Context, line string, mode waitMode) ([]str
 	}
 	if err := e.ensureStartedLocked(); err != nil {
 		return nil, err
+	}
+	return e.runLocked(ctx, line, mode)
+}
+
+func (e *Engine) TryCommand(ctx context.Context, line string, mode waitMode) ([]string, error) {
+	before := e.generation()
+	if !e.cmdMu.TryLock() {
+		return nil, errEngineBusy
+	}
+	defer e.cmdMu.Unlock()
+	if e.closed {
+		return nil, errors.New("engine is closed")
+	}
+	if before != e.generation() {
+		return nil, errors.New("engine restarted while request was queued")
+	}
+	if err := e.ensureStartedLocked(); err != nil {
+		return nil, err
+	}
+	return e.runLocked(ctx, line, mode)
+}
+
+func (e *Engine) TryCommandIfReady(ctx context.Context, line string, mode waitMode) ([]string, error) {
+	before := e.generation()
+	if !e.cmdMu.TryLock() {
+		return nil, errEngineBusy
+	}
+	defer e.cmdMu.Unlock()
+	if e.closed {
+		return nil, errors.New("engine is closed")
+	}
+	if before != e.generation() {
+		return nil, errors.New("engine restarted while request was queued")
+	}
+	e.stateMu.Lock()
+	ready := e.cmd != nil && e.stdin != nil && e.lines != nil && e.done != nil
+	e.stateMu.Unlock()
+	if !ready {
+		return nil, errEngineUnavailable
 	}
 	return e.runLocked(ctx, line, mode)
 }
@@ -344,6 +394,8 @@ format:
 func parseEngineInfo(lines []string) engineInfo {
 	version := ""
 	storageFormat := ""
+	rowCapacity := uint64(0)
+	slotCapacity := uint64(0)
 	for _, line := range lines {
 		if m := versionLineRE.FindStringSubmatch(line); len(m) == 2 {
 			version = m[1]
@@ -351,11 +403,37 @@ func parseEngineInfo(lines []string) engineInfo {
 		if m := storageLineRE.FindStringSubmatch(line); len(m) == 2 {
 			storageFormat = m[1]
 		}
+		if m := rowCapacityLineRE.FindStringSubmatch(line); len(m) == 2 {
+			if n, ok := parseEngineUint(m[1]); ok {
+				rowCapacity = n
+			}
+		}
+		if m := rawCapacityLineRE.FindStringSubmatch(line); len(m) == 2 {
+			if n, ok := parseEngineUint(m[1]); ok {
+				slotCapacity = n
+				if rowCapacity == 0 {
+					rowCapacity = usableRowsFromSlots(n)
+				}
+			}
+		}
 	}
 	if version == "" || storageFormat == "" {
-		return unknownEngineInfo
+		info := unknownEngineInfo
+		info.RowCapacity = rowCapacity
+		info.SlotCapacity = slotCapacity
+		return info
 	}
-	return engineInfo{Version: version, StorageFormat: storageFormat}
+	return engineInfo{Version: version, StorageFormat: storageFormat, RowCapacity: rowCapacity, SlotCapacity: slotCapacity}
+}
+
+func parseEngineUint(text string) (uint64, bool) {
+	clean := strings.NewReplacer(",", "", "_", "", " ", "").Replace(text)
+	n, err := strconv.ParseUint(clean, 10, 64)
+	return n, err == nil
+}
+
+func usableRowsFromSlots(slots uint64) uint64 {
+	return (slots / 4) * 3
 }
 
 func (e *Engine) clearFailedStartLocked(cmd *exec.Cmd) {
@@ -404,6 +482,7 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 	if stdin == nil || lines == nil {
 		return nil, errors.New("engine is not running")
 	}
+	e.drainReadyStaleLines(lines, commandLine)
 	if err := writeFull(stdin, []byte(line+"\n")); err != nil {
 		e.restartLocked("stdin write failed")
 		return nil, err
@@ -427,12 +506,16 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 				if isERR(line) {
 					if !promptSeen {
 						e.drainPromptAfterStatus(lines, line)
+					} else {
+						e.drainStaleLinesUntilQuiet(lines, line)
 					}
 					return out, EngineError{Detail: statusDetail(line)}
 				}
 				if isOK(line) {
 					if !promptSeen {
 						e.drainPromptAfterStatus(lines, line)
+					} else {
+						e.drainStaleLinesUntilQuiet(lines, line)
 					}
 					return out, nil
 				}
@@ -443,6 +526,7 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 				// the engine violated the status protocol. Returning here preserves the
 				// invariant that later requests cannot consume this command's leftover output.
 				logJSON("warn", "engine_response_without_status", map[string]any{"command": commandLine})
+				e.drainStaleLinesUntilQuiet(lines, commandLine)
 				return out, nil
 			}
 		case <-timer.C:
@@ -469,17 +553,86 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 func (e *Engine) drainPromptAfterStatus(lines <-chan string, statusLine string) {
 	timer := time.NewTimer(promptDrainTimeout)
 	defer timer.Stop()
+	drained := []string{}
 	for {
 		select {
 		case raw, ok := <-lines:
 			if !ok {
 				return
 			}
+			line := normalizeEngineLine(raw)
+			if line != "" {
+				drained = append(drained, line)
+			}
 			if hasEnginePrompt(raw) {
+				if len(drained) > 0 {
+					logJSON("warn", "engine_output_after_status_drained", map[string]any{
+						"status": statusLine,
+						"count":  len(drained),
+					})
+				}
+				e.drainStaleLinesUntilQuiet(lines, statusLine)
 				return
 			}
 		case <-timer.C:
 			logJSON("warn", "engine_prompt_missing_after_status", map[string]any{"status": statusLine})
+			return
+		}
+	}
+}
+
+func (e *Engine) drainReadyStaleLines(lines <-chan string, commandLine string) {
+	drained := []string{}
+	for {
+		select {
+		case raw, ok := <-lines:
+			if !ok {
+				return
+			}
+			line := normalizeEngineLine(raw)
+			if line != "" {
+				drained = append(drained, line)
+			}
+		default:
+			if len(drained) > 0 {
+				logJSON("warn", "engine_stale_output_drained", map[string]any{
+					"command": commandLine,
+					"count":   len(drained),
+				})
+			}
+			return
+		}
+	}
+}
+
+func (e *Engine) drainStaleLinesUntilQuiet(lines <-chan string, commandLine string) {
+	timer := time.NewTimer(postFrameDrainTimeout)
+	defer timer.Stop()
+	drained := []string{}
+	for {
+		select {
+		case raw, ok := <-lines:
+			if !ok {
+				return
+			}
+			line := normalizeEngineLine(raw)
+			if line != "" {
+				drained = append(drained, line)
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(postFrameDrainTimeout)
+		case <-timer.C:
+			if len(drained) > 0 {
+				logJSON("warn", "engine_stale_output_drained", map[string]any{
+					"command": commandLine,
+					"count":   len(drained),
+				})
+			}
 			return
 		}
 	}

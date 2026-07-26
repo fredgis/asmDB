@@ -12,6 +12,12 @@ g_readpos:     dq 0
 g_bom_seen:    dq 0
 g_linebuf:     dq 0
 g_table:       dq 0
+g_capacity:    dq CAP_DEFAULT
+g_cap_mask:    dq CAP_DEFAULT-1
+g_region_bytes:dq CAP_DEFAULT*REC_SIZE
+g_region_chunks:dq REGION_CHUNKS_MAX
+g_cap_shift:   db SHIFT_LARGE
+               align 8
 g_count:       dq 0
 g_dat_handle:  dq 0
 g_wal_handle:  dq 0
@@ -73,7 +79,7 @@ g_datname:     times 224 db 0
 g_walname:     times 224 db 0
 g_bakname:     times 224 db 0
 g_tmpname:     times 240 db 0        ; <backup>.part, renamed into place on success
-g_chunkmap:    times 1024 db 0        ; which region chunks held data before a rewrite
+g_chunkmap:    times REGION_CHUNKS_MAX db 0 ; which chunks held data before a rewrite
 g_idbuf:       times 16 db 0
 g_idbuf2:      times 16 db 0
 g_tablename:   times 64 db 0
@@ -92,7 +98,7 @@ g_hdr:
     db 'ASMDB', 0, 0, 0              ; +0  magic (8 bytes)
     dd DB_VERSION                    ; +8
     dd REC_SIZE                      ; +12
-    dq CAPACITY                      ; +16
+    dq CAP_DEFAULT                   ; +16
     dq 0                             ; +24 live count (rewritten at runtime)
     times HDR_ENGINE-32 db 0         ; +32 table name (rewritten at runtime)
     dd ENGINE_VERSION                ; +80 engine that last wrote this file
@@ -239,6 +245,10 @@ s_verdot:       db '.', 0
 s_bnr_ver:      db '  .  v', 0
 s_flag_upgrade: db '--upgrade', 0
 s_flag_reader: db '--reader', 0
+s_env_capacity: db 'ASMDB_CAPACITY', 0
+s_cap_small:    db 'small', 0
+s_cap_medium:   db 'medium', 0
+s_cap_large:    db 'large', 0
 s_upg_suffix:   db '.upgraded.dat', 0
 s_upg_head:     db '  asmdb upgrade', 13, 10, 0
 s_upg_src:      db '  source   : ', 0

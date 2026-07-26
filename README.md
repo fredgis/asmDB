@@ -7,8 +7,8 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). The 1.5.3 PE64 build is 42,997 bytes;
-    the last published ELF64 build is 51,221 bytes. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). The 1.6.0 PE64 build is 43,749 bytes;
+    the 1.6.0 ELF64 build is 52,221 bytes. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -18,7 +18,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-42%2C997%20B%20PE%20%2F%2051%2C221%20B%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-43%2C013%20B%20PE%20%2F%2051%2C485%20B%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -40,7 +40,7 @@ x86-64 assembly — and it is a *real* database, not a demo.
 | 💾 **Durable, not best-effort** | every statement reaches the disk, `BEGIN`/`COMMIT`/`ROLLBACK` are real transactions, and a write-ahead log makes crash recovery atomic |
 | 🔁 **Every change is captured** | an append-only change log records one durable frame per committed transaction, so anything downstream can follow the database exactly |
 | 👥 **One writer, many readers** | `--reader` sessions run alongside the writer, each command isolated by the commit sequence |
-| ⚡ **Absurdly fast at its one job** | **over 12 million inserts/second** in RAM — roughly **12× SQLite** on the same machine (benchmark below, reproducible) |
+| ⚡ **Absurdly fast at its one job** | **over 12 million inserts/second** in RAM on one workstation core — roughly **12× SQLite** on the same machine (benchmark below, reproducible) |
 
 **Two ways to drive it:**
 
@@ -64,9 +64,10 @@ whole point of writing a database in assembly.
 
 ## What fits, and what is enforced
 
-Before you design anything on top of asmdb: the shape of a row and the size of
-the table are **fixed at build time**, and every limit below is refused at write
-time rather than silently trimmed.
+Before you design anything on top of asmdb: the shape of a row is fixed and the
+table size is chosen when the database is created (default `large`), then stored
+in the file header. Every limit below is refused at write time rather than
+silently trimmed.
 
 <p align="center">
   <img src="docs/assets/asmdb-capacity.png" alt="asmdb capacity, record layout, enforced limits and durability model" width="920">
@@ -74,14 +75,14 @@ time rather than silently trimmed.
 
 | | |
 |---|---|
-| **Rows per table** | 4 194 304 slots; comfortable up to ~3.1 M (open addressing) |
+| **Rows per table** | default/large: 4 194 304 slots, 3 145 728 usable rows (0.75 load factor) |
 | **Row size** | 256 bytes, fixed — seven columns, no more |
 | **`tag`** | 39 bytes max, one token, no spaces |
 | **`content`** | 175 bytes max, rest of line |
 | **`id`** | `u64`, unique, ≥ 1 |
 | **`value`** | `i64` |
 | **Rows per transaction** | 4 096 distinct rows |
-| **Database on disk** | `<db>.dat` ~1 GiB, sparse on local filesystems, plus `<db>.wal` and `<db>.cdc` |
+| **Database on disk** | default/large `<db>.dat` ~1 GiB, sparse on local filesystems, plus `<db>.wal` and `<db>.cdc` |
 | **Concurrency** | one writer, unlimited `--reader` sessions |
 | **Not there** | no SQL, no joins, no query planner, no secondary indexes, no auth, no encryption |
 
@@ -95,7 +96,7 @@ files, therefore several engine processes, and **no transaction spans two of
 them**.
 
 A [`FIND`](docs/COMMANDS.md#find) or
-[`RANGE`](docs/COMMANDS.md#range) is a full scan of the 4 194 304 slots;
+[`RANGE`](docs/COMMANDS.md#range) is a full scan of the configured slot table;
 [`SELECT <id>`](docs/COMMANDS.md#select) is O(1). Full details in
 [Data model & supported types](#data-model--supported-types).
 
@@ -120,6 +121,13 @@ the assumptions and the ways the model breaks are in
 <p align="center">
   <img src="docs/assets/asmdb-cloud-tiers.png" alt="asmdb Cloud pricing tiers: free at $0, standard at $15 a month, premium at $49 a month" width="90%">
 </p>
+
+Those prices do **not** buy the workstation benchmark above. Hosted tiers get
+0.25 vCPU (`free`), 0.5 vCPU (`standard`) or 1 vCPU (`premium`), and every
+request also traverses the REST/MCP sidecar and gateway. `free` and `standard`
+scale to zero, so the first request after idling waits for a container start;
+`premium` stays warm. Official per-tier throughput numbers are not published
+yet — use `BENCH` on your own instance for that measurement.
 
 The public front door is API Management; instance containers and storage stay
 private. Requests are HTTPS end-to-end, including the hop from the gateway to the
@@ -227,8 +235,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 42,997 bytes</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · 51,221 bytes</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 43,749 bytes</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · 52,221 bytes</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -408,12 +416,13 @@ Full byte layout and recovery protocol: **[`docs/CDC.md`](docs/CDC.md)**.
 ## How asmdb works
 ### The 60-second version
 
-Picture a huge coat-check with **4,194,304 numbered hooks**. To store a row, asmdb
-runs the row's `id` through a scrambling function that turns it into a hook
-number, and hangs the 256-byte row there. To find it again, it runs the *same*
-function and walks straight to that hook — no scanning, no index to maintain,
-because **the array of hooks *is* the index**. If two rows want the same hook,
-the second one takes the next free hook along (a "linear probe").
+Picture the default `large` table as a huge coat-check with **4,194,304 numbered
+hooks**. To store a row, asmdb runs the row's `id` through a scrambling function
+that turns it into a hook number, and hangs the 256-byte row there. To find it
+again, it runs the *same* function and walks straight to that hook — no scanning,
+no index to maintain, because **the array of hooks *is* the index**. If two rows
+want the same hook, the second one takes the next free hook along (a "linear
+probe").
 
 That whole coat-check lives in memory, so reads and writes are essentially free.
 Durability is a separate job: when you change data, asmdb also writes it to a
@@ -445,7 +454,7 @@ flowchart LR
 
 ### The deep dive
 
-How a 42,997-byte PE64 and a 51,221-byte ELF64 become a durable database.
+How a 43,749-byte PE64 and a 52,221-byte ELF64 become a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -458,20 +467,20 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the PE64 binary is 42,997 bytes at 1.5.3 and the last published
-ELF64 binary is 51,221 bytes — and why a million-row database needs only a few
+which is why the PE64 binary is 43,749 bytes at 1.6.0 and the 1.6.0
+ELF64 binary is 52,221 bytes — and why a million-row database needs only a few
 MB of RAM.
 
 #### The record store — four cache lines per row
 
 Each row is a fixed **256-byte record** (exactly four cache lines), and the
-records live in an open-addressing hash table of **4,194,304 slots** where the
-record array *is* the index — there is no separate structure to keep in sync. The
-slot for a key is a Fibonacci hash: multiply by the 64-bit golden-ratio constant
-and keep the top bits.
+records live in an open-addressing hash table where the record array *is* the
+index — there is no separate structure to keep in sync. The default `large`
+table has **4,194,304 slots**. The slot for a key is a Fibonacci hash: multiply
+by the 64-bit golden-ratio constant and keep the top bits.
 
 ```asm
-; store_hash(rcx = id) -> rax = slot 0 .. 4194303
+; store_hash(rcx = id) -> rax = slot 0 .. 4194303 in the large table
 mov  rax, rcx
 mov  rdx, 0x9E3779B97F4A7C15   ; 2^64 / golden ratio
 imul rax, rdx                  ; scramble the key across the whole table
@@ -549,7 +558,7 @@ offset  size  field             value / meaning
    0      8   magic             "ASMDB\0\0\0"
    8      4   version           2
   12      4   record_size       256
-  16      8   capacity          4194304
+  16      8   capacity          slot count selected at creation
   24      8   live_count        number of live rows
   32     48   table_name        ASCII, NUL-padded
   80      4   engine_version    the build that last wrote this file
@@ -558,7 +567,7 @@ offset  size  field             value / meaning
  104      8   reset_pending_seq the sequence that RESET will carry
  112     16   lineage           identity shared with <name>.cdc
  128    384   reserved          zero-filled to 512
- 512    1 GiB slot array        capacity × 256-byte records (sparse on disk)
+ 512    ... slot array          capacity × 256-byte records (sparse on disk)
 ```
 
 Slot *i* lives at file offset `512 + i * 256`. A record is
@@ -619,12 +628,12 @@ honest baseline — the **same workloads on SQLite** (via Python's in-process
 .\examples\bench.ps1 -Rows 2000000 -NoCompare # asmdb only
 ```
 
-### asmdb vs SQLite — 2,000,000 rows
+### asmdb vs SQLite — 2,000,000 rows on one workstation core
 
 Records are **256 bytes** and the store is a **1 GiB** hash region (`2^22` slots),
 created **sparse** on disk so unused slots cost nothing.
 
-| Workload | asmdb | SQLite 3.49.1 | ratio |
+| Workload, same workstation core | asmdb | SQLite 3.49.1 | ratio |
 |---|--:|--:|--:|
 | **Engine insert** — in-RAM, one transaction | **≈ 12,383,609** rows/s | 1,004,090 rows/s | **≈ 12.3× faster** |
 | **Durable bulk load** — one checkpoint + `fsync` | **≈ 1,170,960** rows/s | 859,784 rows/s | **≈ 1.4× faster*** |
@@ -636,6 +645,13 @@ A fourth figure, not in the table because SQLite has no equivalent, is the
 **≈ 5,932 rows/s** (2M rows in `BEGIN…COMMIT` batches). It is bounded by the
 line-based text protocol, not the engine — which is exactly why a real
 deployment batches inside `BEGIN … COMMIT`.
+
+These are **local workstation measurements**, not hosted-tier promises. asmdb
+Cloud sells fractions of a Container Apps CPU: 0.25 vCPU on `free`, 0.5 on
+`standard`, and 1.0 on `premium`; REST, MCP and gateway hops add overhead, and
+`free`/`standard` also pay a cold start after idling. Per-tier throughput
+figures are not published yet — run `BENCH` on your own instance to measure the
+engine path for that tier.
 
 The story the numbers tell: the disk flush dominates durability. Autocommit
 `fsync`s after *every* row (~932/s); a transaction applies every row in RAM and
@@ -790,27 +806,33 @@ Two documents, deliberately kept in separate lanes:
 | **Concurrency** | ✅ one writer plus **unlimited `--reader` sessions**, each command isolated by the commit-sequence fence |
 | **Integrity** | ✅ `VERIFY` re-checks the store's own invariants — status bytes, reserved keys, content lengths, probe reachability, duplicate keys, row count |
 | **Safety** | ✅ every read/write/flush checked; a failed durable write aborts instead of acknowledging; a corrupt or foreign `.dat` is refused, never silently recreated; `BACKUP` refuses to target a live file |
-| **Startup & memory** | ✅ the store is **mapped copy-on-write**: opening a database is ~80 ms whatever its size (was ~600 ms), and a 1 M-row database peaks at **~5 MB** of RAM (was ~1 029 MB) |
+| **Startup & memory** | ✅ local workstation measurement: the store is **mapped copy-on-write**; opening a database is ~80 ms whatever its size (was ~600 ms), and a 1 M-row database peaks at **~5 MB** of RAM (was ~1 029 MB) |
 | **Snapshots** | ✅ written a chunk at a time with empty chunks left as holes — a three-row backup allocates 3.2 MiB, not 1 GiB |
 | **Machine interface** | ✅ `FORMAT TSV` + `PAGE` — full-fidelity rows, never truncated, for clients that must not parse a picture |
 | **Portability** | ✅ Windows PE64 + Linux ELF64 from one source, behind a thin `os_*` layer |
 | **Integration** | ✅ MCP server (generic CRUD tools) + Python / C# / C stdio clients |
 | **Security** | ⚠️ no auth, no encryption, no audit log; the binary is a single RWX image at a fixed address — see [`docs/SECURITY.md`](docs/SECURITY.md) |
-| **Tests** | ✅ 151 checks on Windows and the same battery on Linux, plus 24 for the MCP server — fault-injected I/O failures, crash windows, format fuzzing |
-| **Next up** | 🔜 **secondary indexes** — a full `FIND` costs ~900 ms whatever the row count, and a status directory was prototyped and measured *worse* on populated tables. Then SIMD scans and multi-writer MVCC |
+| **Tests** | ✅ Windows and Linux smoke suites, plus 24 checks for the MCP server — fault-injected I/O failures, crash windows, format fuzzing |
+| **Next up** | 🔜 **secondary indexes** — on the local benchmark machine, a full `FIND` costs ~900 ms whatever the row count, and a status directory was prototyped and measured *worse* on populated tables. Then SIMD scans and multi-writer MVCC |
 
-**The roadmap is driven by measurement, not intuition.** The last milestone came
-from noticing that opening a database cost **~600 ms regardless of its
+**The roadmap is driven by measurement, not intuition.** On the local benchmark
+workstation, the last milestone came from noticing that opening a database cost
+**~600 ms regardless of its
 contents** — 0 rows, 1 000 rows and 1 000 000 rows all measured the same,
 because `db_open` committed and read the *entire* 1 GiB slot region even though
 the file is sparse and mostly holes. Mapping the file **copy-on-write** instead
 fixed it at the root:
 
-| 1 000 000 rows | before | after |
+| 1 000 000 rows, local workstation | before | after |
 |---|--:|--:|
 | open + `COUNT` | 684 ms | **104 ms** |
 | peak memory | 1 029 MB | **5 MB** |
 | `BENCH` in-RAM insert | 11.8 M rows/s | 11.7 M rows/s (unchanged) |
+
+Hosted cgroup stats need a different reading: Azure Files NFS reserves the full
+tier table on disk, and container working set includes reclaimable file-backed
+cache from the copy-on-write mapping. That is why the service reports reserved
+versus actually used separately; it does not weaken the local 5 MB measurement.
 
 **And measurement kills ideas as well as confirming them.** The next roadmap item
 was a *persisted status directory* — one byte per slot, held contiguously, so a
@@ -843,7 +865,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.5.3 · 1.5.2 · 1.5.1 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.6.0 · 1.5.3 · 1.5.2 · 1.5.1 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -854,7 +876,7 @@ Two numbers are tracked separately and should not be confused:
 
 | | What it is | How often it moves | Effect |
 |---|---|---|---|
-| **Engine version** | the software (`1.5.1`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
+| **Engine version** | the software (`1.6.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
 | **Storage format** | the byte layout of `<db>.dat` (`2`) | rarely | decides whether a file can be opened, and what `--upgrade` migrates |
 
 Run `VERSION` inside the REPL to see both, plus which engine last wrote the open
@@ -862,6 +884,63 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+  <summary><b>1.6.0</b> — the table is sized for the machine it runs on</summary>
+
+  **A database allocated a gigabyte before holding a single row.** The slot
+  table was a compile-time constant: 2²² slots × 256 B, exactly 1 GiB, the same
+  on every machine. That is defensible on a workstation and indefensible as a
+  hosted service, where the smallest tier is given 0.5 GiB — half of what the
+  engine wanted before any data existed.
+
+  The capacity is now chosen when the database file is created, from
+  `ASMDB_CAPACITY`: `small` (2¹⁹ slots), `medium` (2²¹) or `large` (2²², the
+  default, so existing files and existing behaviour are unchanged). It is
+  recorded in the file header, and **the header wins on every later open** — the
+  variable can never reshape a database that already exists, which matters
+  because an environment variable is the easiest thing in the world to change by
+  accident. Growing a database from one size to the next goes through the
+  migration path that already existed for exactly this case.
+
+  The probe loop keeps its speed: the wrap mask and the hash shift became a
+  loaded mask and a variable shift, not a branch or a call.
+
+  **What the hosted service advertised was the slot count, not the row count.**
+  The engine refuses inserts past a 0.75 load factor — that is what keeps
+  lookups constant-time in an open-addressed table — so `4,194,304` was a
+  ceiling no customer could ever reach. Every published figure is now the number
+  the engine actually refuses to exceed: 393,216 · 1,572,864 · 3,145,728.
+
+  **Reservation is no longer reported as consumption.** A database holding five
+  rows reported `1,023.96 MiB working set / 1 GiB`, which reads as full. It was
+  not: the record store is mapped copy-on-write from the `.dat`, so most of that
+  is reclaimable file cache, and the hosted volume is Azure Files NFS, which does
+  not honour sparseness, so the file genuinely occupies its full size on disk.
+  The engine was correct and has not been changed. `/v1/stats` now separates
+  reserved from actually-used for both memory and storage, and reports the
+  reclaimable portion instead of leaving it unknown — it had no cgroup v1
+  fallback, which is why that field was always blank.
+
+  **The CLI answered the previous question.** Responses drifted by one command
+  and never recovered: `SCHEMA` returned the preceding `SELECT *`, `FIND`
+  returned the schema, `COUNT` returned twenty rows, and `BENCH 100000` reported
+  `0 row(s)` after writing a hundred thousand. A command emitting more than one
+  frame left the extra unread, and every later answer was served one behind. The
+  reader now drains to a known boundary before and after each command, so a
+  single malformed response cannot desynchronise a session permanently.
+
+  **A busy database is no longer reported as a broken one.** A stats probe
+  arriving during a long command timed out and blanked the panel, then recovered
+  on the next poll. Probes no longer queue behind the workload or trigger a
+  restart, and a timeout is served as the last known good sample marked stale.
+
+  Console: the instance token is held per database rather than globally, is
+  cleared when leaving the creation screen instead of lingering in the DOM after
+  being shown "once", and the row preview distinguishes *no token held* from
+  *request failed* from *genuinely empty* rather than calling all three empty.
+
+</details>
 
 <details>
   <summary><b>1.5.3</b> — an instance can back itself up without the platform holding a write key</summary>
@@ -925,7 +1004,7 @@ Newest first — click a version to expand it.
   because nothing tested that a command answers at all — the tests asserted what
   commands *print*, never that they *finish*.
 
-  The binary grew from 42,749 to 42,997 bytes. The storage format is unchanged
+  The binary grew from 42,749 to 43,013 bytes. The storage format is unchanged
   at 2, so no database needs migrating.
 
 </details>
@@ -1356,7 +1435,7 @@ file (`<db>.upgraded.dat`), preserves the logical table name, and **never
 touches the original**; you inspect the result and swap the files yourself. A
 format with no migration path is refused rather than guessed at.
 
-**Cost, stated plainly:** autocommit went from ~650 to ~250 rows/s, because
+**Cost, stated plainly on that release's local benchmark machine:** autocommit went from ~650 to ~250 rows/s, because
 atomicity means three flushes (log frame, commit marker, checkpoint) instead of
 one. Transactions are unaffected — batching in `BEGIN … COMMIT` was already the
 right call and now matters more. Group commit is the roadmap answer.
@@ -1373,14 +1452,14 @@ the first command. It is **mapped copy-on-write** from the `.dat`
 `mmap(MAP_PRIVATE)` on Linux) behind two new primitives, `os_map_cow` and
 `os_filesize`.
 
-| 1 000 000 rows | before | after |
+| 1 000 000 rows, local workstation | before | after |
 |---|--:|--:|
 | open + `COUNT` | 684 ms | **104 ms** |
 | peak working set | 1 029 MB | **5 MB** |
 | `BENCH` in-RAM insert | 11.8 M rows/s | 11.7 M rows/s (unchanged) |
 
-Opening a brand-new database went from 575 ms to 72 ms, and open time no longer
-depends on the database's contents at all.
+On that machine, opening a brand-new database went from 575 ms to 72 ms, and
+open time no longer depends on the database's contents at all.
 
 - **Durability is untouched.** The mapping is *private*, so writes to the store
   never reach the file: the `.dat` still changes only through the explicit

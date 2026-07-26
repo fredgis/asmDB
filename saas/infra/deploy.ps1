@@ -272,11 +272,51 @@ if ($existingApp) {
     }
 }
 
+# Resolved before the first deployment for the same reason it is read before it:
+# once the template has run the variable is gone, so a later read would mint a
+# new secret. Resolving it here also lets the failure path below put it back.
+$platformSecret = $existingPlatformSecret
+if (-not $platformSecret) {
+    $bytes = New-Object byte[] 32
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $platformSecret = [Convert]::ToBase64String($bytes)
+    Write-Host '>> generated a new platform secret (none was set)' -ForegroundColor Yellow
+} else {
+    Write-Host '>> reusing the existing platform secret'
+}
+
+# The template owns the container app, so every deployment wipes the control
+# plane's environment and the script puts it back at the end. A failure in
+# between — a build error, an unhealthy revision — used to leave the platform
+# stripped of its public base, its Entra configuration and its platform secret:
+# the site kept answering while sign-in and stats were quietly dead. Restoring
+# is therefore part of the failure path, not only the success path.
+function Set-ControlPlaneEnv {
+    param([Parameter(Mandatory)] $Outputs, [Parameter(Mandatory)] [string] $Secret)
+
+    Invoke-Az @(
+        'containerapp', 'update',
+        '--name', 'asmdb-cp',
+        '--resource-group', $ResourceGroup,
+        '--set-env-vars',
+            "ASMDB_PUBLIC_BASE=$(Get-OutputValue $Outputs 'instancePublicBase')",
+            "ASMDB_ENV_STORAGE=$(Get-OutputValue $Outputs 'instanceStorageName')",
+            "ASMDB_ENTRA_TENANT_ID=$EntraTenantId",
+            "ASMDB_ENTRA_CLIENT_ID=$EntraClientId",
+            "ASMDB_ENTRA_GROUP_ID=$EntraGroupId",
+            "ASMDB_PLATFORM_SECRET=$Secret"
+    )
+}
+
 $deployment = Invoke-GroupDeployment 'Deploying infrastructure with placeholder control-plane image...' $null
 $outputs = $deployment.properties.outputs
 $registryName = Get-OutputValue $outputs 'registryName'
 $registryLoginServer = Get-OutputValue $outputs 'registryLoginServer'
 $controlPlaneImage = "$registryLoginServer/asmdb-controlplane:$Tag"
+
+# From here on the control plane's environment has already been wiped by the
+# template. Anything that throws must put it back before surfacing the error.
+try {
 
 if ($SkipBuild) {
     # The tag now comes from the engine version, so -SkipBuild can name an image
@@ -317,35 +357,19 @@ $apimGatewayUrl = Get-OutputValue $outputs 'apimGatewayUrl'
 $instanceStorageName = Get-OutputValue $outputs 'instanceStorageName'
 $instancePublicBase = Get-OutputValue $outputs 'instancePublicBase'
 
-# The platform secret derives one introspection token per instance. It must
-# survive redeployment: regenerating it would invalidate every derived token and
-# silently break stats on every existing database. So it is generated once, on
-# the first deployment that finds it missing, and read back thereafter.
-# survive redeployment: regenerating it would invalidate every derived token and
-# silently break stats on every existing database. It was captured before the
-# deployment ran, because the deployment itself clears the variable.
-$platformSecret = $existingPlatformSecret
-if (-not $platformSecret) {
-    $bytes = New-Object byte[] 32
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    $platformSecret = [Convert]::ToBase64String($bytes)
-    Write-Host '>> generated a new platform secret (none was set)' -ForegroundColor Yellow
-} else {
-    Write-Host '>> reusing the existing platform secret'
-}
+Set-ControlPlaneEnv -Outputs $outputs -Secret $platformSecret
 
-Invoke-Az @(
-    'containerapp', 'update',
-    '--name', 'asmdb-cp',
-    '--resource-group', $ResourceGroup,
-    '--set-env-vars',
-        "ASMDB_PUBLIC_BASE=$instancePublicBase",
-        "ASMDB_ENV_STORAGE=$instanceStorageName",
-        "ASMDB_ENTRA_TENANT_ID=$EntraTenantId",
-        "ASMDB_ENTRA_CLIENT_ID=$EntraClientId",
-        "ASMDB_ENTRA_GROUP_ID=$EntraGroupId",
-        "ASMDB_PLATFORM_SECRET=$platformSecret"
-)
+}
+catch {
+    # Best effort, and deliberately quiet about its own failures: the error being
+    # reported is the one the operator needs, not whatever the recovery hit.
+    if ($outputs) {
+        Write-Host '>> deployment failed after the template ran; restoring the control plane environment' -ForegroundColor Yellow
+        try { Set-ControlPlaneEnv -Outputs $outputs -Secret $platformSecret }
+        catch { Write-Host ">> could not restore the environment: $($_.Exception.Message)" -ForegroundColor Red }
+    }
+    throw
+}
 
 $deadline = (Get-Date).AddMinutes(10)
 do {

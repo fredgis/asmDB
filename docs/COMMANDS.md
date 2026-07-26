@@ -208,7 +208,7 @@ Remove **every** row in the table in one operation — the bulk counterpart to
 `DELETE`. It is fully **transaction-aware**:
 
 - **Autocommit** — each live slot is tombstoned and only the affected slots (plus
-  the header) are written and flushed; the sparse 1 GiB region is *not*
+  the header) are written and flushed; the sparse slot region is *not*
   materialized.
 - **Inside a transaction** — every removed row's before-image is captured in the
   undo log, so [`ROLLBACK`](#rollback) restores the whole table and
@@ -469,12 +469,12 @@ file can be opened.
 
 ```text
 asmdb> VERSION
-  asmdb 1.5.3   (stable: the on-disk format is versioned and migratable)
+  asmdb 1.6.0   (stable: the on-disk format is versioned and migratable)
   storage format : 2
   record size    : 256 bytes
   capacity       : 4194304 slots
   platform       : Windows PE64 (kernel32)
-  written by     : engine 1.5.3
+  written by     : engine 1.6.0
 [ OK ] version shown
 ```
 
@@ -494,7 +494,8 @@ BENCH <n>
 Insert *n* synthetic rows in a tight in-RAM loop (no text protocol, no per-row
 disk I/O), timed internally with a high-resolution counter, then checkpoint once
 and report throughput. This is how the [Performance](../README.md#performance)
-numbers are produced. `n` is capped to the table capacity.
+numbers are produced. `n` is capped at 75 % of the configured slot table, the
+same load-factor limit enforced for normal inserts.
 
 ```text
 asmdb> BENCH 1000000
@@ -502,6 +503,10 @@ asmdb> BENCH 1000000
   fsync total    :        just over one second for the durable checkpoint
 [ OK ] benchmark complete
 ```
+
+The rows/sec value is machine-specific. Published README benchmark numbers are
+from one workstation core, not from an asmdb Cloud tier; hosted users should run
+`BENCH` on their own instance when they need a tier-specific measurement.
 
 > `BENCH` mutates the open database (it replaces its contents with synthetic
 > rows). Run it against a scratch database name, or `TRUNCATE` afterwards.
@@ -529,7 +534,7 @@ way.
 The snapshot is written to `<file>.part`, created exclusively, flushed, and only
 then renamed over `<file>`. It is written a 1 MiB chunk at a time and chunks
 that hold no rows are left as file holes, so a snapshot of a small database
-costs a few megabytes rather than the full 1 GiB region. So a backup either lands whole or not at all, and a
+costs a few megabytes rather than the full large-table region. So a backup either lands whole or not at all, and a
 failed run never destroys the previous good backup at the same path.
 
 `<file>` is compared to the live `.dat`, `.wal` and `.cdc` **by file identity**
@@ -751,7 +756,7 @@ engine never prints `[ OK ]` after a failed write.
 | `constraint: id must be >= 1 (0 is reserved)` | id `0` is not a usable key |
 | `key already exists` | [`INSERT`](#insert) on a live key — use [`UPDATE`](#update) |
 | `key not found` | [`UPDATE`](#update) / [`DELETE`](#delete) / [`SELECT`](#select) on a missing key |
-| `table full` | no free slot remains at the current capacity |
+| `table full` | the configured table has reached its 0.75 load-factor cap |
 | `no active transaction` | [`COMMIT`](#commit) / [`ROLLBACK`](#rollback) outside a transaction |
 | `transaction already active` | nested [`BEGIN`](#begin) |
 | `transaction too large - COMMIT or ROLLBACK` | more than 4096 **distinct rows** touched in one transaction (for `TRUNCATE`, the whole live table must fit — it fails having changed nothing) |

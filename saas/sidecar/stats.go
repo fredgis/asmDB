@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,24 +11,31 @@ import (
 )
 
 const (
-	rowCapacity = uint64(4_194_304)
-	statsTTL    = 2 * time.Second
+	statsTTL        = 2 * time.Second
+	dataHeaderBytes = uint64(512)
+	recordBytes     = uint64(256)
 )
 
 var cgroupRoot = "/sys/fs/cgroup"
 
 type statsResponse struct {
-	Rows          string       `json:"rows"`
-	Capacity      string       `json:"capacity"`
-	Engine        string       `json:"engine"`
-	StorageFormat string       `json:"storageFormat"`
-	UptimeSeconds int64        `json:"uptimeSeconds"`
-	Storage       storageStats `json:"storage"`
-	Memory        *memoryStats `json:"memory,omitempty"`
-	CPU           *cpuStats    `json:"cpu,omitempty"`
+	Rows             string       `json:"rows"`
+	Capacity         string       `json:"capacity,omitempty"`
+	Engine           string       `json:"engine"`
+	StorageFormat    string       `json:"storageFormat"`
+	UptimeSeconds    int64        `json:"uptimeSeconds"`
+	Status           string       `json:"status,omitempty"`
+	Transient        bool         `json:"transient,omitempty"`
+	Stale            bool         `json:"stale,omitempty"`
+	SampleAgeSeconds int64        `json:"sampleAgeSeconds,omitempty"`
+	Storage          storageStats `json:"storage"`
+	Memory           *memoryStats `json:"memory,omitempty"`
+	CPU              *cpuStats    `json:"cpu,omitempty"`
 }
 
 type storageStats struct {
+	DataReservedBytes  string `json:"dataReservedBytes,omitempty"`
+	DataUsedBytes      string `json:"dataUsedBytes,omitempty"`
 	DataBytes          string `json:"dataBytes,omitempty"`
 	DataAllocatedBytes string `json:"dataAllocatedBytes,omitempty"`
 	DataApparentBytes  string `json:"dataApparentBytes"`
@@ -40,14 +48,20 @@ type storageStats struct {
 }
 
 type memoryStats struct {
-	UsedBytes         string                       `json:"usedBytes,omitempty"`
-	LimitBytes        string                       `json:"limitBytes,omitempty"`
-	ReclaimableBytes  string                       `json:"reclaimableBytes,omitempty"`
-	WorkingSetBytes   string                       `json:"workingSetBytes,omitempty"`
-	FileBytes         string                       `json:"fileBytes,omitempty"`
-	InactiveFileBytes string                       `json:"inactiveFileBytes,omitempty"`
-	Events            map[string]string            `json:"events,omitempty"`
-	Pressure          map[string]map[string]string `json:"pressure,omitempty"`
+	UsedBytes           string                       `json:"usedBytes,omitempty"`
+	CurrentBytes        string                       `json:"currentBytes,omitempty"`
+	ReservedBytes       string                       `json:"reservedBytes,omitempty"`
+	ActualUsedBytes     string                       `json:"actualUsedBytes,omitempty"`
+	NonReclaimableBytes string                       `json:"nonReclaimableBytes,omitempty"`
+	AnonymousBytes      string                       `json:"anonymousBytes,omitempty"`
+	KernelBytes         string                       `json:"kernelBytes,omitempty"`
+	LimitBytes          string                       `json:"limitBytes,omitempty"`
+	ReclaimableBytes    string                       `json:"reclaimableBytes,omitempty"`
+	WorkingSetBytes     string                       `json:"workingSetBytes,omitempty"`
+	FileBytes           string                       `json:"fileBytes,omitempty"`
+	InactiveFileBytes   string                       `json:"inactiveFileBytes,omitempty"`
+	Events              map[string]string            `json:"events,omitempty"`
+	Pressure            map[string]map[string]string `json:"pressure,omitempty"`
 }
 
 type cpuStats struct {
@@ -63,8 +77,12 @@ func (a *api) stats(r *http.Request) (*statsResponse, error) {
 		return a.statsCached, nil
 	}
 
-	count, err := a.count(r)
+	count, err := a.tryCount(r)
 	if err != nil {
+		if errors.Is(err, errEngineBusy) {
+			stats := a.busyStats(now)
+			return stats, nil
+		}
 		return nil, err
 	}
 	started := a.started
@@ -72,15 +90,19 @@ func (a *api) stats(r *http.Request) (*statsResponse, error) {
 		started = now
 	}
 	info := a.engine.engineInfo()
+	memoryReserved := memoryReservedBytes(info)
 	stats := &statsResponse{
 		Rows:          strconv.FormatUint(count, 10),
-		Capacity:      strconv.FormatUint(rowCapacity, 10),
 		Engine:        info.Version,
 		StorageFormat: info.StorageFormat,
 		UptimeSeconds: int64(now.Sub(started).Seconds()),
-		Storage:       collectStorageStats(a.engine.data, a.engine.name),
-		Memory:        collectMemoryStats(),
+		Status:        "ok",
+		Storage:       collectStorageStats(a.engine.data, a.engine.name, count, true),
+		Memory:        collectMemoryStats(memoryReserved),
 		CPU:           collectCPUStats(),
+	}
+	if info.RowCapacity > 0 {
+		stats.Capacity = strconv.FormatUint(info.RowCapacity, 10)
 	}
 
 	a.statsCached = stats
@@ -88,11 +110,51 @@ func (a *api) stats(r *http.Request) (*statsResponse, error) {
 	return stats, nil
 }
 
-func collectStorageStats(dir, name string) storageStats {
+func (a *api) tryCount(r *http.Request) (uint64, error) {
+	lines, err := a.engine.TryCommandIfReady(r.Context(), "COUNT", waitStatus)
+	if err != nil {
+		return 0, err
+	}
+	return parseCountLines(lines)
+}
+
+func (a *api) busyStats(now time.Time) *statsResponse {
+	started := a.started
+	if started.IsZero() {
+		started = now
+	}
+	var stats statsResponse
+	if a.statsCached != nil {
+		stats = *a.statsCached
+	} else {
+		info := a.engine.engineInfo()
+		stats = statsResponse{
+			Engine:        info.Version,
+			StorageFormat: info.StorageFormat,
+		}
+		if info.RowCapacity > 0 {
+			stats.Capacity = strconv.FormatUint(info.RowCapacity, 10)
+		}
+	}
+	stats.UptimeSeconds = int64(now.Sub(started).Seconds())
+	stats.Status = "busy"
+	stats.Transient = true
+	stats.Stale = a.statsCached != nil
+	if a.statsCached != nil {
+		stats.SampleAgeSeconds = int64(now.Sub(a.statsAt).Seconds())
+	}
+	rows, rowsKnown := parseCachedRows(stats.Rows)
+	stats.Storage = collectStorageStats(a.engine.data, a.engine.name, rows, rowsKnown)
+	stats.Memory = collectMemoryStats(memoryReservedBytes(a.engine.engineInfo()))
+	stats.CPU = collectCPUStats()
+	return &stats
+}
+
+func collectStorageStats(dir, name string, rows uint64, rowsKnown bool) storageStats {
 	data := collectFileUsage(filepath.Join(dir, name+".dat"))
 	wal := collectFileUsage(filepath.Join(dir, name+".wal"))
 	cdc := collectFileUsage(filepath.Join(dir, name+".cdc"))
-	return storageStats{
+	stats := storageStats{
 		DataBytes:          data.allocatedDecimal(),
 		DataAllocatedBytes: data.allocatedDecimal(),
 		DataApparentBytes:  data.apparentDecimal(),
@@ -103,17 +165,25 @@ func collectStorageStats(dir, name string) storageStats {
 		CDCAllocatedBytes:  cdc.allocatedDecimal(),
 		CDCApparentBytes:   cdc.apparentDecimal(),
 	}
+	stats.DataReservedBytes = stats.DataAllocatedBytes
+	if rowsKnown {
+		stats.DataUsedBytes = strconv.FormatUint(dataUsedBytes(rows), 10)
+	}
+	return stats
 }
 
-func collectMemoryStats() *memoryStats {
-	used, ok := readUintFile(filepath.Join(cgroupRoot, "memory.current"))
+func collectMemoryStats(reservedBytes uint64) *memoryStats {
+	current, ok := readUintFile(filepath.Join(cgroupRoot, "memory.current"))
 	if !ok {
-		used, ok = readUintFile(filepath.Join(cgroupRoot, "memory", "memory.usage_in_bytes"))
+		current, ok = readUintFile(filepath.Join(cgroupRoot, "memory", "memory.usage_in_bytes"))
 	}
 	if !ok {
 		return nil
 	}
-	stats := &memoryStats{UsedBytes: strconv.FormatUint(used, 10)}
+	stats := &memoryStats{CurrentBytes: strconv.FormatUint(current, 10)}
+	if reservedBytes > 0 {
+		stats.ReservedBytes = strconv.FormatUint(reservedBytes, 10)
+	}
 	if limitText, ok := readTextFile(filepath.Join(cgroupRoot, "memory.max")); ok {
 		if limitText != "max" {
 			if limit, err := strconv.ParseUint(limitText, 10, 64); err == nil {
@@ -123,26 +193,34 @@ func collectMemoryStats() *memoryStats {
 	} else if limit, ok := readUintFile(filepath.Join(cgroupRoot, "memory", "memory.limit_in_bytes")); ok {
 		stats.LimitBytes = strconv.FormatUint(limit, 10)
 	}
-	// memory.current includes page cache. asmdb touches a large sparse data file,
-	// so raw usage can look near the cgroup limit while most of it is reclaimable
-	// file cache. Expose both the raw total and a derived working set.
-	if memStat, ok := readMemoryStat(filepath.Join(cgroupRoot, "memory.stat")); ok {
-		if file, ok := memStat["file"]; ok {
+	// memory.current includes page cache. asmdb maps the table as a copy-on-write,
+	// file-backed region, so expose anonymous/non-reclaimable memory separately.
+	if memStat, ok := readMemoryStats(); ok {
+		if anon, ok := memoryStatValue(memStat, "anon", "total_rss", "rss"); ok {
+			stats.UsedBytes = strconv.FormatUint(anon, 10)
+			stats.ActualUsedBytes = strconv.FormatUint(anon, 10)
+			stats.NonReclaimableBytes = strconv.FormatUint(anon, 10)
+			stats.AnonymousBytes = strconv.FormatUint(anon, 10)
+		}
+		if kernel, ok := memoryStatValue(memStat, "kernel", "kernel_stack"); ok {
+			stats.KernelBytes = strconv.FormatUint(kernel, 10)
+		}
+		if file, ok := memoryStatValue(memStat, "file", "total_cache", "cache"); ok {
 			stats.FileBytes = strconv.FormatUint(file, 10)
 		}
-		reclaimable, ok := memStat["inactive_file"]
+		reclaimable, ok := memoryStatValue(memStat, "inactive_file", "total_inactive_file")
 		if ok {
 			stats.InactiveFileBytes = strconv.FormatUint(reclaimable, 10)
 		} else {
-			reclaimable, ok = memStat["file"]
+			reclaimable, ok = memoryStatValue(memStat, "file", "total_cache", "cache")
 		}
 		if ok {
 			stats.ReclaimableBytes = strconv.FormatUint(reclaimable, 10)
-			working := uint64(0)
-			if used > reclaimable {
-				working = used - reclaimable
+			workingSet := uint64(0)
+			if current > reclaimable {
+				workingSet = current - reclaimable
 			}
-			stats.WorkingSetBytes = strconv.FormatUint(working, 10)
+			stats.WorkingSetBytes = strconv.FormatUint(workingSet, 10)
 		}
 	}
 	if events, ok := readStringUintMap(filepath.Join(cgroupRoot, "memory.events")); ok {
@@ -152,6 +230,41 @@ func collectMemoryStats() *memoryStats {
 		stats.Pressure = pressure
 	}
 	return stats
+}
+
+func readMemoryStats() (map[string]uint64, bool) {
+	if memStat, ok := readMemoryStat(filepath.Join(cgroupRoot, "memory.stat")); ok {
+		return memStat, true
+	}
+	return readMemoryStat(filepath.Join(cgroupRoot, "memory", "memory.stat"))
+}
+
+func memoryReservedBytes(info engineInfo) uint64 {
+	if info.SlotCapacity == 0 {
+		return 0
+	}
+	return info.SlotCapacity * recordBytes
+}
+
+func parseCachedRows(text string) (uint64, bool) {
+	if text == "" {
+		return 0, false
+	}
+	rows, err := strconv.ParseUint(text, 10, 64)
+	return rows, err == nil
+}
+
+func dataUsedBytes(rows uint64) uint64 {
+	return dataHeaderBytes + rows*recordBytes
+}
+
+func memoryStatValue(values map[string]uint64, keys ...string) (uint64, bool) {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			return value, true
+		}
+	}
+	return 0, false
 }
 
 type fileUsage struct {

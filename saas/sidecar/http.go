@@ -422,6 +422,10 @@ func (a *api) count(r *http.Request) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return parseCountLines(lines)
+}
+
+func parseCountLines(lines []string) (uint64, error) {
 	for _, line := range lines {
 		m := countRE.FindStringSubmatch(line)
 		if len(m) == 2 {

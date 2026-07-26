@@ -61,6 +61,28 @@ os_cmdline:
     pop  rbp
     ret
 
+; os_getenv(rcx = name) -> rax = pointer to value, or 0 if missing/empty.
+; The returned pointer is valid until the next os_getenv call.
+os_getenv:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x30
+    lea  rdx, [rel g_envbuf]
+    mov  r8d, 64
+    call [rel iat_GetEnvironmentVariableA]
+    test eax, eax
+    jz   .none
+    cmp  eax, 64
+    jae  .none
+    lea  rax, [rel g_envbuf]
+    jmp  .done
+.none:
+    xor  eax, eax
+.done:
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; --------------------------------- memory -----------------------------------
 
 ; os_alloc(rcx = size) -> rax = zeroed pointer, or 0 on failure
@@ -690,6 +712,7 @@ g_fsize:       dq 0
 g_dir_handle:  dq 0
 g_dir_first:   dq 0
 g_bhfi:        times 52 db 0        ; BY_HANDLE_FILE_INFORMATION
+g_envbuf:      times 64 db 0
                 align 8
 g_lockovl:     times 32 db 0        ; OVERLAPPED for the writer lock
                 align 8
@@ -736,6 +759,7 @@ iat_MoveFileExA:       dq RVA(h_MoveFileExA)
 iat_DeleteFileA:       dq RVA(h_DeleteFileA)
 iat_GetFileAttributesA: dq RVA(h_GetFileAttributesA)
 iat_LockFileEx:        dq RVA(h_LockFileEx)
+iat_GetEnvironmentVariableA: dq RVA(h_GetEnvironmentVariableA)
                        dq 0
 
 dll_name: db 'kernel32.dll', 0
@@ -827,3 +851,6 @@ h_GetFileAttributesA: dw 0
                 align 2
 h_LockFileEx:        dw 0
     db 'LockFileEx', 0
+                align 2
+h_GetEnvironmentVariableA: dw 0
+    db 'GetEnvironmentVariableA', 0

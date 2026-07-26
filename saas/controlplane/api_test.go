@@ -50,17 +50,27 @@ func (p *fakeProvisioner) Delete(_ context.Context, _ instance) error {
 	return nil
 }
 
-func (p *fakeProvisioner) RotateToken(_ context.Context, _ instance, token string) error {
+func (p *fakeProvisioner) RotateToken(_ context.Context, _ instance, token string, progress func(string)) error {
 	if p.rotateErr != nil {
 		return p.rotateErr
+	}
+	if progress != nil {
+		progress("stopping")
+		progress("starting")
+		progress("verifying_health")
 	}
 	p.rotated = append(p.rotated, token)
 	return nil
 }
 
-func (p *fakeProvisioner) UpgradeImage(_ context.Context, _ instance, image string) error {
+func (p *fakeProvisioner) UpgradeImage(_ context.Context, _ instance, image string, progress func(string)) error {
 	if p.upgradeErr != nil {
 		return p.upgradeErr
+	}
+	if progress != nil {
+		progress("stopping")
+		progress("starting")
+		progress("verifying_health")
 	}
 	p.upgraded = append(p.upgraded, image)
 	return nil
@@ -124,6 +134,25 @@ func allowVerifier() *fakeAccessTokenVerifier {
 		Groups: []string{cfg.EntraGroupID},
 		Scopes: []string{entraScopeName},
 	}}
+}
+
+func waitForOperationState(t *testing.T, s store, id, want string) instance {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		in, err := s.Get(context.Background(), id)
+		if err == nil && in.Operation != nil && in.Operation.State == want {
+			return in
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				t.Fatalf("operation did not reach %q: %v", want, err)
+			}
+			in, _ := s.Get(context.Background(), id)
+			t.Fatalf("operation = %+v, want state %q", in.Operation, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func newTestAPI(store store, prov provisioner) *api {
@@ -438,9 +467,29 @@ func TestHealthEngineOverridesImageTag(t *testing.T) {
 	if got.Engine != "1.5.0+hotfix" {
 		t.Fatalf("engine = %q, want health-reported version", got.Engine)
 	}
+	if got.EngineSource != "instance" {
+		t.Fatalf("engineSource = %q, want instance", got.EngineSource)
+	}
 }
 
-func TestRotateTokenChangesStoredHashAndReturnsTokenOnce(t *testing.T) {
+func TestInstanceReportedEngineSuppressesSpuriousUpgrade(t *testing.T) {
+	api := newAPI(newMemoryStore(), &fakeProvisioner{states: map[string]liveState{}}, testStatsConfig(), allowVerifier())
+	got := api.responseFor(context.Background(), instance{
+		ID:               "db_abcdefghijklmnopqrstuvwx",
+		Name:             "db",
+		Tier:             "free",
+		Image:            "reg.azurecr.io/asmdb-instance:1.5.1",
+		Engine:           "1.6.0",
+		EngineSource:     "instance",
+		CreatedAt:        time.Now().UTC(),
+		ContainerAppName: "db-test",
+	})
+	if got.UpgradeAvailable {
+		t.Fatalf("upgradeAvailable = true for instance-reported current engine")
+	}
+}
+
+func TestRotateTokenPreparesThenCommitsAsynchronously(t *testing.T) {
 	store := newMemoryStore()
 	id := "db_abcdefghijklmnopqrstuvwx"
 	oldHash := tokenHash("old-token")
@@ -454,49 +503,87 @@ func TestRotateTokenChangesStoredHashAndReturnsTokenOnce(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/rotate-token", nil)
-	req.Header.Set("Authorization", "Bearer admin")
+	req.Header.Set("Authorization", "Bearer admin-token")
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("prepare status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var prepared struct {
+		Token     string     `json:"token"`
+		Operation *operation `json:"operation"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &prepared); err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`).MatchString(prepared.Token) {
+		t.Fatalf("unexpected token shape: %q", prepared.Token)
+	}
+	got, _ := store.Get(context.Background(), id)
+	if got.TokenHash != oldHash {
+		t.Fatalf("hash changed before commit: %q", got.TokenHash)
+	}
+	if got.Operation == nil || got.Operation.State != "pending_ack" || got.Operation.PendingToken != prepared.Token {
+		t.Fatalf("operation = %+v, want pending_ack with token", got.Operation)
 	}
 
-	var rotated rotateTokenResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &rotated); err != nil {
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/rotate-token/commit", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("commit status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	updated := waitForOperationState(t, store, id, "done")
+	if len(prov.rotated) != 1 || prov.rotated[0] != prepared.Token {
+		t.Fatalf("pushed tokens = %#v, want prepared token", prov.rotated)
+	}
+	if updated.TokenHash != tokenHash(prepared.Token) {
+		t.Fatal("store does not contain committed token hash")
+	}
+	if updated.Operation.PendingToken != prepared.Token {
+		t.Fatal("committed token is not recoverable from operation")
+	}
+}
+
+func TestRotateTokenPrepareLeavesOldTokenWorkingIfClientDisconnects(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	oldHash := tokenHash("old-token")
+	if err := store.Save(context.Background(), instance{ID: id, Name: "db", Tier: "free", TokenHash: oldHash, ContainerAppName: "db-test"}); err != nil {
 		t.Fatal(err)
 	}
-	if !regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`).MatchString(rotated.Token) {
-		t.Fatalf("unexpected token shape: %q", rotated.Token)
+	api := newTestAPI(store, &fakeProvisioner{states: map[string]liveState{}})
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/rotate-token", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if len(prov.rotated) != 1 || prov.rotated[0] != rotated.Token {
-		t.Fatalf("pushed tokens = %#v, want returned token", prov.rotated)
+	got, _ := store.Get(context.Background(), id)
+	if got.TokenHash != oldHash {
+		t.Fatalf("hash = %q, want old hash until commit", got.TokenHash)
 	}
-	updated, err := store.Get(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if updated.TokenHash == oldHash {
-		t.Fatal("stored hash did not change")
-	}
-	if updated.TokenHash == rotated.Token {
-		t.Fatal("store contains plaintext token")
-	}
-	if updated.TokenHash != tokenHash(rotated.Token) {
-		t.Fatal("store does not contain returned token hash")
+	if got.Operation == nil || got.Operation.PendingToken == "" {
+		t.Fatalf("operation = %+v, want recoverable token", got.Operation)
 	}
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/databases/"+id, nil)
-	req.Header.Set("Authorization", "Bearer admin")
+	req.Header.Set("Authorization", "Bearer admin-token")
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("get status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var got databaseResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	var body databaseResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if got.Token != "" {
-		t.Fatal("GET returned rotated token")
+	if body.Operation == nil || body.Operation.State != "pending_ack" || body.Operation.PendingToken == "" {
+		t.Fatalf("database operation = %+v, want observable pending token", body.Operation)
 	}
 }
 
@@ -542,42 +629,40 @@ func TestRotateTokenRequiresAdminGroup(t *testing.T) {
 	}
 }
 
-func TestRotateTokenPushFailureRestoresOldHash(t *testing.T) {
+func TestRotateTokenCommitFailureLeavesOldHashAndNewTokenRecoverable(t *testing.T) {
 	store := newMemoryStore()
 	id := "db_abcdefghijklmnopqrstuvwx"
 	oldHash := tokenHash("old-token")
 	if err := store.Save(context.Background(), instance{ID: id, Name: "db", Tier: "free", TokenHash: oldHash, ContainerAppName: "db-test"}); err != nil {
 		t.Fatal(err)
 	}
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, execResponse{Output: []string{"ok"}, OK: true})
-	}))
-	defer sidecar.Close()
-	api := newTestAPI(store, &fakeProvisioner{rotateErr: errors.New("update failed"), states: map[string]liveState{}, internalEndpoint: sidecar.URL})
+	api := newTestAPI(store, &fakeProvisioner{rotateErr: errors.New("update failed"), states: map[string]liveState{}})
 	mux := http.NewServeMux()
 	api.register(mux)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/rotate-token", nil)
-	req.Header.Set("Authorization", "Bearer admin")
+	req.Header.Set("Authorization", "Bearer admin-token")
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("prepare status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	got, err := store.Get(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
+	prepared, _ := store.Get(context.Background(), id)
+	pending := prepared.Operation.PendingToken
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/rotate-token/commit", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("commit status = %d body = %s", rec.Code, rec.Body.String())
 	}
+	got := waitForOperationState(t, store, id, "failed")
 	if got.TokenHash != oldHash {
 		t.Fatalf("hash = %q, want old hash restored", got.TokenHash)
 	}
-
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/exec", strings.NewReader(`{"command":"SELECT *"}`))
-	req.Header.Set("Authorization", "Bearer old-token")
-	mux.ServeHTTP(rec, req)
-	if rec.Code == http.StatusUnauthorized {
-		t.Fatalf("old token was rejected after failed rotation: %s", rec.Body.String())
+	if got.Operation.PendingToken != pending || pending == "" {
+		t.Fatalf("pending token = %q, want recoverable %q", got.Operation.PendingToken, pending)
 	}
 }
 
@@ -628,9 +713,10 @@ func TestUpgradeBackupFailureAborts(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/upgrade", nil)
 	req.Header.Set("Authorization", "Bearer admin")
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadGateway {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
+	waitForOperationState(t, store, id, "failed")
 	if len(prov.upgraded) != 0 {
 		t.Fatalf("upgrade called after backup failure: %#v", prov.upgraded)
 	}
@@ -663,9 +749,10 @@ func TestUpgradePrepareUnauthorizedAbortsWithoutChangingImage(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/upgrade", nil)
 	req.Header.Set("Authorization", "Bearer admin-token")
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadGateway {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
+	waitForOperationState(t, store, id, "failed")
 	if len(prov.upgraded) != 0 {
 		t.Fatalf("upgrade called after prepare failure: %#v", prov.upgraded)
 	}
@@ -686,7 +773,7 @@ func TestUpgradeRevisionFailureLeavesRecordedImageUnchanged(t *testing.T) {
 		if r.URL.Path != "/v1/prepare-upgrade" {
 			t.Fatalf("unexpected backup path %q", r.URL.Path)
 		}
-		writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: true, Backup: "snapshot"})
+		writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: true, Backup: json.RawMessage(`{"path":"snapshot"}`)})
 	}))
 	defer server.Close()
 	prov := &fakeProvisioner{internalEndpoint: server.URL, upgradeErr: errors.New("revision failed"), states: map[string]liveState{}}
@@ -698,9 +785,10 @@ func TestUpgradeRevisionFailureLeavesRecordedImageUnchanged(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/upgrade", nil)
 	req.Header.Set("Authorization", "Bearer admin")
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadGateway {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
+	waitForOperationState(t, store, id, "failed")
 	got, _ := store.Get(context.Background(), id)
 	if got.Image != oldImage {
 		t.Fatalf("image = %q, want %q after failed revision", got.Image, oldImage)
@@ -721,7 +809,7 @@ func TestUpgradeStoppedInstanceIsDeliberatelyStarted(t *testing.T) {
 			if got, want := r.Header.Get("Authorization"), "Bearer "+derivePlatformToken(testStatsConfig().PlatformSecret, id); got != want {
 				t.Fatalf("prepare-upgrade auth = %q, want %q", got, want)
 			}
-			writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: true, Backup: "snapshot"})
+			writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: true, Backup: json.RawMessage(`{"path":"snapshot"}`)})
 			return
 		}
 		writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Engine: "1.6.0"})
@@ -739,18 +827,94 @@ func TestUpgradeStoppedInstanceIsDeliberatelyStarted(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/upgrade", nil)
 	req.Header.Set("Authorization", "Bearer admin")
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
+	waitForOperationState(t, store, id, "done")
 	if backupCalls != 1 || len(prov.upgraded) != 1 {
 		t.Fatalf("backupCalls=%d upgraded=%#v, want one backup and one upgrade", backupCalls, prov.upgraded)
-	}
-	if !strings.Contains(rec.Body.String(), "was stopped") {
-		t.Fatalf("response does not explain stopped upgrade: %s", rec.Body.String())
 	}
 	got, _ := store.Get(context.Background(), id)
 	if got.Image != testStatsConfig().Image || got.Engine != "1.6.0" {
 		t.Fatalf("stored instance = %+v", got)
+	}
+}
+
+func TestUpgradeReturnsAcceptedPromptlyAndExposesStates(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	_ = store.Save(context.Background(), instance{ID: id, Tier: "free", Image: "reg.azurecr.io/asmdb-instance:1.5.0", ContainerAppName: "db-test"})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: true, Backup: json.RawMessage(`{"path":"snapshot"}`)})
+	}))
+	defer server.Close()
+	prov := &fakeProvisioner{internalEndpoint: server.URL, states: map[string]liveState{}}
+	api := newAPI(store, prov, testStatsConfig(), allowVerifier())
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/upgrade", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	mux.ServeHTTP(rec, req)
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("upgrade blocked for %s", elapsed)
+	}
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	in, _ := store.Get(context.Background(), id)
+	if in.Operation == nil || in.Operation.State != "preparing_backup" {
+		t.Fatalf("operation = %+v, want preparing_backup", in.Operation)
+	}
+	waitForOperationState(t, store, id, "done")
+}
+
+func TestConcurrentUpgradeRejected(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	now := time.Now().UTC()
+	_ = store.Save(context.Background(), instance{
+		ID: id, Tier: "free", Image: "reg.azurecr.io/asmdb-instance:1.5.0", ContainerAppName: "db-test",
+		Operation: &operation{Type: "upgrade", State: "starting", StartedAt: now, UpdatedAt: now},
+	})
+	api := newAPI(store, &fakeProvisioner{states: map[string]liveState{}}, testStatsConfig(), allowVerifier())
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/upgrade", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStaleOperationExpires(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	old := time.Now().UTC().Add(-operationStaleAfter - time.Minute)
+	_ = store.Save(context.Background(), instance{
+		ID: id, Tier: "free", Image: "reg.azurecr.io/asmdb-instance:1.5.0", ContainerAppName: "db-test",
+		Operation: &operation{Type: "upgrade", State: "starting", StartedAt: old, UpdatedAt: old},
+	})
+	api := newAPI(store, &fakeProvisioner{states: map[string]liveState{}}, testStatsConfig(), allowVerifier())
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/databases/"+id, nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	got, _ := store.Get(context.Background(), id)
+	if got.Operation == nil || got.Operation.State != "failed" {
+		t.Fatalf("operation = %+v, want failed", got.Operation)
 	}
 }
 
@@ -984,7 +1148,7 @@ func TestListWithStatsFetchesConcurrently(t *testing.T) {
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(300 * time.Millisecond)
-		writeJSON(w, http.StatusOK, map[string]any{"rows": 12, "cpu": 0.25, "memory": 1024})
+		writeJSON(w, http.StatusOK, map[string]any{"rows": 12, "engine": "1.6.0", "storageFormat": "2", "cpu": 0.25, "memory": 1024})
 	}))
 	defer server.Close()
 	api := newStatsTestAPI(store, &fakeProvisioner{internalEndpoint: server.URL, states: map[string]liveState{}})
@@ -1016,6 +1180,10 @@ func TestListWithStatsFetchesConcurrently(t *testing.T) {
 		if db.Stats == nil || !db.Stats.Available {
 			t.Fatalf("database %s stats = %+v, want available", db.ID, db.Stats)
 		}
+	}
+	updated, _ := store.Get(context.Background(), ids[0])
+	if updated.Engine != "1.6.0" || updated.StorageFormat != "2" || updated.EngineSource != "instance" {
+		t.Fatalf("stored reported version = %+v", updated)
 	}
 }
 

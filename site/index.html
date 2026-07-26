@@ -75,19 +75,19 @@
   <div class="shell shell-wide stats__grid">
     <div class="stat">
       <p class="stat__n">11,959,261</p>
-      <p class="stat__l">rows per second, inserted in RAM.<br>Measured, one core.</p>
+      <p class="stat__l">rows per second, inserted in RAM.<br>One workstation core, not a hosted tier.</p>
     </div>
     <div class="stat">
-      <p class="stat__n">42,733<span> B</span></p>
-      <p class="stat__l">the entire engine, PE64.<br>51,205 B as ELF64.</p>
+      <p class="stat__n">43,749<span> B</span></p>
+      <p class="stat__l">the entire engine, PE64.<br>52,221 B as ELF64.</p>
     </div>
     <div class="stat">
       <p class="stat__n">0</p>
       <p class="stat__l">third-party dependencies.<br>No linker. No C runtime.</p>
     </div>
     <div class="stat">
-      <p class="stat__n">4,194,304</p>
-      <p class="stat__l">rows per instance.<br>256 bytes each, fixed.</p>
+      <p class="stat__n">3,145,728</p>
+      <p class="stat__l">rows in the largest table.<br>256 bytes each, fixed.</p>
     </div>
     <div class="stat">
       <p class="stat__n">~104<span> ms</span></p>
@@ -406,10 +406,11 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
       <p class="sec__kicker">Tiers</p>
       <h2 class="sec__title">Every tier is the same engine.</h2>
       <p class="sec__sub">
-        Tiers buy latency and headroom — never features. The row ceiling, the
-        durability guarantees and the change log are identical on all three, because
-        they are properties of the engine, not of a price list. Prices are USD per
-        month; the cost basis is <a href="https://github.com/fredgis/asmDB/blob/main/docs/COST.md">published in the repository</a>.
+        Tiers buy latency and headroom — never features. Durability guarantees and
+        the change log are identical on every tier, because they are properties of
+        the engine, not of a price list; the row ceiling follows the memory each
+        tier is given. The last two are on the roadmap and cannot be bought yet.
+        Prices are USD per month; the cost basis is <a href="https://github.com/fredgis/asmDB/blob/main/docs/COST.md">published in the repository</a>.
       </p>
     </div>
 
@@ -421,7 +422,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
           <li>0.25 vCPU / 0.5 GiB</li>
           <li>Sleeps when idle</li>
           <li>Max 3 databases per account</li>
-          <li>Same 4,194,304-row ceiling</li>
+          <li>Up to 393,216 rows</li>
           <li>Identical CLI, REST and MCP</li>
         </ul>
         <div class="tier__cta"><button class="btn btn--ghost" data-tier="free" type="button">Create free database</button></div>
@@ -434,7 +435,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
           <li>0.5 vCPU / 1 GiB</li>
           <li>Sleeps when idle</li>
           <li>Max 20 databases per account</li>
-          <li>Same 4,194,304-row ceiling</li>
+          <li>Up to 1,572,864 rows</li>
           <li>Identical CLI, REST and MCP</li>
         </ul>
         <div class="tier__cta"><button class="btn btn--primary" data-tier="standard" type="button">Create standard database</button></div>
@@ -446,17 +447,55 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
         <ul class="tier__list">
           <li>1 vCPU / 2 GiB</li>
           <li>Always warm, no cold start</li>
-          <li>Max 100 databases per account</li>
-          <li>Same 4,194,304-row ceiling</li>
+          <li>Max 10 databases per account</li>
+          <li>Up to 3,145,728 rows</li>
           <li>Identical CLI, REST and MCP</li>
         </ul>
         <div class="tier__cta"><button class="btn btn--ghost" data-tier="premium" type="button">Create premium database</button></div>
       </div>
+
+      <div class="tier tier--soon">
+        <p class="tier__n">Premium+ <span class="tier__soon">not yet built</span></p>
+        <p class="tier__p">$89<small>USD / month</small></p>
+        <ul class="tier__list tier__list--soon">
+          <li>2 vCPU / 4 GiB</li>
+          <li>Up to 6,291,456 rows</li>
+          <li>Container isolation, read replica</li>
+          <li>Recovery point objective ≤ 5 s</li>
+          <li>Usage plus reserved capacity</li>
+        </ul>
+        <div class="tier__cta"><button class="btn btn--ghost" type="button" disabled>Not available yet</button></div>
+      </div>
+
+      <div class="tier tier--soon">
+        <p class="tier__n">Enterprise <span class="tier__soon">not yet built</span></p>
+        <p class="tier__p">Contact us<small>annual contract + usage</small></p>
+        <ul class="tier__list tier__list--soon">
+          <li>Firecracker micro-VM, dedicated nodes</li>
+          <li>Warm standby</li>
+          <li>Data residency</li>
+          <li>Single sign-on</li>
+          <li>Audit export</li>
+        </ul>
+        <div class="tier__cta"><button class="btn btn--ghost" type="button" disabled>Not available yet</button></div>
+      </div>
     </div>
     <p class="tier-note">
       Free uses 0.25 vCPU / 0.5 GiB because Container Apps Consumption has no
-      smaller 1:2 CPU-to-memory pair. Premium keeps a replica resident; the price
-      buys no cold start, not a different engine.
+      smaller 1:2 CPU-to-memory pair. The row ceiling follows the memory: the
+      engine's slot table is resident memory, not a file mapping, so each tier
+      gets the largest table its memory can hold. Premium keeps a replica
+      resident; the price buys no cold start, not a different engine.
+    </p>
+    <p class="tier-note">
+      What the throughput figure above is not: it is one workstation core with
+      the data in RAM. A hosted tier gives you a fraction of a core — a quarter
+      on free, a half on standard, one on premium — so expect throughput in that
+      proportion, less the REST and gateway hops. The engine is identical; the
+      machine is not. Tiers that sleep also pay a cold start on the first request
+      after idling. Every number on this page is measured, and the one that
+      matters for your workload is the one you measure yourself: the CLI ships a
+      <code>BENCH</code> command that writes real rows into your own database.
     </p>
     <div class="tier-capabilities" aria-labelledby="tier-capabilities-title">
       <div class="tier-capabilities__head">
@@ -675,7 +714,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
               </div>
               <span class="badge" id="preview-status">bounded</span>
             </div>
-            <p class="console-card__note">Reads <code>/v1/rows?limit=20&amp;offset=0</code>. The table scrolls inside this frame on narrow screens.</p>
+            <p class="console-card__note">Reads <code>/v1/rows?limit=5&amp;offset=0</code>. The table scrolls inside this frame on narrow screens.</p>
             <div class="table-wrap" id="preview-wrap" tabindex="0" aria-label="table preview, scroll horizontally if needed">
               <table class="preview-table">
                 <thead>
@@ -701,7 +740,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
                 <p class="metric__k">rows</p>
                 <p class="metric__v" id="metric-rows">No sample yet</p>
                 <p class="metric__hint" id="metric-rows-hint">Rows are shown against capacity when the instance is running.</p>
-                <div class="meter" id="rows-meter-wrap" aria-hidden="true" data-empty="true"><span id="rows-meter"></span></div>
+                <div class="meter metric-bar" id="rows-meter-wrap" role="progressbar" aria-label="row usage" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" data-empty="true"><span id="rows-meter"></span></div>
               </div>
               <div class="metric">
                 <p class="metric__k">cpu</p>
@@ -712,7 +751,11 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
                 <p class="metric__k">memory</p>
                 <p class="metric__v" id="metric-memory">No sample yet</p>
                 <p class="metric__hint" id="metric-memory-detail">working set, not reclaimable page cache</p>
+                <div class="meter metric-bar" id="memory-meter-wrap" role="progressbar" aria-label="memory actual use against reservation" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" data-empty="true"><span id="memory-meter"></span></div>
+                <p class="metric__hint metric__bar-note" id="memory-meter-note"></p>
                 <p class="metric__hint" id="metric-storage">allocated storage —</p>
+                <div class="meter metric-bar" id="storage-meter-wrap" role="progressbar" aria-label="storage actual use against reservation" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" data-empty="true"><span id="storage-meter"></span></div>
+                <p class="metric__hint metric__bar-note" id="storage-meter-note"></p>
               </div>
             </div>
           </section>

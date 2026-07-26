@@ -744,5 +744,21 @@ else
     echo "  [FAIL] reader never creates a database"; fail=$((fail+1))
 fi
 
+cap_small="$(printf '%s\n' 'VERSION' 'EXIT' | ASMDB_CAPACITY=small ./asmdb cap_small)"
+check 'capacity env small selected' 'capacity[[:space:]]+:[[:space:]]+524288 slots' "$cap_small"
+
+cap_medium="$(printf '%s\n' 'VERSION' 'EXIT' | ASMDB_CAPACITY=medium ./asmdb cap_medium)"
+check 'capacity env medium selected' 'capacity[[:space:]]+:[[:space:]]+2097152 slots' "$cap_medium"
+
+cap_header_wins="$(printf '%s\n' 'VERSION' 'EXIT' | ASMDB_CAPACITY=medium ./asmdb cap_small)"
+check 'capacity header wins over env on open' 'capacity[[:space:]]+:[[:space:]]+524288 slots' "$cap_header_wins"
+
+cap_fallback="$(printf '%s\n' 'VERSION' 'EXIT' | ASMDB_CAPACITY=nonsense ./asmdb cap_bad)"
+check 'capacity unknown falls back to large' 'capacity[[:space:]]+:[[:space:]]+4194304 slots' "$cap_fallback"
+
+cap_bench="$(printf '%s\n' 'BENCH 999999999' 'COUNT' 'EXIT' | ASMDB_CAPACITY=small ./asmdb cap_bench)"
+check 'runtime load-factor cap for small' 'BENCH inserted 393216 rows' "$cap_bench"
+check 'runtime load-factor count for small' '\[ OK \] 393216 row\(s\)' "$cap_bench"
+
 if [[ $fail -gt 0 ]]; then echo; echo "$fail check(s) failed."; exit 1; fi
 echo; echo "All checks passed."

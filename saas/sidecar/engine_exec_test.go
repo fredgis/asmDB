@@ -139,14 +139,151 @@ func TestMissingTerminatorIsLogged(t *testing.T) {
 	}
 }
 
+func TestMultipleOutputBlocksAreDrainedBeforeNextCommand(t *testing.T) {
+	withShortTestTimeouts(t)
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	lines, err := e.Command(context.Background(), "MULTI_BLOCK", waitStatus)
+	if err != nil {
+		t.Fatalf("MULTI_BLOCK error = %v, lines = %#v", err, lines)
+	}
+	if strings.Join(lines, "\n") != "first block\n[ OK ] first block" {
+		t.Fatalf("MULTI_BLOCK lines = %#v", lines)
+	}
+
+	lines, err = e.Command(context.Background(), "SECOND", waitStatus)
+	if err != nil {
+		t.Fatalf("SECOND error = %v, lines = %#v", err, lines)
+	}
+	if len(lines) != 1 || lines[0] != "[ OK ] second response" {
+		t.Fatalf("SECOND lines = %#v, want only the second command response", lines)
+	}
+}
+
+func TestBenchReturnsOwnInsertedRowCountAndDrainsTrailingDetails(t *testing.T) {
+	withShortTestTimeouts(t)
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	lines, ok, err := e.Exec(context.Background(), "BENCH 100000")
+	if err != nil || !ok {
+		t.Fatalf("BENCH err = %v ok = %v lines = %#v", err, ok, lines)
+	}
+	if len(lines) != 1 || lines[0] != "[ OK ] BENCH inserted 100000 rows" {
+		t.Fatalf("BENCH lines = %#v, want own inserted-row status only", lines)
+	}
+
+	lines, err = e.Command(context.Background(), "SECOND", waitStatus)
+	if err != nil {
+		t.Fatalf("SECOND error = %v, lines = %#v", err, lines)
+	}
+	if len(lines) != 1 || lines[0] != "[ OK ] second response" {
+		t.Fatalf("SECOND lines = %#v, want only the second command response", lines)
+	}
+}
+
+func TestReportedExecSequenceDoesNotDriftAfterMalformedSelect(t *testing.T) {
+	withShortTestTimeouts(t)
+	t.Setenv("ASMDB_FAKE_SELECT_EXTRA_FRAME", "1")
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	lines, ok, err := e.Exec(context.Background(), "SELECT *")
+	if err != nil || !ok {
+		t.Fatalf("SELECT * err = %v ok = %v lines = %#v", err, ok, lines)
+	}
+	if !containsLine(lines, "[ OK ] 1 row(s)") {
+		t.Fatalf("SELECT * lines = %#v, want SELECT output", lines)
+	}
+
+	lines, ok, err = e.Exec(context.Background(), "SCHEMA")
+	if err != nil || !ok {
+		t.Fatalf("SCHEMA err = %v ok = %v lines = %#v", err, ok, lines)
+	}
+	if !containsLine(lines, "[ OK ] schema shown") || containsLine(lines, "[ OK ] 1 row(s)") {
+		t.Fatalf("SCHEMA lines = %#v, want schema output only", lines)
+	}
+
+	for i := 0; i < 2; i++ {
+		lines, ok, err = e.Exec(context.Background(), "FIND CDC")
+		if err != nil || !ok {
+			t.Fatalf("FIND CDC #%d err = %v ok = %v lines = %#v", i+1, err, ok, lines)
+		}
+		if !containsLine(lines, "[ OK ] 1 row(s)") || containsLine(lines, "[ OK ] schema shown") {
+			t.Fatalf("FIND CDC #%d lines = %#v, want FIND output only", i+1, lines)
+		}
+	}
+}
+
+func TestMalformedResponseResynchronizesInsteadOfDriftingForever(t *testing.T) {
+	withShortTestTimeouts(t)
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	if _, err := e.Command(context.Background(), "MULTI_BLOCK", waitStatus); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		lines, err := e.Command(context.Background(), "SECOND", waitStatus)
+		if err != nil {
+			t.Fatalf("SECOND #%d error = %v, lines = %#v", i+1, err, lines)
+		}
+		if len(lines) != 1 || lines[0] != "[ OK ] second response" {
+			t.Fatalf("SECOND #%d lines = %#v, want only the second command response", i+1, lines)
+		}
+	}
+}
+
+func TestCountDoesNotConsumeStaleSelectPage(t *testing.T) {
+	withShortTestTimeouts(t)
+	t.Setenv("ASMDB_FAKE_COUNT", "100000")
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	e.stateMu.Lock()
+	lines := e.lines
+	e.stateMu.Unlock()
+	for i := 0; i < 20; i++ {
+		lines <- fmt.Sprintf("R\t%d\t%d\t1785079967928\t1785079967928\tbench\tsynthetic benchmark record for throughput measurement\n", i+1, i+1)
+	}
+	lines <- "[ OK ] 20 row(s)\n"
+	lines <- "asmdb> "
+
+	got, err := e.Command(context.Background(), "COUNT", waitStatus)
+	if err != nil {
+		t.Fatalf("COUNT error = %v, lines = %#v", err, got)
+	}
+	if len(got) != 1 || got[0] != "[ OK ] 100000" {
+		t.Fatalf("COUNT lines = %#v, want only COUNT output", got)
+	}
+	for _, line := range got {
+		if strings.HasPrefix(line, "R\t") || strings.Contains(line, "20 row(s)") {
+			t.Fatalf("COUNT consumed stale SELECT output: %#v", got)
+		}
+	}
+}
+
+func containsLine(lines []string, want string) bool {
+	for _, line := range lines {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
 func withShortTestTimeouts(t *testing.T) {
 	t.Helper()
 	oldShort, oldGrace := shortCommandTimeout, engineUnresponsiveGrace
+	oldPostFrameDrain := postFrameDrainTimeout
 	shortCommandTimeout = 20 * time.Millisecond
 	engineUnresponsiveGrace = 20 * time.Millisecond
+	postFrameDrainTimeout = time.Millisecond
 	t.Cleanup(func() {
 		shortCommandTimeout = oldShort
 		engineUnresponsiveGrace = oldGrace
+		postFrameDrainTimeout = oldPostFrameDrain
 	})
 }
 
@@ -264,6 +401,13 @@ func TestFakeEngineHelper(t *testing.T) {
 				}
 				fmt.Println("  asmdb " + v + "   (fake)")
 				fmt.Println("  storage format : " + sf)
+				if os.Getenv("ASMDB_FAKE_CAPACITY_MODE") != "missing" {
+					capacity := os.Getenv("ASMDB_FAKE_RAW_CAPACITY")
+					if capacity == "" {
+						capacity = "4194304"
+					}
+					fmt.Println("  capacity       : " + capacity + " slots")
+				}
 			}
 			fmt.Println("[ OK ] version")
 			printPrompt()
@@ -277,8 +421,42 @@ func TestFakeEngineHelper(t *testing.T) {
 			}
 			fmt.Println("[ OK ] 1 row(s)")
 			printPrompt()
+			if os.Getenv("ASMDB_FAKE_SELECT_EXTRA_FRAME") == "1" && format == "TABLE" {
+				fmt.Println("+----+-------+")
+				fmt.Println("| id | value |")
+				fmt.Println("+----+-------+")
+				fmt.Println("[ OK ] 1 row(s)")
+				printPrompt()
+			}
+		case upper == "SCHEMA":
+			fmt.Println("record layout: id value tag content")
+			fmt.Println("[ OK ] schema shown")
+			printPrompt()
+		case upper == "FIND CDC":
+			if format == "TSV" {
+				fmt.Println("R\t2\t7\t10\t10\tcdc\tchange-data-capture")
+			} else {
+				fmt.Println("+----+-------+")
+				fmt.Println("| 2  | cdc   |")
+				fmt.Println("+----+-------+")
+			}
+			fmt.Println("[ OK ] 1 row(s)")
+			printPrompt()
+		case strings.HasPrefix(upper, "BENCH "):
+			n := strings.TrimSpace(line[len("BENCH "):])
+			if n == "" {
+				n = "100000"
+			}
+			fmt.Println("[ OK ] BENCH inserted " + n + " rows")
+			fmt.Println("  in-RAM insert            : 123456 rows/sec  (engine only, no I/O)")
+			fmt.Println("  checkpoint + fsync total : 42 ms  (full-table durable write)")
+			printPrompt()
 		case upper == "COUNT":
-			fmt.Println("[ OK ] 1")
+			count := os.Getenv("ASMDB_FAKE_COUNT")
+			if count == "" {
+				count = "1"
+			}
+			fmt.Println("[ OK ] " + count)
 			printPrompt()
 		case strings.HasPrefix(upper, "BACKUP "):
 			d, _ := time.ParseDuration(os.Getenv("ASMDB_FAKE_BACKUP_SLEEP"))
@@ -300,6 +478,13 @@ func TestFakeEngineHelper(t *testing.T) {
 			printPrompt()
 		case upper == "NO_STATUS":
 			fmt.Println("first response without status")
+			printPrompt()
+		case upper == "MULTI_BLOCK":
+			fmt.Println("first block")
+			fmt.Println("[ OK ] first block")
+			printPrompt()
+			fmt.Println("stale block")
+			fmt.Println("[ OK ] stale block")
 			printPrompt()
 		case upper == "PROMPT_SAME_LINE":
 			fmt.Print("same-line outputasmdb> ")

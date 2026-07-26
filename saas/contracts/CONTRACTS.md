@@ -43,6 +43,7 @@ Base: `https://www.asmdb.cloud/api/v1`. All JSON. All errors use §5.
   "endpoint": "https://www.asmdb.cloud/db/7k2m9x4qp1va8ne03wjr5tzy",
   "token": "<shown once, never again>",
   "created_at": "2026-07-25T19:40:00Z",
+  "engineSource": "image",
   "upgradeAvailable": false,
   "availableEngine": "1.5.3",
   "availableImage": "<registry>.azurecr.io/asmdb-instance:1.5.3"
@@ -95,6 +96,9 @@ Database objects include:
 |---|---|
 | `image` | image reference recorded at provisioning, including the version tag when known |
 | `engine` | engine version actually reported by `/health` if known; otherwise the provisioned image tag, or `"unknown"` |
+| `engineSource` | `"instance"` when the value came from sidecar `/health` or `/v1/stats`; `"image"` when it came from the recorded image tag |
+| `storageFormat` | storage format reported by the running engine when known |
+| `operation` | current or last management operation; see upgrade states below |
 | `upgradeAvailable` | true only when both recorded and current images have parseable version tags and the full image references differ |
 | `availableEngine` | tag on current `ASMDB_IMAGE`, or `"unknown"` |
 | `availableImage` | current instance image when it has a parseable version tag |
@@ -177,9 +181,30 @@ metadata are restored and the **old token remains the working token**.
 ### `POST /databases/{id}/upgrade`
 
 Entra-authenticated. Refused with `409 no_upgrade` when the instance already
-uses the current tagged image. The long-running upgrade API is moving to an
-asynchronous shape so the console can poll state; that final response shape is
-not settled yet and clients must not depend on the current synchronous response.
+uses the current engine. If the instance has reported its actual engine version,
+that value wins over the recorded image tag for upgrade decisions.
+
+**202**
+
+```json
+{
+  "database": { "...": "...", "operation": {
+    "type": "upgrade",
+    "state": "preparing_backup",
+    "started_at": "2026-07-26T13:40:00Z",
+    "updated_at": "2026-07-26T13:40:00Z"
+  }},
+  "operation": {
+    "type": "upgrade",
+    "state": "preparing_backup",
+    "started_at": "2026-07-26T13:40:00Z",
+    "updated_at": "2026-07-26T13:40:00Z"
+  },
+  "warning": "Upgrade runs asynchronously, restarts the instance, and briefly interrupts active connections."
+}
+```
+
+The console polls `GET /databases/{id}` and reads `database.operation`.
 
 The required operation is:
 
@@ -195,6 +220,23 @@ The required operation is:
 
 A stopped instance is deliberately started to prepare the upgrade rather than
 silently skipping the pre-upgrade snapshot.
+
+Upgrade operation states:
+
+| state | meaning |
+|---|---|
+| `preparing_backup` | sidecar `/v1/prepare-upgrade` is running; failure aborts before any app/image change |
+| `stopping` | outgoing revision is being stopped so it releases the database file lock |
+| `starting` | replacement revision has been applied and is being started |
+| `verifying_health` | waiting for the replacement revision to become healthy |
+| `done` | replacement is healthy and metadata has been reconciled |
+| `failed` | operation stopped; `error` explains whether backup failed before changes or start failed and rollback was attempted |
+
+Only one active operation may run for an instance. A second upgrade, or an
+upgrade while token rotation is in progress, returns `409 operation_in_progress`.
+Active operations expire after 30 minutes. Expiry is deliberate: after a control
+plane restart the in-process worker is gone, so the next read marks stale state
+`failed` instead of stranding the console forever.
 
 ### Instance states
 
@@ -296,14 +338,14 @@ an engine-level backup refusal from transport/auth failure:
 The control plane aborts upgrade on any non-2xx response, malformed response,
 or `{"ok":false}`.
 
-Stats shape:
+Stats shape (premium/large example):
 
 ```json
 {
   "rows": "1",
   "capacity": "4194304",
   "engine": "1.5.3",
-  "storageFormat": "1",
+  "storageFormat": "2",
   "uptimeSeconds": 123,
   "storage": {
     "dataBytes": "1073741824",
@@ -329,6 +371,12 @@ Stats shape:
   "cpu": { "usageUsec": "1234", "limitCores": 0.5 }
 }
 ```
+
+`workingSetBytes` is the container cgroup view and includes file-backed page
+cache from the engine's copy-on-write `.dat` mapping. Treat it as reserved /
+reclaimable cache, not private engine consumption; `fileBytes`,
+`inactiveFileBytes` and `reclaimableBytes` are present so the console can show
+reserved versus actually used.
 
 ### `/v1/exec` — the terminal's route
 
@@ -392,7 +440,8 @@ Engine facts the sidecar must not fight:
 
 - **One writer.** Reads may use `asmdb <db> --reader` (any number, no lock).
 - A transaction touches at most **4096 distinct rows**.
-- `FIND` and `RANGE` are **full scans** (~900 ms) — always bound them.
+- `FIND` and `RANGE` are **full scans** — always bound them. The ~900 ms figure
+  quoted elsewhere is a local workstation measurement, not a hosted-tier SLA.
 
 ---
 
@@ -416,6 +465,7 @@ Every non-2xx from either plane:
 | `internal` | 500 |
 | `instance_starting` | 504 |
 | `no_upgrade` | 409 |
+| `operation_in_progress` | 409 |
 | `gateway_timeout` | 504 |
 
 ---
@@ -425,24 +475,59 @@ Every non-2xx from either plane:
 Capabilities are real. Prices are derived in [`docs/COST.md`](../../docs/COST.md)
 from Azure list rates, at **15 % margin on run**.
 
-| tier/capability | price | CPU | memory | scale-to-zero | max instances / account |
-|---|---|---|---|---|---|
-| `free` | $0 | 0.25 | 0.5Gi | yes (idle 5 min) | 3 |
-| `standard` | $15/mo | 0.5 | 1Gi | yes (idle 30 min) | 20 |
-| `premium` | $49/mo | 1.0 | 2Gi | no (always warm) | 100 |
-| Microsoft Fabric Workload | planned for GA, premium capability | — | — | — | — |
-| automated backups | planned for GA, standard and premium capability | — | — | — | — |
+| tier/capability | price | CPU | memory | scale-to-zero | max instances / account | max rows |
+|---|---|---|---|---|---|---:|
+| `free` | $0 | 0.25 | 0.5Gi | yes (idle 5 min) | 3 | 393 216 |
+| `standard` | $15/mo | 0.5 | 1Gi | yes (idle 30 min) | 20 | 1 572 864 |
+| `premium` | $49/mo | 1.0 | 2Gi | no (always warm) | 10 | 3 145 728 |
+| Microsoft Fabric Workload | planned for GA, premium capability | — | — | — | — | — |
+| automated backups | planned for GA, standard and premium capability | — | — | — | — | — |
 
 The sizes are not free choices: Container Apps Consumption accepts only fixed
 vCPU/memory pairs at a 1:2 ratio, and **0.25 / 0.5Gi is the floor** — there is
-nothing smaller to sell.
+nothing smaller to sell. Verified against the API, which refuses anything else:
+`0.1 / 0.2Gi` and `0.25 / 0.25Gi` are both rejected with
+`ContainerAppInvalidResourceTotal`. The portal's resource fields advertise a
+minimum of 0.1, but that is the input control's bound, not the platform's — such
+a value passes field validation and then fails on save.
+
+**Max rows is set by memory, not by licensing.** The engine's slot table is
+mapped copy-on-write, so local sparse filesystems only materialise touched
+pages, but the table still has a real tier size: 2^22 slots is exactly 1 GiB.
+In the hosted service, cgroup working set includes reclaimable file-backed cache
+from that mapping. Each tier gets the largest power-of-two table its memory can
+carry, and the published maximum is the row count the engine actually refuses
+to exceed — there is no advertised ceiling that inserts fail before reaching. The tier
+picks the table at creation via `ASMDB_CAPACITY`; the size is then recorded in
+the database header, which wins on every later open, so the variable can never
+reshape an existing database. Raising a tier's ceiling would mean buying more
+memory, and since memory only sells paired with CPU, that doubles the bill —
+which is why the ceiling moves with the tier rather than with the price list.
 
 The three-instance cap on `free` is a **pricing control**, not a technical
-limit: a free database still costs about $1.08/month to run and is funded by the
+limit: a free database still costs about $1.03/month to run and is funded by the
 paying tiers.
 
-Every tier gets the same engine, the same 4 194 304-row ceiling, the same
-durability. Tiers buy **latency and headroom**, not features.
+The `standard` and `premium` caps are the opposite — they are **capacity
+controls**, and they are measured, not chosen for effect. Every instance keeps
+its own file on the shared Premium Files NFS volume, and Azure Files NFS does
+not honour sparseness, so a database occupies its whole table size on disk from
+the day it is created. The provisioned share is **100 GiB**, which is roughly
+800 `free`, 200 `standard` or 100 `premium` databases **in total, across every
+account**. A per-account `premium` cap of 100 would let one customer consume the
+entire platform, so it is 10. Raising any of these caps means growing the share
+first; the cap is a consequence of provisioning, not an independent dial.
+
+Every tier gets the same engine and the same durability. Tiers buy **latency,
+headroom and capacity**, not features; the row ceiling follows the memory that
+the tier can give to the resident slot table.
+
+No per-tier throughput number is part of this contract. Repository benchmark
+figures are measured on one workstation core, not through the hosted REST/MCP
+path. Hosted throughput depends on the tier's vCPU allocation (0.25 / 0.5 /
+1.0), gateway overhead, request shape and whether the app is cold. `free` and
+`standard` scale to zero and the first request after idling waits for a
+container start; `premium` stays warm.
 
 `maxReplicas` is **1 on every tier and is not negotiable**. The engine is a
 single-writer process that takes an exclusive lock on its files; a second
@@ -463,7 +548,7 @@ the volume is not configured.
 | Isolation | volume mount `subPath` = the instance id, so each database owns a directory |
 | Auth | none to carry: NFS is reachable only from the private VNet, so no account key exists to leak |
 | Mount path | `/data` — must equal `ASMDB_DATA`, asserted in `provisioner_test.go` |
-| Sparse files | not honoured on the live share; each database occupies about 1 GiB |
+| Sparse files | not honoured on the live share; each database occupies its full tier table: about 128 MiB (`free`), 512 MiB (`standard`) or 1 GiB (`premium`) |
 
 SMB was rejected: Container Apps' SMB mount needs a storage account key, and
 the accounts here run with `allowSharedKeyAccess: false`.

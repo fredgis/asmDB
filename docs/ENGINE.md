@@ -97,9 +97,9 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **42,997-byte PE64** at 1.5.3 whose only
-  dependency is `kernel32.dll`. The 1 GiB record region (sparse on disk) is **not** in the exe —
-  it is obtained from `VirtualAlloc` at startup.
+- The result is a single self-contained **43,749-byte PE64** at 1.6.0 whose only
+  dependency is `kernel32.dll`. The configured record region (sparse on disk) is
+  **not** in the exe — it is obtained from `VirtualAlloc` at startup.
 
 #### kernel32 imports
 
@@ -152,7 +152,7 @@ phdr:
 
 Because `p_filesz == p_memsz`, every buffer is **file-initialised** (there is no
 separate `.bss`), which keeps the loader trivial and the ELF fully static. The
-1 GiB record region comes from an `mmap` syscall at startup.
+configured record region comes from an `mmap` syscall at startup.
 `tests/validate_elf.py` asserts these invariants, and `tests/smoke.sh` runs the
 ELF **natively on Linux**.
 
@@ -273,10 +273,13 @@ The `SCHEMA` command prints this exact table at runtime.
 
 ## 5. Hash table — the store *is* the index
 
-- The store is a single array of **`CAPACITY = 4194304`** slots (`2^22`),
-  `256 B` each → a **1 GiB** contiguous region, **mapped copy-on-write from the
-  `.dat`** rather than allocated and read (§6.1). The backing file is created
-  **sparse**, so unused slots cost neither disk nor RAM.
+- The store is a single array of fixed-size slots chosen when the database is
+  created and then persisted in the header: `small` = 524,288 slots (`2^19`),
+  `medium` = 2,097,152 slots (`2^21`), `large` = 4,194,304 slots (`2^22`,
+  the local default). Each slot is `256 B`; the large table is a **1 GiB**
+  contiguous region, **mapped copy-on-write from the `.dat`** rather than
+  allocated and read (§6.1). The backing file is created **sparse** on local
+  filesystems, so unwritten slots cost no disk there.
 
 - **Hash function — Fibonacci (multiplicative) hashing.** Multiply the key by the
   64-bit golden-ratio constant `⌊2^64 / φ⌋` and keep the **top** `log2(CAPACITY)`
@@ -323,8 +326,9 @@ The `SCHEMA` command prints this exact table at runtime.
 
 - **Deletion:** tombstone (`status = 2`) so probe chains stay intact; a later
   INSERT may reuse a tombstoned slot (the `.deleted` branch above).
-- **Load factor** is intended to stay `< 0.75`; INSERT into a full table returns
-  an explicit error (resizing is [future work](#12-roadmap)).
+- **Load factor** is capped at `0.75`; INSERT that would exceed
+  `(capacity * 3) / 4` returns an explicit `table full` error before every slot
+  is occupied (resizing is [future work](#12-roadmap)).
 - `SELECT <id>`, `UPDATE`, `DELETE` are all O(1) average (hash + short probe).
   `SELECT *`, `FIND` and `COUNT` are O(capacity) linear scans over the region.
 
@@ -381,12 +385,18 @@ MAP_PRIVATE)` on Linux — and `g_table = mapped_base + HDR_SIZE`.
 
 Three properties follow, and the third is the reason this is safe:
 
-- **Open is O(1).** Nothing is read or committed up front. Opening a database
-  measured ~600 ms *regardless of its contents* before this change (0 rows,
-  1 000 rows and 1 000 000 rows were indistinguishable); it is now ~80 ms, and
-  that remainder is process start, not the store.
+- **Open is O(1).** Nothing is read or committed up front. On the local
+  benchmark workstation, opening a database measured ~600 ms *regardless of its
+  contents* before this change (0 rows, 1 000 rows and 1 000 000 rows were
+  indistinguishable); it is now ~80 ms, and that remainder is process start, not
+  the store.
 - **Residency follows the data.** Pages materialise only when touched, so a
   million-row database peaks at **~5 MB** of working set instead of ~1 029 MB.
+  That is a local-filesystem measurement. In asmdb Cloud, Azure Files NFS does
+  not honour sparseness on disk, and the container's cgroup working-set counter
+  includes file-backed page cache from the copy-on-write mapping. That hosted
+  number is therefore a reservation/reclaimable-cache view, not contradictory
+  evidence that the engine eagerly consumes a gigabyte of private RAM.
 - **Durability is untouched.** A *private* mapping means writes to `g_table`
   never reach the file. The `.dat` still changes only through the explicit
   `write_at` / `fsync` paths of §7, so the WAL protocol, the undo log and the
@@ -832,9 +842,9 @@ flowchart LR
     class ENGINE engine
 ```
 
-- The server keeps **one long-lived `asmdb.exe` process**, so the 1 GiB region
-  is read once at startup and every tool call is an in-memory hash lookup plus a
-  durable write. On client disconnect it shuts the engine down cleanly (no
+- The server keeps **one long-lived `asmdb.exe` process**, so the configured
+  slot region stays mapped and every tool call is an in-memory hash lookup plus
+  a durable write. On client disconnect it shuts the engine down cleanly (no
   orphaned process).
 - A row is addressed by a numeric **`id`** (used as-is) or a string **`key`**
   that the server hashes to asmdb's `u64` `id` with **64-bit FNV-1a**. The
@@ -911,8 +921,8 @@ The theme is "never lie about durability, never corrupt on crash."
 | Item | What it adds | CRUD path helped |
 |------|--------------|------------------|
 | ~~**CRC32 on WAL frames**~~ | ✅ **done** — table-driven CRC-32 written and flushed with the commit marker; a damaged committed frame is refused instead of replayed (§6.2, §7.3) | durable C/U/D |
-| ~~**Lazy (copy-on-write) `.dat` mapping**~~ | ✅ **done** — the store is mapped `FILE_MAP_COPY` / `MAP_PRIVATE` instead of committed and read. Open went from ~600 ms *regardless of size* to ~80 ms, and peak working set on a 1 M-row database from ~1 029 MB to ~5 MB. Durability is unchanged: a private mapping keeps writes out of the file (§6.1) | every command, and per-instance density |
-| **Persisted dense status directory** ⚠️ | **Prototyped and rejected on measurement.** One status byte per slot, held contiguously so a scan reads 4 MiB instead of striding 1 GiB. It does exactly that — and then turns the record accesses that follow into *random* reads, where the old code swept the region sequentially and let readahead work. Measured: 100 rows 529 ms → 108 ms, but 100 000 rows 897 ms → 6 000 ms. A density switch narrows the loss but the win only survives below roughly a thousand rows, which does not justify a storage-format change. The real answer to slow `FIND`/`RANGE` is a **secondary index**, not a status mirror | full scans on sparse tables |
+| ~~**Lazy (copy-on-write) `.dat` mapping**~~ | ✅ **done** — local workstation measurement: the store is mapped `FILE_MAP_COPY` / `MAP_PRIVATE` instead of committed and read. Open went from ~600 ms *regardless of size* to ~80 ms, and peak working set on a 1 M-row database from ~1 029 MB to ~5 MB. Durability is unchanged: a private mapping keeps writes out of the file (§6.1) | every command, and per-instance density |
+| **Persisted dense status directory** ⚠️ | **Prototyped and rejected on local measurement.** One status byte per slot, held contiguously so a scan reads 4 MiB instead of striding 1 GiB. It does exactly that — and then turns the record accesses that follow into *random* reads, where the old code swept the region sequentially and let readahead work. Measured on the benchmark workstation: 100 rows 529 ms → 108 ms, but 100 000 rows 897 ms → 6 000 ms. A density switch narrows the loss but the win only survives below roughly a thousand rows, which does not justify a storage-format change. The real answer to slow `FIND`/`RANGE` is a **secondary index**, not a status mirror | full scans on sparse tables |
 | **Finer checkpoint granularity** | the whole-table paths (`BACKUP`, `RESTORE`, `BENCH`) now skip chunks that hold no rows, but a chunk containing a single changed row still writes 1 MiB. A dirty-slot bitmap would take that down to the touched records | durable bulk write |
 | **Group commit** | coalesce concurrent `COMMIT`s into one `fsync` | high-rate durable writes |
 | **Dynamic resize / rehash** | grow the table past load factor 0.75 instead of erroring; power-of-two doubling + incremental re-probe | all CRUD at scale |
@@ -1023,6 +1033,6 @@ src/
   data.inc      ; strings, globals, buffers, kernel32 import table (Windows)
 ```
 
-The store itself is **not** in the exe — it is the 1 GiB region **mapped
-copy-on-write** from `<db>.dat`, so only the pages actually touched ever become
-resident.
+The store itself is **not** in the exe — it is the configured slot region
+(`large` is 1 GiB) **mapped copy-on-write** from `<db>.dat`, so only the pages
+actually touched ever become resident.

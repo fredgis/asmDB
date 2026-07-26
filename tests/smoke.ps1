@@ -747,6 +747,34 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
     Check 'reader never creates a database' (-not (Test-Path (Join-Path $work 'ghost.dat')))
     $rg = (@('COUNT', 'EXIT') -join "`n") | .\asmdb.exe ghost --reader 2>&1
     Check 'reader refuses a missing database' (($rg -join "`n") -match 'a reader never creates one')
+
+    # Runtime capacity selection: ASMDB_CAPACITY applies only to new files;
+    # existing headers win, and invalid values fall back to large.
+    $oldCapEnv = $env:ASMDB_CAPACITY
+    try {
+        $env:ASMDB_CAPACITY = 'small'
+        $capSmall = ((@('VERSION', 'EXIT') -join "`n") | .\asmdb.exe cap_small) -join "`n"
+        Check 'capacity env small selected' ($capSmall -match 'capacity\s+:\s+524288 slots')
+
+        $env:ASMDB_CAPACITY = 'medium'
+        $capMedium = ((@('VERSION', 'EXIT') -join "`n") | .\asmdb.exe cap_medium) -join "`n"
+        Check 'capacity env medium selected' ($capMedium -match 'capacity\s+:\s+2097152 slots')
+
+        $capHeaderWins = ((@('VERSION', 'EXIT') -join "`n") | .\asmdb.exe cap_small) -join "`n"
+        Check 'capacity header wins over env on open' ($capHeaderWins -match 'capacity\s+:\s+524288 slots')
+
+        $env:ASMDB_CAPACITY = 'nonsense'
+        $capFallback = ((@('VERSION', 'EXIT') -join "`n") | .\asmdb.exe cap_bad) -join "`n"
+        Check 'capacity unknown falls back to large' ($capFallback -match 'capacity\s+:\s+4194304 slots')
+
+        $env:ASMDB_CAPACITY = 'small'
+        $capBench = ((@('BENCH 999999999', 'COUNT', 'EXIT') -join "`n") | .\asmdb.exe cap_bench) -join "`n"
+        Check 'runtime load-factor cap for small' ($capBench -match 'BENCH inserted 393216 rows' -and $capBench -match '\[ OK \] 393216 row\(s\)')
+    }
+    finally {
+        if ($null -eq $oldCapEnv) { Remove-Item Env:\ASMDB_CAPACITY -ErrorAction SilentlyContinue }
+        else { $env:ASMDB_CAPACITY = $oldCapEnv }
+    }
 }
 finally {
     Pop-Location

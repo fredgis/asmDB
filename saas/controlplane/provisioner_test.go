@@ -54,14 +54,54 @@ func TestDerivePlatformToken(t *testing.T) {
 
 func TestTierSpecs(t *testing.T) {
 	tests := map[string]tierSpec{
-		"free":     {CPU: 0.25, Memory: "0.5Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 3},
-		"standard": {CPU: 0.5, Memory: "1Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 20},
-		"premium":  {CPU: 1.0, Memory: "2Gi", MinReplicas: 1, MaxReplicas: 1, Quota: 100},
+		"free":     {CPU: 0.25, Memory: "0.5Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 3, Capacity: "small", MaxRows: 393216},
+		"standard": {CPU: 0.5, Memory: "1Gi", MinReplicas: 0, MaxReplicas: 1, Quota: 20, Capacity: "medium", MaxRows: 1572864},
+		"premium":  {CPU: 1.0, Memory: "2Gi", MinReplicas: 1, MaxReplicas: 1, Quota: 10, Capacity: "large", MaxRows: 3145728},
 	}
 	for tier, want := range tests {
 		got := tierSpecs[tier]
 		if got != want {
 			t.Fatalf("%s spec = %+v, want %+v", tier, got, want)
+		}
+	}
+}
+
+// MaxRows is published to customers, so it must stay the row count the engine
+// actually refuses to exceed: the slot count under the 0.75 load factor, never
+// the raw slot count.
+func TestTierMaxRowsMatchesLoadFactor(t *testing.T) {
+	slots := map[string]int{"small": 1 << 19, "medium": 1 << 21, "large": 1 << 22}
+	for tier, spec := range tierSpecs {
+		n, ok := slots[spec.Capacity]
+		if !ok {
+			t.Fatalf("%s: unknown capacity %q", tier, spec.Capacity)
+		}
+		if want := n * 3 / 4; spec.MaxRows != want {
+			t.Fatalf("%s: MaxRows = %d, want %d (%d slots at 0.75)", tier, spec.MaxRows, want, n)
+		}
+	}
+}
+
+func TestInstanceGetsCapacity(t *testing.T) {
+	p := &azureProvisioner{
+		location:   "swedencentral",
+		image:      "reg.azurecr.io/asmdb-instance:latest",
+		envStorage: "asmdb-data",
+	}
+	for tier, want := range map[string]string{"free": "small", "standard": "medium", "premium": "large"} {
+		in := instance{ID: "db_abcdefghijklmnopqrstuvwx", Tier: tier, ContainerAppName: "db-abcdefghijklmnopqrstuvwx"}
+		app, err := p.buildContainerApp(in, "customer-token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got string
+		for _, env := range app.Properties.Template.Containers[0].Env {
+			if *env.Name == "ASMDB_CAPACITY" {
+				got = *env.Value
+			}
+		}
+		if got != want {
+			t.Fatalf("%s: ASMDB_CAPACITY = %q, want %q", tier, got, want)
 		}
 	}
 }
@@ -295,7 +335,7 @@ func (b *fakeAppUpdateBackend) WaitContainerAppReady(context.Context, instance) 
 func TestContainerAppUpdateStopsBeforeApplyingAndStarting(t *testing.T) {
 	backend := &fakeAppUpdateBackend{app: testAppWithToken("old")}
 	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", ContainerAppName: "db-test"}
-	err := updateContainerAppStopThenStart(context.Background(), backend, in, func(c *armappcontainers.Container) {
+	err := updateContainerAppStopThenStart(context.Background(), backend, in, nil, func(c *armappcontainers.Container) {
 		setContainerEnv(c, "ASMDB_TOKEN", "new")
 	})
 	if err != nil {
@@ -312,7 +352,7 @@ func TestContainerAppUpdateAlreadyStoppedDoesNotRequireStopCall(t *testing.T) {
 	app.Properties.RunningStatus = to.Ptr(armappcontainers.ContainerAppRunningStatusStopped)
 	backend := &fakeAppUpdateBackend{app: app}
 	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", ContainerAppName: "db-test"}
-	err := updateContainerAppStopThenStart(context.Background(), backend, in, func(c *armappcontainers.Container) {
+	err := updateContainerAppStopThenStart(context.Background(), backend, in, nil, func(c *armappcontainers.Container) {
 		setContainerEnv(c, "ASMDB_TOKEN", "new")
 	})
 	if err != nil {
@@ -327,7 +367,7 @@ func TestContainerAppUpdateAlreadyStoppedDoesNotRequireStopCall(t *testing.T) {
 func TestContainerAppUpdateRollbackRestoresOldSpecWhenNewRevisionUnhealthy(t *testing.T) {
 	backend := &fakeAppUpdateBackend{app: testAppWithToken("old"), finalOnly: true}
 	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", ContainerAppName: "db-test"}
-	err := updateContainerAppStopThenStart(context.Background(), backend, in, func(c *armappcontainers.Container) {
+	err := updateContainerAppStopThenStart(context.Background(), backend, in, nil, func(c *armappcontainers.Container) {
 		setContainerEnv(c, "ASMDB_TOKEN", "new")
 	})
 	if err == nil {
@@ -345,7 +385,7 @@ func TestContainerAppUpdateRollbackRestoresOldSpecWhenNewRevisionUnhealthy(t *te
 func TestContainerAppUpdateStartFailureRestoresOldSpec(t *testing.T) {
 	backend := &fakeAppUpdateBackend{app: testAppWithToken("old"), startErr: errors.New("start failed")}
 	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", ContainerAppName: "db-test"}
-	err := updateContainerAppStopThenStart(context.Background(), backend, in, func(c *armappcontainers.Container) {
+	err := updateContainerAppStopThenStart(context.Background(), backend, in, nil, func(c *armappcontainers.Container) {
 		setContainerEnv(c, "ASMDB_TOKEN", "new")
 	})
 	if err == nil {

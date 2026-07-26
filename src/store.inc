@@ -3,12 +3,13 @@
 ; The record array IS the index (allocated via VirtualAlloc at startup).
 ; -----------------------------------------------------------------------------
 
-; store_hash(rcx = id) -> rax = slot index (0 .. CAPACITY-1)
+; store_hash(rcx = id) -> rax = slot index (0 .. g_capacity-1)
 store_hash:
     mov  rax, rcx
     mov  rdx, GOLDEN
     imul rax, rdx                    ; low 64 bits of id * golden ratio
-    shr  rax, CAP_SHIFT              ; keep the top log2(CAPACITY) bits
+    mov  cl, [rel g_cap_shift]
+    shr  rax, cl                     ; keep the top log2(g_capacity) bits
     ret
 
 ; store_locate(rcx = id)
@@ -56,9 +57,9 @@ store_locate:
     jmp  .ret
 .cont:
     inc  rsi
-    and  rsi, CAPACITY-1
+    and  rsi, [rel g_cap_mask]
     inc  r8
-    cmp  r8, CAPACITY
+    cmp  r8, [rel g_capacity]
     jb   .probe
     xor  rax, rax                    ; scanned whole table: not found
     mov  rdx, r12                    ; candidate (deleted) or 0 if truly full
