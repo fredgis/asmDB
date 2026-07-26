@@ -594,10 +594,9 @@
     var refreshOnly = !!options.refresh || (previousId && nextId && previousId === nextId && options.reset !== true);
     currentDb = db ? Object.assign({}, currentDb && currentDb.id === db.id ? currentDb : {}, db) : null;
     if (currentDb) {
-      var remembered = tokenById[currentDb.id] || readSessionToken(currentDb.id);
+      if (currentDb.token) { rememberInstanceTokenFor(currentDb.id, currentDb.token); }
+      var remembered = tokenForDatabase(currentDb.id);
       if (remembered) {
-        tokenById[currentDb.id] = remembered;
-        currentDb.token = remembered;
         termToken.value = remembered;
         clearTokenNeeded();
       } else if (!currentDb.token) {
@@ -660,7 +659,7 @@
     return token.slice(0, 6) + "…" + token.slice(-6);
   }
   function updateTokenHeld(reveal) {
-    var token = currentDb ? instanceToken() : "";
+    var token = currentDb ? tokenForDatabase(currentDb.id) : "";
     if (!tokenHeld || !tokenMask) { return; }
     if (!token) {
       tokenHeld.hidden = true;
@@ -693,7 +692,7 @@
     setTimeout(function () { termToken.focus(); }, 0);
   }
   function requireInstanceToken(action) {
-    var token = instanceToken();
+    var token = currentDb ? tokenForDatabase(currentDb.id) : "";
     if (token) {
       rememberInstanceToken(token);
       clearTokenNeeded();
@@ -702,17 +701,25 @@
     showTokenNeeded(action);
     return "";
   }
-  function instanceToken() {
-    if (!currentDb) { return ""; }
-    var sessionToken = tokenById[currentDb.id] || readSessionToken(currentDb.id);
-    if (sessionToken && !tokenById[currentDb.id]) { tokenById[currentDb.id] = sessionToken; }
-    return currentDb.token || sessionToken || termToken.value.trim();
+  function tokenForDatabase(idValue) {
+    if (!idValue) { return ""; }
+    var sessionToken = tokenById[idValue] || readSessionToken(idValue);
+    if (sessionToken) {
+      tokenById[idValue] = sessionToken;
+      return sessionToken;
+    }
+    if (currentDb && currentDb.id === idValue && currentDb.token) { return currentDb.token; }
+    return "";
+  }
+  function rememberInstanceTokenFor(idValue, token) {
+    if (!idValue || !token) { return; }
+    tokenById[idValue] = token;
+    writeSessionToken(idValue, token);
+    if (currentDb && currentDb.id === idValue) { currentDb.token = token; }
   }
   function rememberInstanceToken(token) {
     if (!currentDb || !token) { return; }
-    currentDb.token = token;
-    tokenById[currentDb.id] = token;
-    writeSessionToken(currentDb.id, token);
+    rememberInstanceTokenFor(currentDb.id, token);
     updateTokenHeld();
   }
   function oneTimeTokenMarkup(d, intro, extraWarning) {
@@ -735,15 +742,17 @@
       renderPreviewMessage("Open a database from Access first.");
       return Promise.resolve();
     }
-    var token = instanceToken();
+    var dbId = currentDb.id;
+    var endpoint = currentDb.endpoint;
+    var label = databaseLabel(currentDb);
+    var token = tokenForDatabase(dbId);
     if (!token) {
-      renderPreviewMessage("Paste the instance token in Access to preview rows for " + databaseLabel(currentDb) + ".");
+      renderPreviewMessage("Paste the instance token in Access to preview rows for " + label + ".");
       return Promise.resolve();
     }
-    rememberInstanceToken(token);
     previewStatus.textContent = "loading";
     return withColdRetry(function () {
-      return fetch(currentDb.endpoint.replace(/\/$/, "") + "/v1/rows?limit=" + PREVIEW_LIMIT + "&offset=0", {
+      return fetch(endpoint.replace(/\/$/, "") + "/v1/rows?limit=" + PREVIEW_LIMIT + "&offset=0", {
         headers: { "Authorization": "Bearer " + token, "accept": "application/json" }
       }).then(jsonFromResponse);
     }, function () {
@@ -874,7 +883,8 @@
     }
     termDbId.textContent = databaseLabel(db) + " (" + db.id + ")";
     termMeta.textContent = "Selected " + db.id + ". Commands use the instance token, not the Entra token.";
-    if (instanceToken()) { termToken.value = instanceToken(); }
+    var token = tokenForDatabase(db.id);
+    if (token) { termToken.value = token; }
     // A command in flight owns the terminal's state and its input. A poll that
     // lands mid-command must not flip "running" back to "ready", nor re-enable
     // controls the command handler deliberately disabled — that is the flicker
@@ -892,14 +902,14 @@
       paintTerminal();
     }
   }
-  function execRequest(command) {
+  function execRequest(dbId, token, command) {
     return withColdRetry(function () {
       var ctl = new AbortController();
       var timer = setTimeout(function () { ctl.abort(); }, 60000);
-      return fetch(API + "/databases/" + encodeURIComponent(currentDb.id) + "/exec", {
+      return fetch(API + "/databases/" + encodeURIComponent(dbId) + "/exec", {
         method: "POST",
         signal: ctl.signal,
-        headers: { "content-type": "application/json", "Authorization": "Bearer " + instanceToken() },
+        headers: { "content-type": "application/json", "Authorization": "Bearer " + token },
         body: JSON.stringify({ command: command })
       })
         .then(function (r) {
@@ -928,7 +938,9 @@
     }
     command = command.trim();
     if (!command) { return; }
-    if (!requireInstanceToken("Running " + command)) { return; }
+    var dbId = currentDb.id;
+    var token = requireInstanceToken("Running " + command);
+    if (!token) { return; }
     history.push(command);
     historyAt = history.length;
     termCommand.value = "";
@@ -937,7 +949,7 @@
     setTerminalState("running");
     writeTerminal(["asmdb> " + command]);
     var wake = setTimeout(function () { setTerminalState("waking"); writeTerminal(["waking the instance…"]); }, 1200);
-    execRequest(command)
+    execRequest(dbId, token, command)
       .then(function (d) {
         clearTimeout(wake);
         setTerminalState(d.ok === false ? "engine error" : "ready");
@@ -985,19 +997,21 @@
       "INSERT " + String(BigInt(base) + 4n) + " 5 bench BENCH writes rows for test data"
     ];
   }
-  function runCommandsInOrder(commands, index, outputs) {
+  function runCommandsInOrder(commands, index, outputs, dbId, token) {
     outputs = outputs || [];
     if (index >= commands.length) { return Promise.resolve(outputs); }
     writeTerminal(["asmdb> " + commands[index]]);
-    return execRequest(commands[index]).then(function (d) {
+    return execRequest(dbId, token, commands[index]).then(function (d) {
       writeTerminal((d.output || []).concat([""]));
       outputs.push({ command: commands[index], data: d });
-      return runCommandsInOrder(commands, index + 1, outputs);
+      return runCommandsInOrder(commands, index + 1, outputs, dbId, token);
     });
   }
   function loadSampleData() {
     if (!currentDb) { setHash("#console-access"); return; }
-    if (!requireInstanceToken("Loading sample data")) {
+    var dbId = currentDb.id;
+    var token = requireInstanceToken("Loading sample data");
+    if (!token) {
       renderPreviewMessage("Instance token required before loading sample data.");
       return;
     }
@@ -1005,7 +1019,7 @@
     previewStatus.textContent = "loading";
     renderPreviewMessage("Loading sample data into " + databaseLabel(currentDb) + "…");
     writeTerminal(["loading sample data into " + databaseLabel(currentDb), ""]);
-    runCommandsInOrder(sampleCommands(), 0)
+    runCommandsInOrder(sampleCommands(), 0, [], dbId, token)
       .then(function () {
         previewStatus.textContent = "loading";
         return loadPreview();
@@ -1136,7 +1150,9 @@
   function runBench() {
     if (!currentDb) { setHash("#console-access"); return; }
     var command = "BENCH " + benchSize.value;
-    if (!requireInstanceToken("Running " + command)) {
+    var dbId = currentDb.id;
+    var token = requireInstanceToken("Running " + command);
+    if (!token) {
       benchResult.textContent = "Instance token required before running BENCH.";
       return;
     }
@@ -1146,7 +1162,7 @@
     setTerminalState("bench");
     benchResult.textContent = "Running " + command + ". This writes real rows.";
     writeTerminal(["asmdb> " + command, "BENCH writes real rows into this database."]);
-    execRequest(command)
+    execRequest(dbId, token, command)
       .then(function (d) {
         setTerminalState(d.ok === false ? "engine error" : "ready");
         writeTerminal((d.output || []).concat([""]));

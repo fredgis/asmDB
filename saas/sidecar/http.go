@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -42,6 +44,20 @@ type execInput struct {
 	Command string `json:"command"`
 }
 
+type prepareUpgradeResponse struct {
+	OK     bool               `json:"ok"`
+	Backup *prepareBackupInfo `json:"backup,omitempty"`
+	Error  string             `json:"error,omitempty"`
+	Detail string             `json:"detail,omitempty"`
+	Output []string           `json:"output,omitempty"`
+}
+
+type prepareBackupInfo struct {
+	Path           string `json:"path"`
+	ApparentBytes  string `json:"apparentBytes"`
+	AllocatedBytes string `json:"allocatedBytes,omitempty"`
+}
+
 type page struct {
 	limit  int
 	offset int
@@ -67,6 +83,7 @@ func (a *api) routes() http.Handler {
 	mux.Handle("GET /v1/range", a.auth(http.HandlerFunc(a.handleRange)))
 	mux.Handle("POST /v1/verify", a.auth(http.HandlerFunc(a.handleVerify)))
 	mux.Handle("POST /v1/exec", a.auth(http.HandlerFunc(a.handleExec)))
+	mux.Handle("POST /v1/prepare-upgrade", a.prepareUpgradeAuth(http.HandlerFunc(a.handlePrepareUpgrade)))
 	mux.Handle("POST /mcp", a.auth(http.HandlerFunc(a.handleMCP)))
 	return loggingMiddleware(mux)
 }
@@ -82,6 +99,17 @@ func (a *api) auth(next http.Handler) http.Handler {
 }
 
 func (a *api) introspectionAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := bearerToken(r)
+		if !tokenEqual(got, a.token) && !tokenEqual(got, a.platformToken) {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *api) prepareUpgradeAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := bearerToken(r)
 		if !tokenEqual(got, a.token) && !tokenEqual(got, a.platformToken) {
@@ -305,6 +333,47 @@ func (a *api) handleExec(w http.ResponseWriter, r *http.Request) {
 	// PAGE is session state in the engine. Paged REST handlers set PAGE before
 	// each listing, so a terminal PAGE command cannot leak into the data API.
 	writeJSON(w, http.StatusOK, map[string]any{"output": lines, "ok": ok})
+}
+
+func (a *api) handlePrepareUpgrade(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	dest := a.preUpgradeBackupPath(time.Now().UTC())
+	// This route must never become a generic command runner or accept a caller
+	// supplied path. It is safe for the platform token only because the caller
+	// can express exactly one operation: BACKUP to a sidecar-chosen durable file.
+	lines, err := a.engine.Command(r.Context(), "BACKUP "+dest, waitStatus)
+	if err != nil {
+		var ee EngineError
+		if errors.As(err, &ee) {
+			writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: false, Error: "backup_failed", Detail: ee.Detail, Output: lines})
+			return
+		}
+		writeMappedError(w, err)
+		return
+	}
+	info, err := backupInfo(dest)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "backup_missing", "backup completed but output file could not be statted", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: true, Backup: info, Output: lines})
+}
+
+func (a *api) preUpgradeBackupPath(now time.Time) string {
+	name := fmt.Sprintf("%s.pre-upgrade.%s.bak", a.engine.name, now.Format("20060102T150405.000000000Z"))
+	return filepath.Join(a.engine.data, name)
+}
+
+func backupInfo(path string) (*prepareBackupInfo, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	usage := collectFileUsage(path)
+	return &prepareBackupInfo{
+		Path:           path,
+		ApparentBytes:  usage.apparentDecimal(),
+		AllocatedBytes: usage.allocatedDecimal(),
+	}, nil
 }
 
 func (a *api) writeRowsPage(w http.ResponseWriter, lines []string, err error, p page) {

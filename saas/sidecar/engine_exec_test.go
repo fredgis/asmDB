@@ -231,16 +231,23 @@ func TestFakeEngineHelper(t *testing.T) {
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
-		switch strings.ToUpper(line) {
-		case "FORMAT TSV":
+		if p := os.Getenv("ASMDB_FAKE_COMMAND_LOG"); p != "" {
+			if f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+				_, _ = f.WriteString(line + "\n")
+				_ = f.Close()
+			}
+		}
+		upper := strings.ToUpper(line)
+		switch {
+		case upper == "FORMAT TSV":
 			format = "TSV"
 			fmt.Println("[ OK ] format tsv")
 			printPrompt()
-		case "FORMAT TABLE":
+		case upper == "FORMAT TABLE":
 			format = "TABLE"
 			fmt.Println("[ OK ] format table")
 			printPrompt()
-		case "VERSION":
+		case upper == "VERSION":
 			switch os.Getenv("ASMDB_FAKE_VERSION_MODE") {
 			case "bad":
 				fmt.Println("not a version")
@@ -260,7 +267,7 @@ func TestFakeEngineHelper(t *testing.T) {
 			}
 			fmt.Println("[ OK ] version")
 			printPrompt()
-		case "SELECT *":
+		case upper == "SELECT *":
 			if format == "TSV" {
 				fmt.Println("R\t1\t5\t10\t10\ttag\tcontent")
 			} else {
@@ -270,18 +277,36 @@ func TestFakeEngineHelper(t *testing.T) {
 			}
 			fmt.Println("[ OK ] 1 row(s)")
 			printPrompt()
-		case "COUNT":
+		case upper == "COUNT":
 			fmt.Println("[ OK ] 1")
 			printPrompt()
-		case "NO_STATUS":
+		case strings.HasPrefix(upper, "BACKUP "):
+			d, _ := time.ParseDuration(os.Getenv("ASMDB_FAKE_BACKUP_SLEEP"))
+			if d > 0 {
+				time.Sleep(d)
+			}
+			if os.Getenv("ASMDB_FAKE_BACKUP_FAIL") == "1" {
+				fmt.Println("[ERR] backup failed - write error, file is incomplete")
+				printPrompt()
+				continue
+			}
+			target := strings.TrimSpace(line[len("BACKUP "):])
+			if err := os.WriteFile(target, []byte("fake backup\n"), 0o600); err != nil {
+				fmt.Println("[ERR] cannot open backup file")
+				printPrompt()
+				continue
+			}
+			fmt.Println("[ OK ] backup complete")
+			printPrompt()
+		case upper == "NO_STATUS":
 			fmt.Println("first response without status")
 			printPrompt()
-		case "PROMPT_SAME_LINE":
+		case upper == "PROMPT_SAME_LINE":
 			fmt.Print("same-line outputasmdb> ")
-		case "SECOND":
+		case upper == "SECOND":
 			fmt.Println("[ OK ] second response")
 			printPrompt()
-		case "SLOW":
+		case upper == "SLOW":
 			d, _ := time.ParseDuration(os.Getenv("ASMDB_FAKE_SLOW"))
 			if d <= 0 {
 				d = 50 * time.Millisecond
@@ -289,10 +314,10 @@ func TestFakeEngineHelper(t *testing.T) {
 			time.Sleep(d)
 			fmt.Println("[ OK ] slow")
 			printPrompt()
-		case "FAIL":
+		case upper == "FAIL":
 			fmt.Println("[ERR] forced failure")
 			printPrompt()
-		case "EXIT", "QUIT":
+		case upper == "EXIT", upper == "QUIT":
 			os.Exit(0)
 		default:
 			fmt.Println("[ OK ]")

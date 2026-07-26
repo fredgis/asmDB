@@ -13,7 +13,7 @@ $env:ASMDB_PLATFORM_TOKEN="dev-platform-token"
 go run .
 ```
 
-`GET /health` is unauthenticated. Data-plane routes require the instance access token. `/v1/stats` also accepts the narrower `ASMDB_PLATFORM_TOKEN`; no mutating route accepts that token.
+`GET /health` is unauthenticated. Data-plane routes require the instance access token. `/v1/stats` and `/v1/prepare-upgrade` also accept the narrower `ASMDB_PLATFORM_TOKEN`; prepare-upgrade is limited to one sidecar-chosen backup command.
 
 ## Environment
 
@@ -23,12 +23,12 @@ go run .
 | `ASMDB_DATA` | `/data` | Directory for `.dat`, `.wal`, and `.cdc` files. |
 | `ASMDB_NAME` | `main` | Database base name. |
 | `ASMDB_TOKEN` | required | instance bearer token; startup fails if empty. |
-| `ASMDB_PLATFORM_TOKEN` | unset | optional read-only token for `/v1/stats`. |
+| `ASMDB_PLATFORM_TOKEN` | unset | optional platform token for `/v1/stats` and the narrow `/v1/prepare-upgrade` backup hook. |
 | `PORT` | `8080` | HTTP listen port. |
 
 ## Routes
 
-- `GET /health` -> `{"status":"ok","engine":"1.5.1","rows":n}` without auth.
+- `GET /health` -> `{"status":"ok","engine":"<engine version>","storageFormat":"<format>","rows":n}` without auth.
 - `GET /v1/rows?limit=&offset=`
 - `GET /v1/rows/{id}`
 - `POST /v1/rows`
@@ -40,11 +40,14 @@ go run .
 - `POST /v1/verify`
 - `POST /v1/exec`
 - `GET /v1/stats`
+- `POST /v1/prepare-upgrade`
 - `POST /mcp`
 
 `/v1/exec` runs one terminal command under the engine lock. `BENCH`, `BACKUP`, `RESTORE`, `VERIFY`, and `TRUNCATE` get the long command timeout; other commands use the short timeout. If the engine exits, the sidecar restarts it and backs off while waiting for the exclusive file lock.
 
 `/v1/stats` reports live rows/capacity/engine, uptime, CPU, cgroup memory, and storage. Storage includes both apparent and allocated byte counts for `.dat`, `.wal`, and `.cdc`; memory includes file, inactive-file, reclaimable, and working-set fields plus cgroup events/pressure when available.
+
+`/v1/prepare-upgrade` takes no request body. It accepts the instance token or platform token, runs exactly `BACKUP <sidecar-chosen path>` under the engine lock, and returns `{"ok":true,"backup":{"path":"...","apparentBytes":"...","allocatedBytes":"..."},"output":[...]}`. Engine backup failures return `{"ok":false,"error":"backup_failed","detail":"...","output":[...]}` so the control plane can abort the upgrade.
 
 ## Container build
 
