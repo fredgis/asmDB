@@ -123,6 +123,21 @@ use the instance access token. It is an opaque bearer string issued at creation,
 returned with the endpoint once, and stored by the control plane only as a hash.
 Comparisons are constant time.
 
+> **Known gap — plaintext token during and after rotation.** Rotation is
+> deliberately two-phase so a client that times out does not lose the only copy
+> of a token that was in fact issued; that failure locked a user out of their own
+> database once, which is why the two-phase design exists. The prepared token is
+> therefore written **in clear** to the instance record in blob metadata, it is
+> **kept after the rotation commits**, and it is serialised in the `operation`
+> field of every response that returns the database object — including
+> `GET /api/v1/databases`. So the guarantee stated above does not hold from the
+> moment a rotation is prepared. Anyone who can read the metadata container, or
+> who can list databases, can read that token. This is tracked as a release
+> blocker: the fix is to purge it on commit, encrypt it at rest with a short
+> time to live while it is pending, and never serialise it in list or get
+> responses. Until then, treat a rotated token as exposed to any administrator
+> and to anyone with access to the metadata store.
+
 Tokens are not retrievable after creation. Rotation is available at
 `POST /api/v1/databases/{id}/rotate-token` and is authenticated with Entra, not
 with the instance token; that is intentional, because rotation is needed when

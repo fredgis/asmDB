@@ -796,9 +796,17 @@ is in [`COST.md`](COST.md).
 
 | Tier | Price | Size | Behaviour | Cap | Max rows |
 |---|---|---|---|---|---:|
-| **Free** | $0 | 0.25 vCPU / 0.5 GiB | sleeps when idle | 3 per account | 393 216 |
-| **Standard** | $15/mo | 0.5 vCPU / 1 GiB | sleeps when idle | 20 per account | 1 572 864 |
-| **Premium** | $49/mo | 1 vCPU / 2 GiB | always warm, no cold start | 10 per account | 3 145 728 |
+| **Free** | $0 | 0.25 vCPU / 0.5 GiB | sleeps when idle | 3 | 393 216 |
+| **Standard** | $15/mo | 0.5 vCPU / 1 GiB | sleeps when idle | 20 | 1 572 864 |
+| **Premium** | $49/mo | 1 vCPU / 2 GiB | always warm, no cold start | 10 | 3 145 728 |
+
+> **The caps are global today, not per account.** The `instance` record carries
+> no tenant, owner or account, so the quota is counted across every database in
+> the deployment and every member of the administrator group can see and manage
+> every database. The service is therefore a single-organisation tool at
+> present. It must not be described or sold as multi-tenant until an owner is
+> recorded on each instance, quotas are counted and enforced per tenant, and
+> reads are filtered by ownership.
 
 Every tier runs the identical engine and the same durability. Tiers buy
 **latency and headroom, not features** — there is no paid feature flag in the

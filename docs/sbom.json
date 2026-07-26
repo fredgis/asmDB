@@ -8,7 +8,7 @@
     "component": {
       "type": "application",
       "name": "asmdb",
-      "version": "1.5.3"
+      "version": "1.6.2"
     },
     "properties": [
       {
@@ -20,9 +20,9 @@
   "components": [
     {
       "type": "application",
-      "bom-ref": "pkg:generic/asmdb-engine@1.5.3",
+      "bom-ref": "pkg:generic/asmdb-engine@1.6.2",
       "name": "asmdb-engine",
-      "version": "1.5.3",
+      "version": "1.6.2",
       "description": "x86-64 assembly database engine assembled directly with nasm -f bin; no linker, no CRT, no runtime libraries.",
       "properties": [
         {
@@ -49,9 +49,9 @@
     },
     {
       "type": "application",
-      "bom-ref": "pkg:npm/asmdb-mcp@1.1.0",
+      "bom-ref": "pkg:npm/asmdb-mcp@1.2.0",
       "name": "asmdb-mcp",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "description": "Model Context Protocol server exposing the asmdb transactional engine as a generic CRUD store (agent memory is one example use case).",
       "licenses": [
         {
@@ -2999,7 +2999,7 @@
   ],
   "dependencies": [
     {
-      "ref": "pkg:generic/asmdb-engine@1.5.3",
+      "ref": "pkg:generic/asmdb-engine@1.6.2",
       "dependsOn": []
     },
     {
@@ -3011,7 +3011,7 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:npm/asmdb-mcp@1.1.0",
+      "ref": "pkg:npm/asmdb-mcp@1.2.0",
       "dependsOn": [
         "pkg:npm/@modelcontextprotocol/sdk@1.29.0?path=node_modules/@modelcontextprotocol/sdk",
         "pkg:npm/zod@3.25.76?path=node_modules/zod"

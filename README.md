@@ -107,7 +107,8 @@ asmdb Cloud is the same engine run as a managed service. The public hostname is
 registrar. You create a database and get a real isolated asmdb instance,
 reachable through the REST data API, an MCP endpoint for AI agents and
 a CLI. The endpoint and the instance access token are returned together once at
-creation; the token is then stored only as a hash and can be rotated from the
+creation; the token is then stored only as a hash — except during a rotation,
+which is a known gap described in [`docs/SECURITY.md`](docs/SECURITY.md) — and can be rotated from the
 management API.
 
 <p align="center">

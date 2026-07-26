@@ -15,6 +15,13 @@ Required:
 | `ASMDB_ENTRA_CLIENT_ID` | application id; accepted audience is `api://<client-id>` |
 | `ASMDB_ENTRA_GROUP_ID` | `ASMDB_ADMIN` group object id |
 
+> **The three Entra variables are documented as required but are not enforced.**
+> `main.go` supplies this deployment's real tenant, client and group ids as
+> defaults, so a control plane started without them comes up silently validating
+> tokens against those identities instead of refusing to start. That is wrong in
+> both directions: it bakes one deployment's identifiers into the source, and it
+> lets a misconfigured deployment look healthy. It should fail fast when unset.
+
 Optional/defaulted:
 
 | var | default | meaning |
@@ -87,6 +94,11 @@ stores only its SHA-256 hash, records the full `ASMDB_IMAGE` reference and
 engine version tag, then creates Container App `db-<id suffix>` in the
 configured resource group/environment. The child app receives:
 
+**Only at creation.** A *rotation* stores the prepared token in clear in the
+instance record, keeps it after the rotation commits, and returns it in the
+`operation` field of every response carrying the database object. See the known
+gap in [`docs/SECURITY.md`](../../docs/SECURITY.md).
+
 - `ASMDB_TOKEN`
 - `ASMDB_PLATFORM_TOKEN`
 - `ASMDB_NAME=main`
@@ -97,9 +109,9 @@ Ingress is internal on target port 8080. Customer data-plane traffic enters
 through APIM at `https://www.asmdb.cloud/db/<24-char-suffix>/...`; the control
 plane uses the internal Container Apps FQDN for proxy, stats, wake,
 prepare-upgrade, and upgrade operations. Tier resources and quotas follow the current contract: free
-`0.25/0.5Gi/0..1`, 3 per account, 393,216 usable rows; standard
-`0.5/1Gi/0..1`, 20 per account, 1,572,864 usable rows; premium
-`1.0/2Gi/1..1`, 10 per account, 3,145,728 usable rows; with
+`0.25/0.5Gi/0..1`, 3, 393,216 usable rows; standard
+`0.5/1Gi/0..1`, 20, 1,572,864 usable rows; premium
+`1.0/2Gi/1..1`, 10, 3,145,728 usable rows; with
 `maxReplicas: 1` on every tier. The API returns `201` once Azure accepts the
 create request; it does not wait for the app to become running.
 

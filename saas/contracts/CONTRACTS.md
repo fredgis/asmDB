@@ -475,13 +475,19 @@ Every non-2xx from either plane:
 Capabilities are real. Prices are derived in [`docs/COST.md`](../../docs/COST.md)
 from Azure list rates, at **15 % margin on run**.
 
-| tier/capability | price | CPU | memory | scale-to-zero | max instances / account | max rows |
+| tier/capability | price | CPU | memory | scale-to-zero | max instances | max rows |
 |---|---|---|---|---|---|---:|
 | `free` | $0 | 0.25 | 0.5Gi | yes (idle 5 min) | 3 | 393 216 |
 | `standard` | $15/mo | 0.5 | 1Gi | yes (idle 30 min) | 20 | 1 572 864 |
 | `premium` | $49/mo | 1.0 | 2Gi | no (always warm) | 10 | 3 145 728 |
 | Microsoft Fabric Workload | planned for GA, premium capability | — | — | — | — | — |
 | automated backups | planned for GA, standard and premium capability | — | — | — | — | — |
+
+> **These limits are global, not per account.** The `instance` record carries no
+> tenant, owner or account, so quotas are counted across the whole deployment
+> and every member of the administrator group can see and manage every database.
+> The service is a single-organisation tool until an owner is recorded per
+> instance, quotas are counted per tenant, and reads are filtered by ownership.
 
 The sizes are not free choices: Container Apps Consumption accepts only fixed
 vCPU/memory pairs at a 1:2 ratio, and **0.25 / 0.5Gi is the floor** — there is
@@ -514,7 +520,7 @@ its own file on the shared Premium Files NFS volume, and Azure Files NFS does
 not honour sparseness, so a database occupies its whole table size on disk from
 the day it is created. The provisioned share is **100 GiB**, which is roughly
 800 `free`, 200 `standard` or 100 `premium` databases **in total, across every
-account**. A per-account `premium` cap of 100 would let one customer consume the
+deployment**. A `premium` cap of 100 would let one customer consume the
 entire platform, so it is 10. Raising any of these caps means growing the share
 first; the cap is a consequence of provisioning, not an independent dial.
 
@@ -587,3 +593,4 @@ deployment finds the same registry instead of creating a second one.
 | `saas/infra/` | Agent I |
 | `site/` | orchestrator only |
 | `src/`, `tests/`, `docs/`, `mcp/`, `README.md` | orchestrator only — **do not touch** |
+

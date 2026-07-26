@@ -91,9 +91,9 @@ theoretical:
 | `standard` | 2^21 slots | 512 MiB | $0.096 |
 | `premium` | 2^22 slots | 1 GiB | $0.192 |
 
-That is also what sets the per-account caps. The provisioned share is 100 GiB,
+That is also what sets the instance caps. The provisioned share is 100 GiB,
 which holds roughly **800 `free`, 200 `standard` or 100 `premium` databases in
-total, across every account**. A per-account `premium` cap of 100 would let a
+total**. A `premium` cap of 100 would let one tenant, once tenancy exists, take a
 single customer take the whole platform, so the cap is **10**. These caps are
 capacity controls derived from provisioning, not marketing dials: raising one
 means growing the share first.
@@ -172,9 +172,14 @@ Cost per paying database, then **+15 % margin on run**:
 
 | Tier | Price | What it buys | Max rows |
 |---|---|---|---:|
-| `free` | **$0** | 0.25 vCPU / 0.5 GiB, sleeps when idle, max 3 per account | 393 216 |
-| `standard` | **$15 / month** | 0.5 vCPU / 1 GiB, sleeps when idle, max 20 per account | 1 572 864 |
-| `premium` | **$49 / month** | 1 vCPU / 2 GiB, always warm — no cold start, max 10 per account | 3 145 728 |
+| `free` | **$0** | 0.25 vCPU / 0.5 GiB, sleeps when idle, max 3 | 393 216 |
+| `standard` | **$15 / month** | 0.5 vCPU / 1 GiB, sleeps when idle, max 20 | 1 572 864 |
+| `premium` | **$49 / month** | 1 vCPU / 2 GiB, always warm — no cold start, max 10 | 3 145 728 |
+
+> Those caps are **global**, not per account: no owner is recorded on an
+> instance, so the quota is counted across the whole deployment. See
+> [`SAAS.md`](SAAS.md) for what that means for the revenue model — a single
+> organisation cannot be billed separately from another today.
 
 Every tier runs the identical engine and the same durability. Tiers buy
 **latency and headroom, not features**. There is no paid feature flag anywhere
@@ -235,3 +240,4 @@ against the standard and premium tiers.
 Support, on-call, the domain, certificates, backups beyond the provisioned
 share, and the cost of building the thing. This is the cost of *running* it,
 which is what the 15 % is taken on.
+
