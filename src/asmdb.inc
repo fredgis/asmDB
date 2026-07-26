@@ -120,7 +120,7 @@
 ; database, without ever affecting whether it can be opened.
 %define ENGINE_MAJOR 1
 %define ENGINE_MINOR 5
-%define ENGINE_PATCH 1
+%define ENGINE_PATCH 2
 %define ENGINE_VERSION ((ENGINE_MAJOR << 16) | (ENGINE_MINOR << 8) | ENGINE_PATCH)
 
 ; ---- On-disk ----

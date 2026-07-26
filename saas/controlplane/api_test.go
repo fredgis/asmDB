@@ -613,7 +613,10 @@ func TestUpgradeBackupFailureAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, execResponse{Output: []string{"[ERR] backup failed"}, OK: false})
+		if r.URL.Path != "/v1/prepare-upgrade" {
+			t.Fatalf("unexpected backup path %q", r.URL.Path)
+		}
+		writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: false, Detail: "backup failed"})
 	}))
 	defer server.Close()
 	prov := &fakeProvisioner{internalEndpoint: server.URL, states: map[string]liveState{}}
@@ -645,7 +648,10 @@ func TestUpgradeRevisionFailureLeavesRecordedImageUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, execResponse{Output: []string{"backup ok"}, OK: true})
+		if r.URL.Path != "/v1/prepare-upgrade" {
+			t.Fatalf("unexpected backup path %q", r.URL.Path)
+		}
+		writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: true, Backup: "snapshot"})
 	}))
 	defer server.Close()
 	prov := &fakeProvisioner{internalEndpoint: server.URL, upgradeErr: errors.New("revision failed"), states: map[string]liveState{}}
@@ -675,9 +681,12 @@ func TestUpgradeStoppedInstanceIsDeliberatelyStarted(t *testing.T) {
 	}
 	backupCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/exec" {
+		if r.URL.Path == "/v1/prepare-upgrade" {
 			backupCalls++
-			writeJSON(w, http.StatusOK, execResponse{Output: []string{"backup ok"}, OK: true})
+			if got, want := r.Header.Get("Authorization"), "Bearer "+derivePlatformToken(testStatsConfig().PlatformSecret, id); got != want {
+				t.Fatalf("prepare-upgrade auth = %q, want %q", got, want)
+			}
+			writeJSON(w, http.StatusOK, prepareUpgradeResponse{OK: true, Backup: "snapshot"})
 			return
 		}
 		writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Engine: "1.6.0"})

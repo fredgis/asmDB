@@ -563,7 +563,7 @@ image instances run, and whether an upgrade is offered. It lives in
 ```nasm
 %define ENGINE_MAJOR 1
 %define ENGINE_MINOR 5
-%define ENGINE_PATCH 1
+%define ENGINE_PATCH 2
 ```
 
 `scripts/release.ps1` reads it and uses it as the release tag. That is not

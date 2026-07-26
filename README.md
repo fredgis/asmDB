@@ -7,8 +7,8 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64): 42,749 bytes and 51,221 bytes respectively at 1.5.1.
-    And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). The 1.5.2 PE64 build is 42,997 bytes;
+    the last published ELF64 build is 51,221 bytes. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -18,7 +18,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-42%2C749%20B%20PE%20%2F%2051%2C221%20B%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-42%2C997%20B%20PE%20%2F%2051%2C221%20B%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -227,7 +227,7 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 42,749 bytes</b>"]:::win
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 42,997 bytes</b>"]:::win
     LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · 51,221 bytes</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
@@ -445,7 +445,7 @@ flowchart LR
 
 ### The deep dive
 
-How a 42,749-byte PE64 and a 51,221-byte ELF64 become a durable database.
+How a 42,997-byte PE64 and a 51,221-byte ELF64 become a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -458,8 +458,9 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the binaries are 42,749 bytes (PE) and 51,221 bytes (ELF) at
-1.5.1 — and why a million-row database needs only a few MB of RAM.
+which is why the PE64 binary is 42,997 bytes at 1.5.2 and the last published
+ELF64 binary is 51,221 bytes — and why a million-row database needs only a few
+MB of RAM.
 
 #### The record store — four cache lines per row
 
@@ -842,7 +843,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.5.1 · 1.5.0 · 1.4.0 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.5.2 · 1.5.1 · 1.5.0 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -861,6 +862,39 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+  <summary><b>1.5.2</b> — every command answers, and the answer belongs to the command</summary>
+
+  **Four commands emitted no status line.** `HELP`, `SCHEMA`, `VERSION` and
+  `SELECT *` on an empty table returned to the prompt without an `[ OK ]` or an
+  `[ERR]`. The protocol every machine consumer relies on is *send a line, read
+  until a status line*, so those four left the reader waiting for a terminator
+  that never arrived.
+
+  The consequence was not a hang, which would at least be honest. The reader
+  blocked until its timeout and then **every later response was offset by one
+  command**. Sending `HELP` to a hosted instance returned `[ OK ] 5 row(s)` —
+  the answer to an earlier `COUNT`. A desynchronised stream does not fail, it
+  returns confident wrong answers.
+
+  It also explains a symptom nobody had connected to it: a stuck `HELP` holds
+  the engine lock, so the hosted service's `/v1/stats` could not run its `COUNT`
+  and the console showed the database as unavailable until the timeout released
+  it. One defect, three symptoms.
+
+  Every command now terminates, on error paths as well as success, in both
+  `FORMAT TABLE` and `FORMAT TSV`. **Clients may rely on it**: exactly one
+  status line per command, always.
+
+  The suite gained a check for it. This reached a running service precisely
+  because nothing tested that a command answers at all — the tests asserted what
+  commands *print*, never that they *finish*.
+
+  The binary grew from 42,749 to 42,997 bytes. The storage format is unchanged
+  at 2, so no database needs migrating.
+
+</details>
 
 <details>
   <summary><b>1.5.1</b> — a slow command no longer leaves a hosted instance dead</summary>

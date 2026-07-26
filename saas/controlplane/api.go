@@ -95,6 +95,12 @@ type healthResponse struct {
 	Rows   int64  `json:"rows"`
 }
 
+type prepareUpgradeResponse struct {
+	OK     bool   `json:"ok"`
+	Backup string `json:"backup,omitempty"`
+	Detail string `json:"detail,omitempty"`
+}
+
 type versionResponse struct {
 	Engine string `json:"engine,omitempty"`
 	Image  string `json:"image,omitempty"`
@@ -763,30 +769,34 @@ func (a *api) fetchStats(ctx context.Context, in instance) statsResponse {
 func (a *api) backupInstance(ctx context.Context, in instance) error {
 	reqCtx, cancel := context.WithTimeout(ctx, backupTimeout)
 	defer cancel()
-	body, err := json.Marshal(execRequest{Command: "BACKUP"})
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(a.provisioner.InternalEndpoint(in), "/")+"/v1/exec", bytes.NewReader(body))
+
+	// This deliberately does not use /v1/exec. The control plane stores only a
+	// hash of the customer's instance token, and the platform token must never
+	// become a fleet-wide write credential. The sidecar route is a narrow
+	// pre-upgrade capability: it may take/verify the snapshot needed before an
+	// image change, and nothing else.
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(a.provisioner.InternalEndpoint(in), "/")+"/v1/prepare-upgrade", nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+derivePlatformToken(a.cfg.PlatformSecret, in.ID))
-	req.Header.Set("Content-Type", "application/json")
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("backup returned %s", resp.Status)
+		return fmt.Errorf("prepare-upgrade returned %s", resp.Status)
 	}
-	var out execResponse
+	var out prepareUpgradeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return err
 	}
 	if !out.OK {
-		return fmt.Errorf("backup command failed")
+		if out.Detail != "" {
+			return fmt.Errorf("prepare-upgrade failed: %s", out.Detail)
+		}
+		return fmt.Errorf("prepare-upgrade failed")
 	}
 	return nil
 }

@@ -19,6 +19,7 @@
   var openSelected = id("open-selected-db");
   var saveToken = id("save-token");
   var rotateTokenBtn = id("rotate-token");
+  var createTokenOutput = id("create-token-output");
   var rotatedTokenOutput = id("rotated-token-output");
   var authPanel = id("auth-panel");
   var authSignIn = id("auth-signin");
@@ -61,6 +62,7 @@
   var termSend = id("term-send");
   var loadSampleBtn = id("load-sample");
   var upgradeDbBtn = id("upgrade-db");
+  var upgradeStatus = id("upgrade-status");
   var deleteDbBtn = id("delete-db");
   var benchSize = id("bench-size");
   var benchRun = id("bench-run");
@@ -82,6 +84,7 @@
   var historyAt = 0;
   var statsPrevious = Object.create(null);
   var pollTimer = 0;
+  var revealTimer = 0;
   var pollDelay = POLL_BASE_MS;
   var loadingList = false;
   var activeView = "create";
@@ -526,7 +529,14 @@
       selectedDbId.textContent = "choose an instance before previewing rows or running CLI commands";
       databaseViewName.textContent = "no database selected";
       databaseViewMeta.textContent = "Open a database from Access before previewing data.";
-      if (upgradeDbBtn) { upgradeDbBtn.hidden = true; }
+      if (loadSampleBtn) { loadSampleBtn.disabled = true; }
+      if (deleteDbBtn) { deleteDbBtn.disabled = true; }
+      if (upgradeDbBtn) {
+        upgradeDbBtn.hidden = false;
+        upgradeDbBtn.disabled = true;
+        upgradeDbBtn.textContent = "Upgrade database";
+      }
+      if (upgradeStatus) { upgradeStatus.textContent = "Open a database first."; }
       return;
     }
     selectedDbName.textContent = databaseLabel(currentDb);
@@ -535,12 +545,20 @@
     databaseViewMeta.textContent = currentDb.endpoint
       ? currentDb.id + " · " + (currentDb.state || "state") + " · " + currentDb.endpoint
       : currentDb.id + " · " + (currentDb.state || "state");
+    if (loadSampleBtn) { loadSampleBtn.disabled = false; }
+    if (deleteDbBtn) { deleteDbBtn.disabled = false; }
     if (upgradeDbBtn) {
+      var runningEngine = currentDb.engine || "unknown";
+      var targetEngine = currentDb.availableEngine || runningEngine;
+      upgradeDbBtn.hidden = false;
       if (currentDb.upgradeAvailable) {
-        upgradeDbBtn.hidden = false;
-        upgradeDbBtn.textContent = currentDb.availableEngine ? "Upgrade to " + currentDb.availableEngine : "Upgrade database";
+        upgradeDbBtn.disabled = false;
+        upgradeDbBtn.textContent = "Upgrade " + runningEngine + " → " + targetEngine;
+        if (upgradeStatus) { upgradeStatus.textContent = "Upgrade available: " + runningEngine + " to " + targetEngine + "."; }
       } else {
-        upgradeDbBtn.hidden = true;
+        upgradeDbBtn.disabled = true;
+        upgradeDbBtn.textContent = "Upgrade database";
+        if (upgradeStatus) { upgradeStatus.textContent = "Running " + runningEngine + " — current."; }
       }
     }
   }
@@ -651,6 +669,7 @@
       return;
     }
     tokenHeld.hidden = false;
+    tokenHeld.setAttribute("data-revealed", reveal ? "true" : "false");
     tokenMask.textContent = reveal ? token : maskToken(token);
     if (tokenReveal) {
       tokenReveal.hidden = false;
@@ -695,6 +714,21 @@
     tokenById[currentDb.id] = token;
     writeSessionToken(currentDb.id, token);
     updateTokenHeld();
+  }
+  function oneTimeTokenMarkup(d, intro, extraWarning) {
+    return [
+      '<span class="ok">[ OK ]</span> ' + esc(intro),
+      '<span class="k">id       </span> ' + esc(d.id),
+      '<span class="k">name     </span> ' + esc(d.name),
+      '<span class="k">tier     </span> ' + esc(d.tier),
+      '<span class="k">state    </span> ' + esc(d.state),
+      '<span class="k">endpoint </span> ' + esc(d.endpoint),
+      "",
+      '<span class="k">token    </span> <span class="danger">' + esc(d.token) + '</span>',
+      '<span class="danger">          shown once — put it in a secret manager now</span>',
+      '<span class="token-copy-row"><button class="btn btn--ghost" type="button" data-copy-token-for="' + attr(d.id) + '">Copy token</button><span class="danger">' + esc(extraWarning) + '</span></span>',
+      '<span class="token-copy-row"><button class="btn btn--ghost" type="button" data-dismiss-token-output>Dismiss token from this screen</button></span>'
+    ].join("\n");
   }
   function loadPreview() {
     if (!currentDb || !currentDb.endpoint) {
@@ -929,18 +963,13 @@
       tokenById[d.id] = d.token;
       writeSessionToken(d.id, d.token);
     }
-    say([
-      '<span class="ok">[ OK ]</span> database created\n',
-      '<span class="k">id       </span> ' + esc(d.id),
-      '<span class="k">name     </span> ' + esc(d.name),
-      '<span class="k">tier     </span> ' + esc(d.tier),
-      '<span class="k">state    </span> ' + esc(d.state),
-      '<span class="k">endpoint </span> ' + esc(d.endpoint),
-      "",
-      '<span class="k">token    </span> ' + esc(d.token),
-      '<span class="danger">          shown once — put it in a secret manager now</span>',
-      '<span class="token-copy-row"><button class="btn btn--ghost" type="button" data-copy-token-for="' + attr(d.id) + '">Copy token</button><span class="danger">This is the only time the token will be shown in clear text.</span></span>'
-    ].join("\n"), "ok");
+    var tokenMarkup = oneTimeTokenMarkup(d, "database created", "This is the only time the token will be shown in clear text.");
+    if (createTokenOutput) {
+      createTokenOutput.hidden = false;
+      createTokenOutput.innerHTML = tokenMarkup;
+      createTokenOutput.setAttribute("data-state", "ok");
+    }
+    say(tokenMarkup, "ok");
     var existing = findDb(d.id);
     if (existing) { Object.assign(existing, d); }
     else { databases.unshift(d); }
@@ -1015,16 +1044,12 @@
     if (!token) { throw new Error("token rotation did not return a token"); }
     rememberInstanceToken(token);
     if (rotatedTokenOutput) {
+      var display = Object.assign({}, currentDb, { token: token });
       rotatedTokenOutput.hidden = false;
       rotatedTokenOutput.innerHTML = [
-        '<span class="ok">[ OK ]</span> token rotation response received',
-        '<span class="k">database </span> ' + esc(currentDb.id),
+        oneTimeTokenMarkup(display, "token rotation response received", "Update every client that used the previous token."),
         '<span class="k">warning  </span> ' + esc((data && data.warning) || "Token rotation restarts the instance and briefly interrupts active connections."),
-        '<span class="k">state    </span> new token returned; the instance may still be restarting',
-        "",
-        '<span class="k">token    </span> ' + esc(token),
-        '<span class="danger">          shown once — put it in a secret manager now</span>',
-        '<span class="token-copy-row"><button class="btn btn--ghost" type="button" data-copy-token-for="' + attr(currentDb.id) + '">Copy token</button><span class="danger">Update every client that used the previous token.</span></span>'
+        '<span class="k">state    </span> new token returned; the instance may still be restarting'
       ].join("\n");
       rotatedTokenOutput.setAttribute("data-state", "ok");
     }
@@ -1160,6 +1185,27 @@
       done("copy unavailable");
     }
   }
+  function setTokenReveal(on) {
+    if (revealTimer) {
+      clearTimeout(revealTimer);
+      revealTimer = 0;
+    }
+    updateTokenHeld(on);
+    if (tokenReveal) { tokenReveal.textContent = on ? "Hide token" : "Reveal for 10s"; }
+  }
+  function revealTokenTemporarily() {
+    setTokenReveal(true);
+    revealTimer = setTimeout(function () { setTokenReveal(false); }, 10000);
+  }
+  function handleTokenOutputClick(e, container) {
+    var copy = e.target.closest("[data-copy-token-for]");
+    if (copy) { copyTokenFor(copy.getAttribute("data-copy-token-for"), copy); return; }
+    var dismiss = e.target.closest("[data-dismiss-token-output]");
+    if (dismiss) {
+      container.hidden = true;
+      container.textContent = "";
+    }
+  }
 
   createBtn.addEventListener("click", function () {
     var name = (nameEl.value || "").trim();
@@ -1177,9 +1223,11 @@
     }).then(renderCreated).catch(fail).then(function () { busy(false, createBtn); });
   });
   out.addEventListener("click", function (e) {
-    var button = e.target.closest("[data-copy-token-for]");
-    if (button) { copyTokenFor(button.getAttribute("data-copy-token-for"), button); }
+    handleTokenOutputClick(e, out);
   });
+  if (createTokenOutput) {
+    createTokenOutput.addEventListener("click", function (e) { handleTokenOutputClick(e, createTokenOutput); });
+  }
   listBtn.addEventListener("click", function () {
     busy(true, listBtn, "loading…");
     loadDatabases({ selectFirst: false }).then(function () { busy(false, listBtn); });
@@ -1207,21 +1255,22 @@
     if (activeView === "database") { loadPreview(); }
   });
   if (tokenReveal) {
-    ["mousedown", "touchstart", "keydown"].forEach(function (eventName) {
-      tokenReveal.addEventListener(eventName, function (e) {
-        if (eventName === "keydown" && e.key !== " " && e.key !== "Enter") { return; }
-        updateTokenHeld(true);
-      });
-    });
-    ["mouseup", "mouseleave", "touchend", "touchcancel", "keyup", "blur"].forEach(function (eventName) {
-      tokenReveal.addEventListener(eventName, function () { updateTokenHeld(false); });
+    tokenReveal.addEventListener("pointerdown", function () { setTokenReveal(true); });
+    tokenReveal.addEventListener("pointerup", function () { setTokenReveal(false); });
+    tokenReveal.addEventListener("pointercancel", function () { setTokenReveal(false); });
+    tokenReveal.addEventListener("pointerleave", function () { setTokenReveal(false); });
+    tokenReveal.addEventListener("click", revealTokenTemporarily);
+    tokenReveal.addEventListener("keydown", function (e) {
+      if (e.key === " " || e.key === "Enter") {
+        e.preventDefault();
+        revealTokenTemporarily();
+      }
     });
   }
   loadSampleBtn.addEventListener("click", loadSampleData);
   rotateTokenBtn.addEventListener("click", rotateCurrentToken);
   rotatedTokenOutput.addEventListener("click", function (e) {
-    var button = e.target.closest("[data-copy-token-for]");
-    if (button) { copyTokenFor(button.getAttribute("data-copy-token-for"), button); }
+    handleTokenOutputClick(e, rotatedTokenOutput);
   });
   upgradeDbBtn.addEventListener("click", upgradeCurrentDatabase);
   deleteDbBtn.addEventListener("click", deleteCurrentDatabase);

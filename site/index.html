@@ -596,6 +596,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
             <button class="btn btn--primary" id="db-create" type="button">Create database</button>
             <a class="btn btn--ghost" href="#console-access">Access database</a>
           </div>
+          <pre class="out mono token-output create-token-output" id="create-token-output" hidden></pre>
           <div class="out mono" id="db-out" role="status" aria-live="polite">Ready. Pick a name and tier, then create.</div>
         </div>
       </section>
@@ -629,7 +630,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
             <p class="console-card__note">Paste the selected database token to preview rows or run CLI commands. It is not an Entra token.</p>
             <div class="token-held" id="token-held" hidden>
               <span>Token held for this tab: <code id="token-mask">masked</code></span>
-              <button class="btn btn--ghost token-reveal" id="token-reveal" type="button">Hold to reveal</button>
+              <button class="btn btn--ghost token-reveal" id="token-reveal" type="button">Reveal for 10s</button>
             </div>
             <div class="field terminal__token" id="term-token-wrap">
               <label for="term-token">token for selected database</label>
@@ -658,7 +659,8 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
           </div>
           <div class="console-actions database-heading__actions">
             <button class="btn btn--primary" id="load-sample" type="button">Load sample data</button>
-            <button class="btn btn--ghost" id="upgrade-db" type="button" hidden>Upgrade database</button>
+            <button class="btn btn--ghost" id="upgrade-db" type="button" disabled>Upgrade database</button>
+            <span class="action-status" id="upgrade-status">Open a database first.</span>
             <button class="btn btn--ghost btn--danger" id="delete-db" type="button">Delete database</button>
             <a class="btn btn--ghost" href="#console-access">Change database</a>
           </div>

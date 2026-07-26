@@ -232,6 +232,10 @@ a { color: inherit; }
 .btn--ghost:hover { border-color: var(--color-accent); color: var(--color-ink); }
 .btn--ghost:active { transform: translateY(1px); }
 .btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+.btn[disabled]:hover {
+  border-color: var(--color-rule-2);
+  color: var(--color-ink-2);
+}
 
 /* ============================== stat strip ================================ */
 
@@ -1253,8 +1257,11 @@ img, svg, video, pre, table, figure { max-width: 100%; }
 }
 .token-held[hidden] { display: none; }
 .token-held code {
-  color: var(--color-accent);
+  color: var(--color-bad);
   font-family: var(--font-mono);
+}
+.token-held[data-revealed="true"] {
+  border-color: color-mix(in oklab, var(--color-bad) 45%, var(--color-rule));
 }
 .token-reveal { padding: var(--space-xs) var(--space-sm); }
 .token-output {
@@ -1262,6 +1269,8 @@ img, svg, video, pre, table, figure { max-width: 100%; }
   white-space: pre-wrap;
   word-break: break-word;
 }
+.create-token-output[hidden],
+.token-output[hidden] { display: none; }
 
 .console-access-grid,
 .database-grid {
@@ -1281,6 +1290,12 @@ img, svg, video, pre, table, figure { max-width: 100%; }
 }
 .database-heading__actions {
   justify-content: flex-end;
+}
+.action-status {
+  align-self: center;
+  color: var(--color-ink-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
 }
 #database-view-name { color: var(--color-accent); }
 .preview-card,

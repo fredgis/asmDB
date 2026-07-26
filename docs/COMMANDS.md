@@ -48,6 +48,10 @@ Rules that apply everywhere:
 - Numbers must end on a token boundary: `DELETE 42junk` is a syntax error, not a
   deletion of row 42. An input line longer than 511 bytes is refused rather than
   truncated and executed.
+- Every command response terminates with exactly one status line: `[ OK ] ...`
+  on success or `[ERR] ...` on failure. This is part of the protocol for clients
+  that drive the REPL programmatically; even `HELP`, `SCHEMA`, `VERSION` and an
+  empty `SELECT *` end with a status line.
 
 ### Sessions
 
@@ -416,6 +420,7 @@ asmdb> SCHEMA
     32      8     value    i64   numeric score / payload
     40      40    tag      char[40]  category, 39 usable + NUL
     80      176   content  char[176] free text, 175 usable + NUL
+[ OK ] schema shown
 ```
 
 ---
@@ -445,6 +450,7 @@ asmdb> TYPES
     timestamp      64  unix epoch ms               created, updated
     char[40]      320  text, <= 39 B + NUL        tag
     char[176]    1408  text, <= 175 B + NUL       content
+[ OK ] types shown
 ```
 
 ---
@@ -463,12 +469,13 @@ file can be opened.
 
 ```text
 asmdb> VERSION
-  asmdb 1.4.0   (stable: the on-disk format is versioned and migratable)
+  asmdb 1.5.2   (stable: the on-disk format is versioned and migratable)
   storage format : 2
   record size    : 256 bytes
   capacity       : 4194304 slots
   platform       : Windows PE64 (kernel32)
-  written by     : engine 1.4.0
+  written by     : engine 1.5.2
+[ OK ] version shown
 ```
 
 `written by` reads a stamp in the file header. Databases written before 0.9.0
@@ -685,7 +692,7 @@ HELP
 ```
 
 Print the in-app command reference, grouped by section (Data, Transactions,
-Catalog, Backup, Session).
+Catalog, Backup, Session), then `[ OK ] help shown`.
 
 ---
 
