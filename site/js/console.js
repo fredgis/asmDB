@@ -53,6 +53,11 @@
   var benchSize = id("bench-size");
   var benchRun = id("bench-run");
   var benchResult = id("bench-result");
+  var costStatus = id("cost-status");
+  var costBasis = id("cost-basis");
+  var costTotal = id("cost-total");
+  var costCounts = id("cost-counts");
+  var costRows = id("cost-rows");
   var binaryList = id("binary-list");
   var bannerMarkup = termScreen.innerHTML;
 
@@ -93,6 +98,7 @@
     if (h === "console-access") { return "access"; }
     if (h === "database") { return "database"; }
     if (h === "cli") { return "cli"; }
+    if (h === "costs") { return "costs"; }
     if (h === "create") { return "create"; }
     return activeView;
   }
@@ -111,6 +117,8 @@
       else { renderPreviewMessage("Open a database from Access first."); }
     } else if (view === "cli") {
       showTerminal(currentDb);
+    } else if (view === "costs") {
+      loadCosts();
     }
   }
   function setHash(hash) {
@@ -356,6 +364,18 @@
     var fracText = (frac < 10n ? "0" + String(frac) : String(frac)).replace(/0+$/, "");
     return formatDecimalString(String(whole)) + (fracText ? "." + fracText : "") + " " + units[unit];
   }
+  function formatMoney(value) {
+    if (value == null || value === "") { return "—"; }
+    var n = Number(value);
+    if (!isFinite(n)) { return "—"; }
+    return "$" + n.toFixed(n < 1 ? 4 : 2);
+  }
+  function formatHours(value) {
+    if (value == null || value === "") { return "—"; }
+    var n = Number(value);
+    if (!isFinite(n)) { return "—"; }
+    return n.toFixed(n < 10 ? 3 : 1).replace(/\.?0+$/, "") + " h";
+  }
   function percentFromDecimalStrings(used, total) {
     try {
       var u = BigInt(used || "0");
@@ -588,6 +608,46 @@
       .catch(function () {
         pollDelay = Math.min(POLL_MAX_MS, pollDelay * 2);
         renderStatsUnavailable("unavailable");
+      });
+  }
+  function renderCosts(data) {
+    var counts = data && data.counts || {};
+    var rows = data && Array.isArray(data.databases) ? data.databases : [];
+    costStatus.textContent = rows.length ? String(rows.length) : "empty";
+    costBasis.textContent = (data && data.basis) || "estimated from Azure Monitor replica time at public list rates; not an invoice";
+    costTotal.textContent = formatMoney(data && data.totalUsd);
+    costCounts.innerHTML = ["free", "standard", "premium"].map(function (tier) {
+      return "<span>" + esc(tier) + " " + esc(formatDecimalString(counts[tier] || 0)) + "</span>";
+    }).join("");
+    if (!rows.length) {
+      costRows.innerHTML = '<tr><td colspan="7">No databases in this cost window.</td></tr>';
+      return;
+    }
+    costRows.innerHTML = rows.map(function (row) {
+      var noData = row.metricsUnavailable || ((row.activeHours || 0) === 0 && (row.pausedHours || 0) === 0 && (row.estimatedComputeUsd || 0) === 0);
+      var active = noData ? "no data yet" : formatHours(row.activeHours);
+      var paused = noData ? "no data yet" : formatHours(row.pausedHours);
+      var cost = noData ? "no data yet" : formatMoney(row.estimatedComputeUsd);
+      return "<tr>" +
+        "<td>" + esc(row.name || row.id || "database") + "<br><span class=\"db-item__id\">" + esc(row.id || "") + "</span></td>" +
+        "<td>" + esc(row.tier || "—") + "</td>" +
+        "<td>" + esc(row.size || "—") + "</td>" +
+        "<td>" + esc(asleepLabel(row.state || "—")) + "</td>" +
+        "<td>" + esc(active) + "</td>" +
+        "<td>" + esc(paused) + "</td>" +
+        "<td>" + esc(cost) + "</td>" +
+      "</tr>";
+    }).join("");
+  }
+  function loadCosts() {
+    if (!auth.account) { return Promise.resolve(); }
+    costStatus.textContent = "loading";
+    costRows.innerHTML = '<tr><td colspan="7">Loading cost estimate…</td></tr>';
+    return request("/costs", { method: "GET" })
+      .then(renderCosts)
+      .catch(function (e) {
+        costStatus.textContent = "unavailable";
+        costRows.innerHTML = '<tr><td colspan="7">' + esc((e && e.message) || "Cost estimate unavailable.") + '</td></tr>';
       });
   }
   function startPolling() { stopPolling(); schedulePoll(POLL_BASE_MS); }

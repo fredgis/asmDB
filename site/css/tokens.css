@@ -25,6 +25,7 @@
   --color-focus:      oklch(88% 0.14 205);
   --color-warn:       oklch(82% 0.13 85);
   --color-ok:         oklch(78% 0.15 155);
+  --color-bad:        oklch(70% 0.16 28);
 
   /* ---- rules ------------------------------------------------------------ */
   --color-rule:       oklch(26% 0.03 265);

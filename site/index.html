@@ -458,6 +458,33 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
       smaller 1:2 CPU-to-memory pair. Premium keeps a replica resident; the price
       buys no cold start, not a different engine.
     </p>
+    <div class="tier-capabilities" aria-labelledby="tier-capabilities-title">
+      <div class="tier-capabilities__head">
+        <h3 id="tier-capabilities-title">Planned platform capabilities at general availability</h3>
+        <p>The engine remains identical on every tier; these are service capabilities planned for GA.</p>
+      </div>
+      <div class="tier-matrix-wrap">
+        <table class="tier-matrix">
+          <thead>
+            <tr><th>Capability</th><th>Free</th><th>Standard</th><th>Premium</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th>Microsoft Fabric Workload</th>
+              <td><span class="mark mark--no" aria-label="not included">✗</span></td>
+              <td><span class="mark mark--no" aria-label="not included">✗</span></td>
+              <td><span class="mark mark--yes" aria-label="included">✓</span></td>
+            </tr>
+            <tr>
+              <th>Automated backups</th>
+              <td><span class="mark mark--no" aria-label="not included">✗</span></td>
+              <td><span class="mark mark--yes" aria-label="included">✓</span></td>
+              <td><span class="mark mark--yes" aria-label="included">✓</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -538,6 +565,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
         <a href="#console-access" data-console-tab="access">Access</a>
         <a href="#database" data-console-tab="database">Database view</a>
         <a href="#cli" data-console-tab="cli">CLI</a>
+        <a href="#costs" data-console-tab="costs">Costs</a>
       </nav>
 
       <section class="console-view" id="console-view-create" data-console-view="create" aria-labelledby="create-title">
@@ -724,6 +752,46 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
               <button class="btn btn--primary" id="bench-run" type="button">Bench</button>
             </div>
             <div class="bench-result mono" id="bench-result" role="status" aria-live="polite">No bench run yet.</div>
+          </div>
+        </section>
+      </section>
+
+      <section class="console-view" id="costs" data-console-view="costs" aria-labelledby="cost-title" hidden>
+        <section class="console-card cost-view">
+          <div class="console-card__head">
+            <div>
+              <p class="sec__kicker">Costs</p>
+              <h3 class="console-card__title" id="cost-title">Month-to-date estimate</h3>
+            </div>
+            <span class="badge" id="cost-status">not loaded</span>
+          </div>
+          <div class="cost-basis" id="cost-basis">
+            Estimated from Azure Monitor replica time at public list rates; not an invoice.
+          </div>
+          <div class="cost-summary">
+            <div class="cost-total">
+              <span>estimated compute</span>
+              <strong id="cost-total">—</strong>
+            </div>
+            <div class="cost-counts" id="cost-counts" aria-label="database counts by tier">
+              <span>free —</span><span>standard —</span><span>premium —</span>
+            </div>
+          </div>
+          <p class="console-card__note">
+            Paused hours are shown explicitly because free and standard databases can scale to zero.
+            See the <a href="https://github.com/fredgis/asmDB/blob/main/docs/COST.md">cost model</a>.
+          </p>
+          <div class="cost-table-wrap" tabindex="0" aria-label="cost estimate table">
+            <table class="cost-table">
+              <thead>
+                <tr>
+                  <th>Database</th><th>Tier</th><th>Size</th><th>State</th><th>Active hours</th><th>Paused hours</th><th>Estimated cost</th>
+                </tr>
+              </thead>
+              <tbody id="cost-rows">
+                <tr><td colspan="7">Open the cost view to load estimates.</td></tr>
+              </tbody>
+            </table>
           </div>
         </section>
       </section>
