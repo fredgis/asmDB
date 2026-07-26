@@ -182,8 +182,9 @@ exposes:
 | REST CRUD under `/v1/rows` | Data-plane row operations. |
 | `/mcp` | MCP over HTTP. |
 | `POST /v1/exec` | Browser terminal execution path. |
+| `POST /v1/prepare-upgrade` | Narrow pre-upgrade backup path used by the control plane. |
 | `GET /v1/stats` | Rows/capacity from the engine and CPU/memory from container cgroups. |
-| `/health` | Instance health. |
+| `/health` | Instance health, including engine version and `storageFormat`. |
 
 `GET /v1/stats` accepts a per-instance platform token:
 
@@ -191,7 +192,9 @@ exposes:
 HMAC-SHA256(master secret, instance id)
 ```
 
-That token is accepted only on `/v1/stats`, never on mutating routes.
+That token is accepted only on `/v1/stats`, never on mutating routes. The sidecar
+reads the engine version and `storageFormat` from the engine itself, so `/health`
+does not depend on a duplicated constant.
 
 ### 4.2 Control plane
 
@@ -205,8 +208,9 @@ The control plane exposes:
 | `POST /api/v1/databases` | Create a database and return endpoint + token once. |
 | `DELETE /api/v1/databases/{id}` | Delete a database. |
 | `POST /api/v1/databases/{id}/exec` | Proxy browser terminal commands using the instance token. |
+| `POST /api/v1/databases/{id}/wake` | Trigger activation and return promptly while a cold instance starts. |
 | `POST /api/v1/databases/{id}/rotate-token` | Rotate the instance token. |
-| `POST /api/v1/databases/{id}/upgrade` | Backup, restart and upgrade an instance. |
+| `POST /api/v1/databases/{id}/upgrade` | Backup, stop, update, start and confirm an instance; the asynchronous shape is still being settled. |
 | `GET /api/v1/costs` | Estimated cost view. |
 
 The control-plane image also serves downloadable engine binaries as static
@@ -264,9 +268,12 @@ POST /api/v1/databases/{id}/rotate-token
 
 Rotation is authenticated with Entra, not with the instance token. That is
 intentional: rotation is needed when the instance token has been lost. Rotation
-restarts the instance and briefly interrupts connections. The new token arrives
-as an environment variable, which creates a new container revision, and the
-engine holds an exclusive lock until the outgoing process releases it.
+stops the instance, applies the new token, starts it again and confirms health.
+The new token arrives as an environment variable, which creates a new container
+revision. A rolling update cannot work here: the engine holds an exclusive lock,
+so a new revision cannot open the database while the old one is still alive. If
+the replacement does not become healthy, the control plane rolls back to the
+previous token and revision.
 
 ---
 
@@ -281,10 +288,18 @@ One Premium FileStorage NFS 4.1 share, `instances`, serves the platform. The
 mount sub-path is the instance id, so each database sees only its own directory.
 The share is 100 GiB provisioned.
 
+A scale-to-zero cold start is a state, not a data-plane failure. While Azure is
+activating an idle instance, the platform may return its own HTML placeholder;
+the control-plane proxy recognises that response, retries, and reports
+`instance_starting` rather than a generic engine error. The wake route exists for
+the console and clients that want to trigger that activation deliberately:
+`POST /api/v1/databases/{id}/wake`.
+
 `maxReplicas` is `1` on every tier. This is not a scaling preference; it follows
 from the engine. `asmdb` is a single-writer process holding an exclusive lock on
 its database. A second replica is a second engine process, and it cannot safely
-open the same files while the first one is running.
+open the same files while the first one is running. Instance updates are
+therefore stop-then-start, not rolling.
 
 ---
 
@@ -563,7 +578,7 @@ image instances run, and whether an upgrade is offered. It lives in
 ```nasm
 %define ENGINE_MAJOR 1
 %define ENGINE_MINOR 5
-%define ENGINE_PATCH 2
+%define ENGINE_PATCH 3
 ```
 
 `scripts/release.ps1` reads it and uses it as the release tag. That is not
@@ -624,22 +639,25 @@ which, without further arguments:
 
 **6 — existing databases upgrade when their owner asks**
 
-`POST /api/v1/databases/{id}/upgrade` takes a `BACKUP` first and aborts if that
-fails, then moves the container app to the new image. The volume is NFS and
-persists, so the new engine opens the existing files; if the on-disk format
-moved, the engine's own `--upgrade` path migrates them.
+`POST /api/v1/databases/{id}/upgrade` first asks the sidecar to take the
+pre-upgrade backup through `POST /v1/prepare-upgrade`, not through the generic
+exec path. If that fails, the upgrade aborts. The control plane then stops the
+app, applies the new image, starts it again and confirms health. If the new
+revision does not come up, it rolls back to the previous image. The volume is
+NFS and persists, so the new engine opens the existing files; if the on-disk
+format moved, the engine's own `--upgrade` path migrates them.
 
-Upgrading **restarts the instance and interrupts connections**. The engine holds
-an exclusive lock and runs at `maxReplicas: 1`, so the replacement cannot open
-the database until the outgoing process releases it. This is not zero-downtime
-and is not presented as such. Nobody is upgraded without asking.
+Upgrading **stops and starts the instance and interrupts connections**. This is
+not zero-downtime and is not presented as such. Nobody is upgraded without asking.
+The request shape is being moved away from a long blocking call because a
+stop/start/health-confirm cycle is too long for an ordinary synchronous request.
 
 ### Rolling back
 
 Deploy with the previous tag explicitly:
 
 ```powershell
-.\saas\infra\deploy.ps1 -Tag 1.5.0
+.\saas\infra\deploy.ps1 -Tag <previous-version>
 ```
 
 The image is still in the registry, so this points `ASMDB_IMAGE` back and the
@@ -656,11 +674,14 @@ The live database files are on the durable NFS volume. That is the durability
 mechanism that exists today beyond the engine's own `.dat`, `.wal` and `.cdc`
 files. Backup shipping, PITR and invoice-grade usage metering are not deployed.
 
-Upgrade is deliberately conservative. `POST /api/v1/databases/{id}/upgrade`
-takes a `BACKUP` before changing anything and aborts if the backup fails. The
-operation restarts the instance, so it is not seamless; active connections can
-be interrupted while the old process exits, the lock is released and the new
-revision starts.
+Upgrade is deliberately conservative. The control plane asks the sidecar to
+prepare a backup through `POST /v1/prepare-upgrade` before changing anything and
+aborts if that fails. The operation is stop-then-start, not rolling: active
+connections are interrupted, the old process exits and releases the lock, and
+only then can the new revision open the database. If the replacement does not
+become healthy, the control plane rolls back to the previous image. The public
+upgrade API is expected to become asynchronous; its final response shape is still
+being settled.
 
 ---
 
@@ -726,8 +747,8 @@ flowchart TB
 | Area | Status |
 |---|---|
 | Contracts | Landed. The control-plane and sidecar surfaces exist. |
-| Sidecar | Landed: REST CRUD, MCP over HTTP, browser `exec`, health, stats from engine + cgroups. |
-| Control plane | Landed: health, config, database create/list/delete, exec proxy, rotate, upgrade, costs. |
+| Sidecar | Landed: REST CRUD, MCP over HTTP, browser `exec`, prepare-upgrade, health with engine version and `storageFormat`, stats from engine + cgroups. |
+| Control plane | Landed: health, config, database create/list/delete, wake, exec proxy, rotate, upgrade with rollback, costs. |
 | Infrastructure | Landed: resource group, VNet, internal Container Apps environment, APIM, managed identity, Log Analytics. |
 | Private network and gateway | Landed: APIM is public; Container Apps, Blob, NFS and runtime pulls are private. |
 | Site | Landed through `GET /` on the APIM gateway. |

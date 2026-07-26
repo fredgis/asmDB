@@ -70,6 +70,11 @@ image tag; unparseable tags are reported as `unknown`, not an empty string.
 `GET /version` exposes the current platform engine/image from the configured
 `ASMDB_IMAGE`.
 
+Upgrade is becoming asynchronous; do not treat the current synchronous response
+as a stable console contract. The stable guarantees are that upgrade is refused
+when already current, pre-upgrade preparation must succeed first, the instance
+restarts, and the recorded image changes only after the replacement is healthy.
+
 ## Provisioning
 
 On create, the service generates a `db_` id, a 32-byte base64url bearer token,
@@ -85,8 +90,8 @@ configured resource group/environment. The child app receives:
 
 Ingress is internal on target port 8080. Customer data-plane traffic enters
 through APIM at `https://www.asmdb.cloud/db/<24-char-suffix>/...`; the control
-plane uses the internal Container Apps FQDN for proxy, stats, wake, backup, and
-upgrade operations. Tier resources and quotas follow the frozen contract: free
+plane uses the internal Container Apps FQDN for proxy, stats, wake,
+prepare-upgrade, and upgrade operations. Tier resources and quotas follow the current contract: free
 `0.25/0.5Gi/0..1`, standard `0.5/1Gi/0..1`, premium `1.0/2Gi/1..1`, with
 `maxReplicas: 1` on every tier. The API returns `201` once Azure accepts the
 create request; it does not wait for the app to become running.
@@ -95,3 +100,14 @@ Free and standard instances can scale to zero. The exec proxy treats Azure's
 cold-start HTML page as retryable and eventually returns `instance_starting`
 rather than forwarding HTML. Stats and list views do not wake instances;
 `POST /wake` is the explicit non-blocking warm-up trigger.
+
+Instance app updates are stop-then-start rather than rolling because the engine
+holds an exclusive lock and `maxReplicas` is 1. Token rotation and upgrade wait
+for the replacement revision to become healthy; on failure they restore the
+previous app spec. A failed rotation also restores the old token hash so the old
+token remains valid.
+
+Upgrade preparation calls the sidecar's narrow `POST /v1/prepare-upgrade` route
+with the per-instance platform token. That route must not accept caller-supplied
+engine commands or paths; the control plane aborts the upgrade on any non-OK
+prepare response.

@@ -15,6 +15,10 @@ go run .
 
 `GET /health` is unauthenticated. Data-plane routes require the instance access token. `/v1/stats` and `/v1/prepare-upgrade` also accept the narrower `ASMDB_PLATFORM_TOKEN`; prepare-upgrade is limited to one sidecar-chosen backup command.
 
+Hosted instances are reached through the control-plane prefix
+`https://www.asmdb.cloud/db/<instance>/v1/...` and MCP at
+`https://www.asmdb.cloud/db/<instance>/mcp`.
+
 ## Environment
 
 | var | default | meaning |
@@ -45,9 +49,9 @@ go run .
 
 `/v1/exec` runs one terminal command under the engine lock. `BENCH`, `BACKUP`, `RESTORE`, `VERIFY`, and `TRUNCATE` get the long command timeout; other commands use the short timeout. If the engine exits, the sidecar restarts it and backs off while waiting for the exclusive file lock.
 
-`/v1/stats` reports live rows/capacity/engine, uptime, CPU, cgroup memory, and storage. Storage includes both apparent and allocated byte counts for `.dat`, `.wal`, and `.cdc`; memory includes file, inactive-file, reclaimable, and working-set fields plus cgroup events/pressure when available.
+`/health` and `/v1/stats` report the engine version and storage format read from the engine's `VERSION` command, not a sidecar constant. `/v1/stats` also reports live rows/capacity, uptime, CPU, cgroup memory, and storage. Storage includes both apparent and allocated byte counts for `.dat`, `.wal`, and `.cdc`; memory includes file, inactive-file, reclaimable, and working-set fields plus cgroup events/pressure when available.
 
-`/v1/prepare-upgrade` takes no request body. It accepts the instance token or platform token, runs exactly `BACKUP <sidecar-chosen path>` under the engine lock, and returns `{"ok":true,"backup":{"path":"...","apparentBytes":"...","allocatedBytes":"..."},"output":[...]}`. Engine backup failures return `{"ok":false,"error":"backup_failed","detail":"...","output":[...]}` so the control plane can abort the upgrade.
+`/v1/prepare-upgrade` takes no request body. It accepts the instance token or platform token, runs exactly `BACKUP <sidecar-chosen path>` under the engine lock, and returns `{"ok":true,"backup":{"path":"...","apparentBytes":"...","allocatedBytes":"..."},"output":[...]}`. No caller-supplied value reaches the engine command. Engine backup failures return `{"ok":false,"error":"backup_failed","detail":"...","output":[...]}` so the control plane can abort the upgrade.
 
 ## Container build
 

@@ -49,9 +49,9 @@ Rules that apply everywhere:
   deletion of row 42. An input line longer than 511 bytes is refused rather than
   truncated and executed.
 - Every command response terminates with exactly one status line: `[ OK ] ...`
-  on success or `[ERR] ...` on failure. This is part of the protocol for clients
-  that drive the REPL programmatically; even `HELP`, `SCHEMA`, `VERSION` and an
-  empty `SELECT *` end with a status line.
+  on success or `[ERR] ...` on failure, in both `FORMAT TABLE` and `FORMAT TSV`.
+  This is part of the protocol for clients that drive the REPL programmatically;
+  even `HELP`, `SCHEMA`, `VERSION` and an empty `SELECT *` end with a status line.
 
 ### Sessions
 
@@ -469,12 +469,12 @@ file can be opened.
 
 ```text
 asmdb> VERSION
-  asmdb 1.5.2   (stable: the on-disk format is versioned and migratable)
+  asmdb 1.5.3   (stable: the on-disk format is versioned and migratable)
   storage format : 2
   record size    : 256 bytes
   capacity       : 4194304 slots
   platform       : Windows PE64 (kernel32)
-  written by     : engine 1.5.2
+  written by     : engine 1.5.3
 [ OK ] version shown
 ```
 

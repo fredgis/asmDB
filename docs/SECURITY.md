@@ -126,10 +126,12 @@ Comparisons are constant time.
 Tokens are not retrievable after creation. Rotation is available at
 `POST /api/v1/databases/{id}/rotate-token` and is authenticated with Entra, not
 with the instance token; that is intentional, because rotation is needed when
-the instance token is lost. Rotation restarts the instance and briefly interrupts
-connections. The new token arrives as an environment variable, which creates a
-new Container Apps revision, and the engine holds an exclusive lock until the
-old process exits.
+the instance token is lost. Rotation stops the instance, applies the new token,
+starts it again and confirms health. The new token arrives as an environment
+variable, which creates a new Container Apps revision. A rolling update cannot
+work with the engine's exclusive lock, so the old process must exit before the
+replacement can open the database; if the replacement does not become healthy,
+the control plane rolls back to the previous token and revision.
 
 ## Hosted durability and isolation
 

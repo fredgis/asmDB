@@ -5,8 +5,8 @@ the **asmdb** transactional engine as a **generic CRUD store** over MCP. Any MCP
 client can insert, update, get, delete, search, list and count rows — all backed
 by the WAL-durable x86-64 assembly engine.
 
-Current engine: **1.5.1**, storage format **2**. The binaries are 42,749 bytes
-(PE64) and 51,221 bytes (ELF64), and downloads are published at
+Current engine: **1.5.3**, storage format **2**. The binaries are 42,997 bytes
+(PE64) and 51,205 bytes (ELF64), and downloads are published at
 <https://www.asmdb.cloud/downloads/> with SHA-256 hashes in the manifest.
 
 **Agent memory is one example use case** (address each memory by a string key,
@@ -38,14 +38,18 @@ flowchart LR
 The server keeps **one long-lived `asmdb` process** for the whole session, and
 the record region is **mapped copy-on-write**, so startup is immediate and only
 the pages actually touched become resident; every tool call is then an in-memory
-hash lookup plus a small durable write. When the MCP client disconnects, the
-server shuts the engine down cleanly (no orphaned process).
+hash lookup plus a small durable write. The server relies on the 1.5.3 CLI
+guarantee that every command terminates with `[ OK ]` or `[ERR]`; older engines
+missed terminators on `HELP`, `SCHEMA`, `VERSION` and empty `SELECT *`, which
+could desynchronise a stdio reader. When the MCP client disconnects, the server
+shuts the engine down cleanly (no orphaned process).
 
 For hosted databases, every instance also speaks MCP over HTTP at
 `https://www.asmdb.cloud/db/<instance>/mcp` using the instance bearer token; REST
-is available at `/v1/rows`. See [`../docs/SAAS.md`](../docs/SAAS.md) for the
-platform details. The local engine itself has no authentication, encryption or
-audit log; those are supplied by the host around it.
+is available at `https://www.asmdb.cloud/db/<instance>/v1/rows`. See
+[`../docs/SAAS.md`](../docs/SAAS.md) for the platform details. The local engine
+itself has no authentication, encryption or audit log; those are supplied by the
+host around it.
 
 ## Addressing rows: `id` or `key`
 
@@ -122,7 +126,7 @@ platforms the default executable name is `build/asmdb`.
 
 | MCP server | Engine | Storage format | CLI protocol |
 |------------|--------|----------------|--------------|
-| 1.2.0 | 1.2.0 – 1.5.1 | 2 (`.dat` + `.wal` + `.cdc`) | REPL with `FORMAT TSV` rows (`R<TAB>…`) and `PAGE <limit> <offset>` |
+| 1.2.0 | 1.2.0 – 1.5.3 | 2 (`.dat` + `.wal` + `.cdc`) | REPL with `FORMAT TSV` rows (`R<TAB>…`) and `PAGE <limit> <offset>`; 1.5.3+ always emits a status terminator |
 | 1.1.0 | 1.1.0 | 2 (`.dat` + `.wal` + `.cdc`) | Human table parsing — content silently truncated at 39 bytes; do not use |
 | 1.0.0 | 1.0.0 | 2 (`.dat` + `.wal` + `.cdc`) | Human table parsing — content silently truncated at 39 bytes; do not use |
 

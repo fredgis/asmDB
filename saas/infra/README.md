@@ -38,7 +38,7 @@ Important migration caveat: an existing non-VNet Container Apps environment cann
 
 Options:
 
-- `-Tag <tag>` overrides the default release tag. If omitted, the script reads `ENGINE_MAJOR`/`ENGINE_MINOR`/`ENGINE_PATCH` from `src\asmdb.inc` and uses that version, currently `1.5.1`.
+- `-Tag <tag>` overrides the default release tag. If omitted, the script reads `ENGINE_MAJOR`/`ENGINE_MINOR`/`ENGINE_PATCH` from `src\asmdb.inc` and uses that version, currently `1.5.3`.
 - Each build pushes both images as `<version>` and `latest`; the control plane receives `ASMDB_IMAGE=<registry>/asmdb-instance:<version>` so upgrades compare versioned image references instead of `latest`.
 - `-SkipBuild` redeploys infrastructure and updates the Container App without rebuilding images, but first refuses if either image lacks the requested tag in ACR.
 - `-SkipApim` deploys the private network, private endpoints, internal Container Apps environment, storage, registry, identity, and control plane, but skips APIM for faster iteration.
@@ -63,3 +63,4 @@ The durable instance volume is one shared Premium Azure Files NFS 4.1 share with
 ```
 
 Use `-Force` to skip the prompt. The teardown deletes the platform resources and every `db-*` Container App, but never deletes the `<service-resource-group>` resource group.
+

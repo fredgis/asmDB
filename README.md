@@ -7,7 +7,7 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). The 1.5.2 PE64 build is 42,997 bytes;
+    <strong>and</strong> Linux (ELF64). The 1.5.3 PE64 build is 42,997 bytes;
     the last published ELF64 build is 51,221 bytes. And it is genuinely fast.
   </p>
 
@@ -458,7 +458,7 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the PE64 binary is 42,997 bytes at 1.5.2 and the last published
+which is why the PE64 binary is 42,997 bytes at 1.5.3 and the last published
 ELF64 binary is 51,221 bytes — and why a million-row database needs only a few
 MB of RAM.
 
@@ -843,7 +843,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.5.2 · 1.5.1 · 1.5.0 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.5.3 · 1.5.2 · 1.5.1 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -862,6 +862,40 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+  <summary><b>1.5.3</b> — an instance can back itself up without the platform holding a write key</summary>
+
+  Hosting only; the engine is unchanged from 1.5.2 apart from the version
+  constant.
+
+  **The upgrade path could never run.** It takes a backup before touching
+  anything and aborts when that fails — the guarantee worth keeping — but the
+  backup could not succeed. The control plane has no credential to command an
+  instance: the customer's token exists only as a hash, and the per-instance
+  platform token is confined to reading stats.
+
+  The obvious move was to widen that token. It is derived for the whole fleet
+  from one master secret, so a route that accepted it *and* could mutate data
+  would be a fleet-wide write capability behind a single key. Instead the
+  instance backs itself up, through a route that can do nothing else: the caller
+  sends no command, no path, no argument that reaches the engine, and can
+  express exactly one thing. A test asserts that property and fails loudly if
+  anyone later adds a parameter.
+
+  **Instance updates stop before they start.** Container Apps rolls updates; the
+  engine holds an exclusive lock and runs one replica. So a new revision could
+  never open the database while the old one lived, and the old one was never
+  retired because the new one never became healthy. Rotating a token returned
+  200 and a token the database rejected. Rotation and upgrade now stop the app,
+  apply, start, confirm healthy, and roll back — leaving the previous token
+  working rather than handing over one that does not.
+
+  A cold start is now a state rather than a failure. An idle instance returns
+  the platform's own HTML error page; that is recognised, retried while the
+  instance comes up, and reported as `instance_starting`.
+
+</details>
 
 <details>
   <summary><b>1.5.2</b> — every command answers, and the answer belongs to the command</summary>

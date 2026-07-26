@@ -15,7 +15,7 @@ Version `2026-07-26.1`.
 | **instance id** | `db_` + 24 lowercase base32 chars. Immutable. Also the Container App name suffix. |
 | **tier** | `free` · `standard` · `premium`. Selects CPU/memory and whether the app scales to zero. |
 | **access token** | opaque bearer string, 43 chars base64url, issued once at creation, stored hashed. |
-| **platform token** | per-instance read-only introspection bearer token derived as `HMAC-SHA256(ASMDB_PLATFORM_SECRET, instance id)`, accepted only by `/v1/stats`. |
+| **platform token** | per-instance platform bearer token derived as `HMAC-SHA256(ASMDB_PLATFORM_SECRET, instance id)`. It is accepted only by explicitly narrow platform routes: `/v1/stats` and `/v1/prepare-upgrade`. |
 
 ---
 
@@ -37,19 +37,19 @@ Base: `https://www.asmdb.cloud/api/v1`. All JSON. All errors use §5.
   "id": "db_7k2m9x4qp1va8ne03wjr5tzy",
   "name": "my-notes",
   "tier": "free",
-  "image": "<registry>.azurecr.io/asmdb-instance:1.5.1",
-  "engine": "1.5.1",
+  "image": "<registry>.azurecr.io/asmdb-instance:1.5.3",
+  "engine": "1.5.3",
   "state": "provisioning",
   "endpoint": "https://www.asmdb.cloud/db/7k2m9x4qp1va8ne03wjr5tzy",
   "token": "<shown once, never again>",
   "created_at": "2026-07-25T19:40:00Z",
   "upgradeAvailable": false,
-  "availableEngine": "1.5.1",
-  "availableImage": "<registry>.azurecr.io/asmdb-instance:1.5.1"
+  "availableEngine": "1.5.3",
+  "availableImage": "<registry>.azurecr.io/asmdb-instance:1.5.3"
 }
 ```
 
-### `GET /version` → `200 {"engine":"1.5.1","image":"<current instance image>"}`
+### `GET /version` → `200 {"engine":"1.5.3","image":"<current instance image>"}`
 ### `GET /config` → `200 {"tenantId","clientId","scope"}`
 ### `GET /costs?from=&to=` → estimated costs from Azure Monitor `Replicas`
 Entra-authenticated. If absent, `from`/`to` default to the current calendar
@@ -127,7 +127,9 @@ cold-start retry budget.
 
 The proxy retries Azure cold-start HTML for about 45 s and never returns that
 HTML body to clients. The browser can also call `POST /databases/{id}/wake` to
-start activation before the first terminal command.
+start activation before the first terminal command. `instance_starting` is a
+normal retryable state and is distinct from `stopped` and from a genuine
+upstream failure; the console renders it as "waking" rather than "broken".
 
 ### `POST /databases/{id}/wake`
 
@@ -153,6 +155,10 @@ or
 { "available": false, "reason": "stopped|instance_starting|unavailable|timeout|platform_token_unconfigured" }
 ```
 
+`instance_starting` means the platform returned the Azure stopped-app HTML page
+instead of a sidecar JSON payload. It is distinct from `stopped` (known zero
+replicas) and `unavailable` (broken, rejected, or malformed response).
+
 ### `POST /databases/{id}/rotate-token`
 
 Entra-authenticated. Generates a new instance token, updates the child Container
@@ -162,17 +168,33 @@ App's `ASMDB_TOKEN`, and returns the new token once:
 { "token": "<shown once>", "warning": "Token rotation restarts the instance and briefly interrupts active connections." }
 ```
 
-If the Container App update fails, metadata is restored to the previous hash so
-the old token still works.
+Instance Container App changes are **stop-then-start**, not rolling. The
+outgoing replica is stopped first so the single-writer engine releases its file
+lock, the new revision is started, and readiness is confirmed before success is
+reported. If the replacement does not become healthy, the previous app spec and
+metadata are restored and the **old token remains the working token**.
 
 ### `POST /databases/{id}/upgrade`
 
 Entra-authenticated. Refused with `409 no_upgrade` when the instance already
-uses the current tagged image. Otherwise it runs `BACKUP` first, updates the
-Container App image in place, waits for Azure to report the revision healthy,
-and records the new image only after success. It is not zero-downtime: the
-instance restarts and active connections are interrupted. A stopped instance is
-deliberately started so the backup can run before the image change.
+uses the current tagged image. The long-running upgrade API is moving to an
+asynchronous shape so the console can poll state; that final response shape is
+not settled yet and clients must not depend on the current synchronous response.
+
+The required operation is:
+
+1. Call the sidecar's narrow `POST /v1/prepare-upgrade` route with the
+   per-instance platform token. Anything other than success aborts the upgrade
+   before the Container App is touched.
+2. Apply the new image with the same stop-then-start sequence used by token
+   rotation. This is not zero-downtime: the instance restarts and active
+   connections are interrupted.
+3. Record the new image only after the replacement revision is healthy. If the
+   replacement does not become healthy, roll back to the previous app spec and
+   leave the recorded image unchanged.
+
+A stopped instance is deliberately started to prepare the upgrade rather than
+silently skipping the pre-upgrade snapshot.
 
 ### Instance states
 
@@ -213,11 +235,11 @@ Configuration arrives as `ASMDB_ENTRA_TENANT_ID`, `ASMDB_ENTRA_CLIENT_ID` and
 
 ## 3. Data-plane API (the sidecar, one per instance)
 
-Base: the instance `endpoint`. Except for `/health`, routes require the instance access token in the `Authorization` header. `/v1/stats` also accepts the platform token.
+Base: the instance `endpoint`. Except for `/health`, routes require the instance access token in the `Authorization` header. `/v1/stats` and `/v1/prepare-upgrade` also accept the platform token.
 
 | Route | Body | Success |
 |---|---|---|
-| `GET /health` | — | `200 {"status":"ok","engine":"1.5.1","rows":<n>}` — **no auth** |
+| `GET /health` | — | `200 {"status":"ok","engine":"1.5.3","storageFormat":"<n>","rows":<n>}` — **no auth** |
 | `GET /v1/rows?limit=&offset=` | — | `200 {"rows":[Row],"count":<n>,"hasMore":<bool>,"nextOffset":<n>}` |
 | `GET /v1/rows/{id}` | — | `200 {"row":Row}` / `404` |
 | `POST /v1/rows` | `Row` without timestamps | `201 {"row":Row}` |
@@ -229,12 +251,50 @@ Base: the instance `endpoint`. Except for `/health`, routes require the instance
 | `POST /v1/verify` | — | `200 {"ok":<bool>,"detail":"<engine output>"}` |
 | `POST /v1/exec` | `{"command":"<one line>"}` | `200 {"output":[<lines>],"ok":<bool>}` |
 | `GET /v1/stats` | — | `200` live stats payload; instance token or platform token |
+| `POST /v1/prepare-upgrade` | ignored | `200 {"ok":true,"backup":{...},"output":[...]}` or `200 {"ok":false,"error":"backup_failed","detail":"...","output":[...]}`; instance token or platform token |
 | `POST /mcp` | MCP streamable-HTTP | the MCP session |
 
 `limit` default 100, max 1000. `offset` default 0.
 
-`/v1/stats` is the only route that accepts the platform token. That token is
-not accepted for CRUD, `/v1/exec`, `/v1/verify`, or `/mcp`.
+`/health` reports the engine version and storage format read from the engine's
+own `VERSION` output, not from the image tag or a sidecar constant. If the
+engine output cannot be parsed, those fields are `"unknown"`.
+
+`/v1/stats` is read-only introspection. `/v1/prepare-upgrade` is the only
+non-read route that accepts the platform token. It is safe for the platform
+token only because no caller-supplied value reaches the engine: the sidecar
+chooses the backup path and runs exactly one operation, a pre-upgrade `BACKUP`
+to a durable file. It must never become a generic command runner. The platform
+token is not accepted for CRUD, `/v1/exec`, `/v1/verify`, or `/mcp`.
+
+Prepare-upgrade success:
+
+```json
+{
+  "ok": true,
+  "backup": {
+    "path": "/data/main.pre-upgrade.20260726T130000.000000000Z.bak",
+    "apparentBytes": "1073741824",
+    "allocatedBytes": "1073741824"
+  },
+  "output": ["[ OK ] backup"]
+}
+```
+
+Prepare-upgrade backup failure is still HTTP 200 so the caller can distinguish
+an engine-level backup refusal from transport/auth failure:
+
+```json
+{
+  "ok": false,
+  "error": "backup_failed",
+  "detail": "<engine detail>",
+  "output": ["[ERR] ..."]
+}
+```
+
+The control plane aborts upgrade on any non-2xx response, malformed response,
+or `{"ok":false}`.
 
 Stats shape:
 
@@ -242,7 +302,8 @@ Stats shape:
 {
   "rows": "1",
   "capacity": "4194304",
-  "engine": "1.5.1",
+  "engine": "1.5.3",
+  "storageFormat": "1",
   "uptimeSeconds": 123,
   "storage": {
     "dataBytes": "1073741824",
@@ -441,4 +502,3 @@ deployment finds the same registry instead of creating a second one.
 | `saas/infra/` | Agent I |
 | `site/` | orchestrator only |
 | `src/`, `tests/`, `docs/`, `mcp/`, `README.md` | orchestrator only — **do not touch** |
-
