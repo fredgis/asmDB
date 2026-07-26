@@ -841,7 +841,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.5.0 · 1.4.0 · 1.3.1 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.5.1 · 1.5.0 · 1.4.0 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -860,6 +860,34 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+  <summary><b>1.5.1</b> — a slow command no longer leaves a hosted instance dead</summary>
+
+  Found by benchmarking a live hosted instance rather than by reading the code.
+  `BENCH 10000` on a quarter of a core takes longer than the sidecar's fixed
+  30-second command timer, so the sidecar killed the engine, then started a
+  replacement while the process it had just killed still held the exclusive
+  lock. The replacement exited with `database is locked by another process`,
+  which triggered another restart, immediately — dozens of cycles a second, and
+  the instance never came back. A plain `COUNT` failed afterwards too.
+
+  Two faults, and the second is the serious one. A single timeout for every
+  command punished the ones that are legitimately long — `BENCH`, but equally
+  `BACKUP`, `RESTORE`, `VERIFY` and `TRUNCATE` on a populated table. And the
+  restart raced a dying process for its own lock, with no backoff and no
+  ceiling, which is what turned a slow command into a permanently broken
+  database.
+
+  Commands now get a budget chosen by what they are, a restart waits for the
+  previous process to exit before claiming the lock, retries back off, and a run
+  of failures makes the instance report itself unhealthy instead of spinning.
+  Exceeding a budget no longer kills the engine by itself.
+
+  **The engine is unchanged.** This release is the hosting layer around it; the
+  `.asm` tree is identical to 1.5.0 apart from the version constant.
+
+</details>
 
 <details>
 <summary><b>1.5.0</b> — change-log retention, and a command line that survives a space</summary>

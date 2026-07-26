@@ -84,10 +84,10 @@ Write-Step "Releasing asmdb $tag"
 
 if (-not $SkipTests) {
     Write-Step 'Building and testing locally'
-    & powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\build.ps1') | Out-Host
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\build.ps1') | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'Build failed. Nothing was published.' }
 
-    $smoke = & powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'tests\smoke.ps1') -NoBuild 2>&1
+    $smoke = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'tests\smoke.ps1') -NoBuild 2>&1
     $smoke | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'The smoke suite failed. Nothing was published.' }
 
@@ -112,7 +112,7 @@ if ($WhatIf) {
 # ---------------------------------------------------------------- publish ----
 
 Write-Step 'Publishing'
-& powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'saas\infra\deploy.ps1') -Tag $tag | Out-Host
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'saas\infra\deploy.ps1') -Tag $tag | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'Deployment failed.' }
 
 # ----------------------------------------------------------------- report ----
