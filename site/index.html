@@ -26,7 +26,7 @@
       <img class="nav__logo" src="assets/logo.png" alt="" width="26" height="26">
       <span class="nav__word">asmdb</span>
     </a>
-    <span class="nav__ver mono">v1.5.0</span>
+    <span class="nav__ver mono" id="nav-version" hidden></span>
     <div class="nav__links">
       <a href="#engine">engine</a>
       <a href="#mcp">mcp</a>
@@ -46,7 +46,7 @@
   <div class="shell hero__in">
     <div class="hero__grid">
       <div>
-        <p class="hero__eyebrow mono"><span class="dot" aria-hidden="true"></span> engine 1.5.0 · storage format 2 · 151 tests green</p>
+        <p class="hero__eyebrow mono" id="hero-version"><span class="dot" aria-hidden="true"></span> loading engine version</p>
 
         <h1 class="hero__h">Forty kilobytes.<br>A real database.</h1>
 
@@ -648,6 +648,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
           </div>
           <div class="console-actions database-heading__actions">
             <button class="btn btn--primary" id="load-sample" type="button">Load sample data</button>
+            <button class="btn btn--ghost" id="upgrade-db" type="button" hidden>Upgrade database</button>
             <button class="btn btn--ghost btn--danger" id="delete-db" type="button">Delete database</button>
             <a class="btn btn--ghost" href="#console-access">Change database</a>
           </div>
@@ -698,6 +699,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
               <div class="metric">
                 <p class="metric__k">memory</p>
                 <p class="metric__v" id="metric-memory">No sample yet</p>
+                <p class="metric__hint" id="metric-memory-detail">working set, not reclaimable page cache</p>
                 <p class="metric__hint" id="metric-storage">allocated storage —</p>
               </div>
             </div>
@@ -841,7 +843,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
       </div>
     </div>
     <div class="foot__base">
-      <span>Engine 1.5.0 · storage format 2 · MIT licence</span>
+      <span id="foot-version">Engine version loading · MIT licence</span>
       <span>Numbers on this page are measured on one machine and reproducible from the repository.</span>
     </div>
   </div>

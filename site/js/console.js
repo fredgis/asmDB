@@ -39,7 +39,11 @@
   var rowsMeter = id("rows-meter");
   var metricCpu = id("metric-cpu");
   var metricMemory = id("metric-memory");
+  var metricMemoryDetail = id("metric-memory-detail");
   var metricStorage = id("metric-storage");
+  var navVersion = id("nav-version");
+  var heroVersion = id("hero-version");
+  var footVersion = id("foot-version");
   var termDbId = id("term-db-id");
   var termState = id("term-state");
   var termMeta = id("term-meta");
@@ -49,6 +53,7 @@
   var termCommand = id("term-command");
   var termSend = id("term-send");
   var loadSampleBtn = id("load-sample");
+  var upgradeDbBtn = id("upgrade-db");
   var deleteDbBtn = id("delete-db");
   var benchSize = id("bench-size");
   var benchRun = id("bench-run");
@@ -65,6 +70,7 @@
   var currentDb = null;
   var tokenById = Object.create(null);
   var transcript = [];
+  var terminalDbId = "";
   var history = [];
   var historyAt = 0;
   var statsPrevious = Object.create(null);
@@ -146,7 +152,7 @@
     listBtn.disabled = on;
     if (btn) { btn.textContent = on ? label : btn.dataset.label; }
   }
-  [createBtn, listBtn, authSignIn, authSignOut, saveToken, loadSampleBtn, deleteDbBtn, benchRun].forEach(function (b) {
+  [createBtn, listBtn, authSignIn, authSignOut, saveToken, loadSampleBtn, upgradeDbBtn, deleteDbBtn, benchRun].forEach(function (b) {
     if (b) { b.dataset.label = b.textContent; }
   });
 
@@ -350,6 +356,31 @@
       .then(renderBinaries)
       .catch(renderBinariesUnavailable);
   }
+  function renderVersion(data) {
+    var engine = data && data.engine;
+    if (!engine) {
+      if (navVersion) { navVersion.hidden = true; navVersion.textContent = ""; }
+      if (heroVersion) { heroVersion.innerHTML = '<span class="dot" aria-hidden="true"></span> engine version unavailable'; }
+      if (footVersion) { footVersion.textContent = "Engine version unavailable · MIT licence"; }
+      return;
+    }
+    if (navVersion) {
+      navVersion.textContent = "v" + engine;
+      navVersion.hidden = false;
+    }
+    if (heroVersion) {
+      heroVersion.innerHTML = '<span class="dot" aria-hidden="true"></span> engine ' + esc(engine);
+    }
+    if (footVersion) {
+      footVersion.textContent = "Engine " + engine + " · MIT licence";
+    }
+  }
+  function loadVersion() {
+    fetch(API + "/version", { headers: { "accept": "application/json" } })
+      .then(jsonFromResponse)
+      .then(renderVersion)
+      .catch(function () { renderVersion(null); });
+  }
   function formatBytes(value) {
     if (value == null || value === "") { return "—"; }
     var n;
@@ -419,6 +450,7 @@
       : "Stats unavailable for the selected database.";
     metricCpu.textContent = "—";
     metricMemory.textContent = label === "asleep" ? "asleep" : "No sample";
+    if (metricMemoryDetail) { metricMemoryDetail.textContent = label === "asleep" ? "working set unavailable while asleep" : "working set unavailable"; }
     metricStorage.textContent = "allocated storage —";
     setRowsMeter("0", "0");
   }
@@ -428,6 +460,7 @@
     metricRowsHint.textContent = "Open a database from Access to request stats.";
     metricCpu.textContent = "—";
     metricMemory.textContent = "No database selected";
+    if (metricMemoryDetail) { metricMemoryDetail.textContent = "working set unavailable"; }
     metricStorage.textContent = "allocated storage —";
     setRowsMeter("0", "0");
   }
@@ -440,6 +473,7 @@
       metricRowsHint.textContent = "Rows are shown against capacity when the first stats sample arrives.";
       metricCpu.textContent = "—";
       metricMemory.textContent = "No sample yet";
+      if (metricMemoryDetail) { metricMemoryDetail.textContent = "waiting for working set sample"; }
       metricStorage.textContent = "allocated storage —";
       setRowsMeter("0", "0");
       return;
@@ -453,7 +487,12 @@
     metricRows.textContent = formatDecimalString(rows) + " / " + formatDecimalString(capacity);
     metricRowsHint.textContent = rowsPercent == null ? "capacity unavailable" : rowsPercent.toFixed(rowsPercent < 1 ? 2 : 1) + " % of row capacity";
     setRowsMeter(rows, capacity);
-    metricMemory.textContent = formatBytes((stats.memory || {}).usedBytes) + " / " + formatBytes((stats.memory || {}).limitBytes);
+    var memory = stats.memory || {};
+    var workingSet = memory.workingSetBytes != null && memory.workingSetBytes !== "" ? memory.workingSetBytes : memory.usedBytes;
+    metricMemory.textContent = formatBytes(workingSet) + " working set / " + formatBytes(memory.limitBytes);
+    if (metricMemoryDetail) {
+      metricMemoryDetail.textContent = "total " + formatBytes(memory.usedBytes) + "; reclaimable " + formatBytes(memory.reclaimableBytes);
+    }
     metricStorage.textContent = "allocated storage " + formatBytes((stats.storage || {}).dataBytes);
     metricCpu.textContent = cpuText(db.id, stats.cpu || {});
   }
@@ -479,6 +518,7 @@
       selectedDbId.textContent = "choose an instance before previewing rows or running CLI commands";
       databaseViewName.textContent = "no database selected";
       databaseViewMeta.textContent = "Open a database from Access before previewing data.";
+      if (upgradeDbBtn) { upgradeDbBtn.hidden = true; }
       return;
     }
     selectedDbName.textContent = databaseLabel(currentDb);
@@ -487,6 +527,14 @@
     databaseViewMeta.textContent = currentDb.endpoint
       ? currentDb.id + " · " + (currentDb.state || "state") + " · " + currentDb.endpoint
       : currentDb.id + " · " + (currentDb.state || "state");
+    if (upgradeDbBtn) {
+      if (currentDb.upgradeAvailable) {
+        upgradeDbBtn.hidden = false;
+        upgradeDbBtn.textContent = currentDb.availableEngine ? "Upgrade to " + currentDb.availableEngine : "Upgrade database";
+      } else {
+        upgradeDbBtn.hidden = true;
+      }
+    }
   }
   function renderDatabases() {
     dbListStatus.textContent = databases.length ? String(databases.length) : "empty";
@@ -515,13 +563,17 @@
   }
   function selectDatabase(db, options) {
     options = options || {};
-    currentDb = db ? Object.assign({}, db) : null;
+    var previousId = currentDb && currentDb.id;
+    var nextId = db && db.id;
+    var refreshOnly = !!options.refresh || (previousId && nextId && previousId === nextId && options.reset !== true);
+    currentDb = db ? Object.assign({}, currentDb && currentDb.id === db.id ? currentDb : {}, db) : null;
     if (currentDb && tokenById[currentDb.id]) { currentDb.token = tokenById[currentDb.id]; }
     if (currentDb && !currentDb.token) { termToken.value = ""; }
     updateSelectedChrome();
     renderDatabases();
+    if (refreshOnly) { return; }
     renderStats(currentDb, null);
-    showTerminal(currentDb);
+    showTerminal(currentDb, { reset: true });
     if (currentDb && options.route) { setHash(options.route); }
   }
   function renderPreviewMessage(message) {
@@ -587,8 +639,9 @@
         databases = (data && data.databases) || [];
         databases.forEach(function (db) { if (db.token) { tokenById[db.id] = db.token; } });
         var selected = currentDb && findDb(currentDb.id);
+        var refreshingSelected = !!selected;
         if (!selected && options.selectFirst && databases.length) { selected = databases[0]; }
-        if (selected) { selectDatabase(selected); }
+        if (selected) { selectDatabase(selected, { refresh: refreshingSelected }); }
         else { renderDatabases(); }
         say(databases.length ? "Ready. Use Access to choose a database, or Create to provision another." : "Ready. Create a database or refresh Access.", "ok");
       })
@@ -673,25 +726,40 @@
     if (transcript.length > 700) { transcript = transcript.slice(transcript.length - 700); }
     paintTerminal();
   }
-  function showTerminal(db) {
+  function showTerminal(db, options) {
+    options = options || {};
     if (!db) {
       termDbId.textContent = "no database selected";
       termMeta.textContent = "Open a database from Access before running commands.";
       termCommand.disabled = true;
       termSend.disabled = true;
       setTerminalState("no database");
-      transcript = [bannerMarkup, "", esc("asmdb> open a database from Access")];
-      paintTerminal();
+      if (terminalDbId || options.reset || !transcript.length) {
+        terminalDbId = "";
+        transcript = [bannerMarkup, "", esc("asmdb> open a database from Access")];
+        paintTerminal();
+      }
       return;
     }
     termDbId.textContent = databaseLabel(db) + " (" + db.id + ")";
     termMeta.textContent = "Selected " + db.id + ". Commands use the instance token, not the Entra token.";
     if (instanceToken()) { termToken.value = instanceToken(); }
-    termCommand.disabled = false;
-    termSend.disabled = false;
-    setTerminalState(isAsleep(db) ? "asleep" : "ready");
-    transcript = [bannerMarkup, "", esc("database " + db.id)];
-    paintTerminal();
+    // A command in flight owns the terminal's state and its input. A poll that
+    // lands mid-command must not flip "running" back to "ready", nor re-enable
+    // controls the command handler deliberately disabled — that is the flicker
+    // the five-second refresh used to cause. Only a refresh can be pre-empted
+    // this way; selecting a database always takes the controls back.
+    var busy = options.refresh && termCommand.disabled;
+    if (!busy) {
+      termCommand.disabled = false;
+      termSend.disabled = false;
+      setTerminalState(isAsleep(db) ? "asleep" : "ready");
+    }
+    if (options.reset || terminalDbId !== db.id || !transcript.length) {
+      terminalDbId = db.id;
+      transcript = [bannerMarkup, "", esc("database " + db.id)];
+      paintTerminal();
+    }
   }
   function execRequest(command) {
     return withColdRetry(function () {
@@ -797,7 +865,9 @@
   function runCommandsInOrder(commands, index, outputs) {
     outputs = outputs || [];
     if (index >= commands.length) { return Promise.resolve(outputs); }
+    writeTerminal(["asmdb> " + commands[index]]);
     return execRequest(commands[index]).then(function (d) {
+      writeTerminal((d.output || []).concat([""]));
       outputs.push({ command: commands[index], data: d });
       return runCommandsInOrder(commands, index + 1, outputs);
     });
@@ -814,6 +884,7 @@
     loadSampleBtn.disabled = true;
     previewStatus.textContent = "loading";
     renderPreviewMessage("Loading sample data into " + databaseLabel(currentDb) + "…");
+    writeTerminal(["loading sample data into " + databaseLabel(currentDb), ""]);
     runCommandsInOrder(sampleCommands(), 0)
       .then(function () {
         previewStatus.textContent = "loading";
@@ -825,6 +896,28 @@
         renderPreviewMessage((e && e.message) || "Sample load failed.");
       })
       .then(function () { loadSampleBtn.disabled = false; });
+  }
+  function upgradeCurrentDatabase() {
+    if (!currentDb || !currentDb.upgradeAvailable) { return; }
+    upgradeDbBtn.disabled = true;
+    upgradeDbBtn.textContent = "upgrading…";
+    say("Upgrading " + esc(databaseLabel(currentDb)) + ". The instance restarts during the upgrade.");
+    request("/databases/" + encodeURIComponent(currentDb.id) + "/upgrade", { method: "POST" })
+      .then(function (data) {
+        var upgraded = data && data.database;
+        if (upgraded) {
+          var existing = findDb(upgraded.id);
+          if (existing) { Object.assign(existing, upgraded); }
+          selectDatabase(upgraded, { refresh: true });
+        }
+        say("Upgrade complete. " + esc((data && data.warning) || ""), "ok");
+        return loadDatabases({ selectFirst: false });
+      })
+      .catch(fail)
+      .then(function () {
+        upgradeDbBtn.disabled = false;
+        updateSelectedChrome();
+      });
   }
   function deleteCurrentDatabase() {
     if (!currentDb) { setHash("#console-access"); return; }
@@ -950,6 +1043,7 @@
     if (activeView === "database") { loadPreview(); }
   });
   loadSampleBtn.addEventListener("click", loadSampleData);
+  upgradeDbBtn.addEventListener("click", upgradeCurrentDatabase);
   deleteDbBtn.addEventListener("click", deleteCurrentDatabase);
   benchRun.addEventListener("click", runBench);
   authSignIn.addEventListener("click", signIn);
@@ -993,6 +1087,7 @@
   renderStats(null, null);
   showTerminal(null);
   applyRoute();
+  loadVersion();
   loadBinaries();
 
   showSignedOut("Loading sign-in configuration…", "The public site remains available while the console checks Entra configuration.", "");
