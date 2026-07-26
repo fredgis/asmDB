@@ -17,12 +17,15 @@ import (
 )
 
 const (
-	statsRequestTimeout = 2 * time.Second
-	statsListTimeout    = 3 * time.Second
-	healthCheckTimeout  = 3 * time.Second
-	backupTimeout       = 30 * time.Second
-	costMaxWindow       = 31 * 24 * time.Hour
-	costMetricGrain     = 15 * time.Minute
+	statsRequestTimeout  = 2 * time.Second
+	statsListTimeout     = 3 * time.Second
+	healthCheckTimeout   = 3 * time.Second
+	backupTimeout        = 30 * time.Second
+	execColdStartBudget  = 45 * time.Second
+	execColdStartBackoff = 2 * time.Second
+	wakeRequestTimeout   = 2 * time.Second
+	costMaxWindow        = 31 * 24 * time.Hour
+	costMetricGrain      = 15 * time.Minute
 )
 
 var (
@@ -32,13 +35,16 @@ var (
 )
 
 type api struct {
-	store       store
-	provisioner provisioner
-	cfg         config
-	verifier    accessTokenVerifier
-	httpClient  *http.Client
-	statsClient *http.Client
-	now         func() time.Time
+	store            store
+	provisioner      provisioner
+	cfg              config
+	verifier         accessTokenVerifier
+	httpClient       *http.Client
+	statsClient      *http.Client
+	wakeClient       *http.Client
+	execRetryBudget  time.Duration
+	execRetryBackoff time.Duration
+	now              func() time.Time
 }
 
 type databaseResponse struct {
@@ -96,13 +102,16 @@ type versionResponse struct {
 
 func newAPI(store store, provisioner provisioner, cfg config, verifier accessTokenVerifier) *api {
 	return &api{
-		store:       store,
-		provisioner: provisioner,
-		cfg:         cfg,
-		verifier:    verifier,
-		httpClient:  &http.Client{Timeout: 60 * time.Second},
-		statsClient: &http.Client{Timeout: statsRequestTimeout},
-		now:         func() time.Time { return time.Now().UTC() },
+		store:            store,
+		provisioner:      provisioner,
+		cfg:              cfg,
+		verifier:         verifier,
+		httpClient:       &http.Client{Timeout: 60 * time.Second},
+		statsClient:      &http.Client{Timeout: statsRequestTimeout},
+		wakeClient:       &http.Client{Timeout: wakeRequestTimeout},
+		execRetryBudget:  execColdStartBudget,
+		execRetryBackoff: execColdStartBackoff,
+		now:              func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -183,6 +192,10 @@ func (a *api) handleDatabase(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "upgrade" {
 		a.handleUpgrade(w, r, parts[0])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "wake" {
+		a.handleWake(w, r, parts[0])
 		return
 	}
 	if len(parts) != 1 || !idPattern.MatchString(parts[0]) {
@@ -504,6 +517,61 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 	})
 }
 
+func (a *api) handleWake(w http.ResponseWriter, r *http.Request, id string) {
+	if !idPattern.MatchString(id) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	if !a.authorized(w, r) {
+		return
+	}
+	in, err := a.store.Get(r.Context(), id)
+	if errors.Is(err, errNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		return
+	}
+	state, err := a.provisioner.GetState(r.Context(), in)
+	if err != nil {
+		state = liveState{State: "unknown", Error: err.Error()}
+	}
+	a.triggerWake(in)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":    in.ID,
+		"state": state.State,
+		"error": state.Error,
+	})
+}
+
+func (a *api) triggerWake(in instance) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), wakeRequestTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.provisioner.InternalEndpoint(in), "/")+"/health", nil)
+		if err != nil {
+			return
+		}
+		if a.cfg.PlatformSecret != "" {
+			req.Header.Set("Authorization", "Bearer "+derivePlatformToken(a.cfg.PlatformSecret, in.ID))
+		}
+		resp, err := a.wakeClient.Do(req)
+		if err == nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+}
+
 func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
 	if !idPattern.MatchString(id) {
 		writeError(w, http.StatusNotFound, "not_found", "database not found", "")
@@ -550,11 +618,31 @@ func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
+	deadline := time.Now().Add(a.execRetryBudget)
+	for {
+		out, retry, status, code, message, detail := a.execOnce(r.Context(), in, token, body)
+		if status == http.StatusOK {
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if !retry || time.Now().Add(a.execRetryBackoff).After(deadline) {
+			writeError(w, status, code, message, detail)
+			return
+		}
+		select {
+		case <-time.After(a.execRetryBackoff):
+		case <-r.Context().Done():
+			writeError(w, http.StatusGatewayTimeout, "instance_starting", "instance is starting; retry shortly", "request cancelled while waiting for instance startup")
+			return
+		}
+	}
+}
+
+func (a *api) execOnce(ctx context.Context, in instance, token string, body []byte) (execResponse, bool, int, string, string, string) {
 	upstreamURL := strings.TrimRight(a.provisioner.InternalEndpoint(in), "/") + "/v1/exec"
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway", "instance unreachable", err.Error())
-		return
+		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance unreachable", err.Error()
 	}
 	upstreamReq.Header.Set("Authorization", "Bearer "+token)
 	upstreamReq.Header.Set("Content-Type", "application/json")
@@ -562,32 +650,33 @@ func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
 	resp, err := a.httpClient.Do(upstreamReq)
 	if err != nil {
 		if isTimeoutError(err) {
-			writeError(w, http.StatusGatewayTimeout, "gateway_timeout", "instance timed out", "")
-			return
+			return execResponse{}, false, http.StatusGatewayTimeout, "gateway_timeout", "instance timed out", ""
 		}
-		writeError(w, http.StatusBadGateway, "bad_gateway", "instance unreachable", err.Error())
-		return
+		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance unreachable", summarizeError(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		writeError(w, http.StatusBadGateway, "bad_gateway", "instance returned an error", resp.Status)
-		return
-	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway", "read instance response", err.Error())
-		return
+		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "read instance response", err.Error()
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if isAzureColdStartResponse(resp.StatusCode, contentType, data) {
+		return execResponse{}, true, http.StatusGatewayTimeout, "instance_starting", "instance is starting; retry shortly", "Azure Container Apps reports the instance is stopped or not ready"
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance returned an error", resp.Status
+	}
+	if !strings.Contains(strings.ToLower(contentType), "json") && contentType != "" {
+		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance returned non-JSON response", summarizeContentType(contentType)
 	}
 	var out execResponse
 	if err := json.Unmarshal(data, &out); err != nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway", "instance returned invalid JSON", err.Error())
-		return
+		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance returned invalid JSON", err.Error()
 	}
 	if out.Output == nil {
-		writeError(w, http.StatusBadGateway, "bad_gateway", "instance returned invalid response", "")
-		return
+		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance returned invalid response", ""
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out, false, http.StatusOK, "", "", ""
 }
 
 func (a *api) fetchStatsForList(ctx context.Context, instances []instance) map[string]statsResponse {
@@ -652,11 +741,20 @@ func (a *api) fetchStats(ctx context.Context, in instance) statsResponse {
 		return unavailableStats("unavailable")
 	}
 	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return unavailableStats("unavailable")
+	}
+	if isAzureColdStartResponse(resp.StatusCode, resp.Header.Get("Content-Type"), data) {
+		return unavailableStats("instance_starting")
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return unavailableStats("unavailable")
 	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil || !json.Valid(data) {
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") && resp.Header.Get("Content-Type") != "" {
+		return unavailableStats("unavailable")
+	}
+	if !json.Valid(data) {
 		return unavailableStats("unavailable")
 	}
 	return statsResponse{Available: true, Stats: json.RawMessage(data)}
@@ -844,6 +942,31 @@ func isTimeoutError(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isAzureColdStartResponse(status int, contentType string, body []byte) bool {
+	if status != http.StatusNotFound && status != http.StatusServiceUnavailable {
+		return false
+	}
+	lowerType := strings.ToLower(contentType)
+	lowerBody := strings.ToLower(string(body))
+	return strings.Contains(lowerType, "html") &&
+		(strings.Contains(lowerBody, "azure container app - unavailable") ||
+			strings.Contains(lowerBody, "container app is stopped or does not exist"))
+}
+
+func summarizeContentType(contentType string) string {
+	if contentType == "" {
+		return "missing Content-Type"
+	}
+	return "Content-Type: " + contentType
+}
+
+func summarizeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func sameOrigin(origin, host string) bool {

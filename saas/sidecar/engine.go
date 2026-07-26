@@ -14,6 +14,16 @@ import (
 	"time"
 )
 
+var (
+	shortCommandTimeout     = 30 * time.Second
+	longCommandTimeout      = 30 * time.Minute
+	engineUnresponsiveGrace = 30 * time.Second
+	restartInitialBackoff   = 200 * time.Millisecond
+	restartMaxBackoff       = 5 * time.Second
+	restartMaxAttempts      = 6
+	restartSleep            = time.Sleep
+)
+
 type waitMode int
 
 const (
@@ -35,6 +45,9 @@ type Engine struct {
 	done    chan struct{}
 	gen     uint64
 	closed  bool
+
+	lastStartErr string
+	failedStarts int
 }
 
 func NewEngine(bin, data, name string) (*Engine, error) {
@@ -149,7 +162,7 @@ func (e *Engine) ensureStartedLocked() error {
 	if ready {
 		return nil
 	}
-	return e.startLocked()
+	return e.startWithBackoffLocked("engine not running")
 }
 
 func (e *Engine) startLocked() error {
@@ -172,6 +185,60 @@ func (e *Engine) startLocked() error {
 		return fmt.Errorf("database upgrade swap failed: %w", err)
 	}
 	return e.startEngineLocked(db)
+}
+
+func (e *Engine) startWithBackoffLocked(reason string) error {
+	backoff := restartInitialBackoff
+	var last error
+	for attempt := 1; attempt <= restartMaxAttempts; attempt++ {
+		if err := e.startLocked(); err != nil {
+			last = err
+			e.setStartUnhealthyLocked(err)
+			logJSON("error", "engine_start_failed", map[string]any{
+				"attempt": attempt,
+				"max":     restartMaxAttempts,
+				"reason":  reason,
+				"error":   err.Error(),
+			})
+			if attempt == restartMaxAttempts {
+				break
+			}
+			restartSleep(backoff)
+			backoff *= 2
+			if backoff > restartMaxBackoff {
+				backoff = restartMaxBackoff
+			}
+			continue
+		}
+		e.setStartHealthyLocked()
+		return nil
+	}
+	if last == nil {
+		last = errors.New("engine failed to start")
+	}
+	return last
+}
+
+func (e *Engine) setStartHealthyLocked() {
+	e.stateMu.Lock()
+	e.lastStartErr = ""
+	e.failedStarts = 0
+	e.stateMu.Unlock()
+}
+
+func (e *Engine) setStartUnhealthyLocked(err error) {
+	e.stateMu.Lock()
+	e.failedStarts++
+	if err != nil {
+		e.lastStartErr = err.Error()
+	}
+	e.stateMu.Unlock()
+}
+
+func (e *Engine) healthError() string {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.lastStartErr
 }
 
 func (e *Engine) startEngineLocked(db string) error {
@@ -249,14 +316,21 @@ func (e *Engine) clearFailedStartLocked(cmd *exec.Cmd) {
 func (e *Engine) restartLocked(reason string) {
 	logJSON("warn", "engine_restarting", map[string]any{"reason": reason})
 	e.stateMu.Lock()
-	cmd := e.cmd
+	cmd, done := e.cmd, e.done
 	e.cmd, e.stdin, e.lines, e.done = nil, nil, nil, nil
 	e.gen++
 	e.stateMu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				logJSON("error", "engine_exit_wait_timeout", map[string]any{"reason": reason})
+			}
+		}
 	}
-	if err := e.startLocked(); err != nil {
+	if err := e.startWithBackoffLocked(reason); err != nil {
 		logJSON("error", "engine_restart_failed", map[string]any{"error": err.Error()})
 	}
 }
@@ -276,8 +350,9 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 		return nil, err
 	}
 
-	timer := time.NewTimer(30 * time.Second)
+	timer := time.NewTimer(commandTimeout(line))
 	defer timer.Stop()
+	budgetExpired := false
 	out := []string{}
 	for {
 		select {
@@ -301,18 +376,44 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 				return out, nil
 			}
 		case <-timer.C:
-			e.restartLocked("command timeout")
-			return out, EngineError{Detail: "engine command timed out after 30s"}
+			if !budgetExpired {
+				budgetExpired = true
+				logJSON("warn", "engine_command_over_budget", map[string]any{
+					"command": firstCommandToken(line),
+					"budget":  commandTimeout(line).String(),
+				})
+				timer.Reset(engineUnresponsiveGrace)
+				continue
+			}
+			e.restartLocked("engine unresponsive after command timeout")
+			return out, EngineError{Detail: "engine command exceeded its timeout and then stopped responding"}
 		case <-ctx.Done():
 			return out, ctx.Err()
 		}
 	}
 }
 
+func commandTimeout(line string) time.Duration {
+	switch firstCommandToken(line) {
+	case "BENCH", "BACKUP", "RESTORE", "VERIFY", "TRUNCATE":
+		return longCommandTimeout
+	default:
+		return shortCommandTimeout
+	}
+}
+
+func firstCommandToken(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToUpper(fields[0])
+}
+
 func (e *Engine) watch(cmd *exec.Cmd, done chan struct{}) {
 	err := cmd.Wait()
 	e.stateMu.Lock()
-	shouldRestart := !e.closed
+	shouldRestart := !e.closed && e.cmd == cmd
 	if e.cmd == cmd {
 		e.cmd, e.stdin, e.lines, e.done = nil, nil, nil, nil
 		e.gen++
@@ -325,14 +426,13 @@ func (e *Engine) watch(cmd *exec.Cmd, done chan struct{}) {
 		logJSON("info", "engine_exited", nil)
 	}
 	if shouldRestart {
-		time.Sleep(time.Second)
 		e.cmdMu.Lock()
 		defer e.cmdMu.Unlock()
 		e.stateMu.Lock()
 		needsStart := !e.closed && e.cmd == nil
 		e.stateMu.Unlock()
 		if needsStart {
-			if err := e.startLocked(); err != nil {
+			if err := e.startWithBackoffLocked("engine exited"); err != nil {
 				logJSON("error", "engine_restart_failed", map[string]any{"error": err.Error()})
 			}
 		}

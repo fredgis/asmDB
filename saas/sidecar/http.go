@@ -108,7 +108,13 @@ func tokenEqual(got, want string) bool {
 func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 	count, err := a.count(r)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "engine_error", "engine is not healthy", err.Error())
+		detail := err.Error()
+		if a.engine != nil {
+			if healthErr := a.engine.healthError(); healthErr != "" {
+				detail = healthErr
+			}
+		}
+		writeError(w, http.StatusServiceUnavailable, "engine_unhealthy", "engine is not healthy", detail)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "engine": engineVersion, "rows": count})

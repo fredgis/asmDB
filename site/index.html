@@ -35,6 +35,7 @@
       <a href="#cli">CLI</a>
       <a href="#binaries">binaries</a>
       <a href="https://github.com/fredgis/asmDB">source</a>
+      <a class="nav__access" href="#console-access">access database</a>
       <a class="nav__cta nav__keep" href="#create">create a database</a>
     </div>
   </div>
@@ -58,7 +59,6 @@
 
         <div class="hero__actions">
           <a class="btn btn--primary" href="#create">Create a database →</a>
-          <a class="btn btn--ghost" href="#console-access">Access database</a>
           <a class="btn btn--ghost" href="#mcp">Use it from an AI agent</a>
         </div>
       </div>
@@ -618,7 +618,11 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
             <h3 class="console-card__title" id="database-title">Rows and live stats for <span id="database-view-name">no database selected</span></h3>
             <p class="console-card__note" id="database-view-meta">Open a database from Access before previewing data.</p>
           </div>
-          <a class="btn btn--ghost" href="#console-access">Change database</a>
+          <div class="console-actions database-heading__actions">
+            <button class="btn btn--primary" id="load-sample" type="button">Load sample data</button>
+            <button class="btn btn--ghost btn--danger" id="delete-db" type="button">Delete database</button>
+            <a class="btn btn--ghost" href="#console-access">Change database</a>
+          </div>
         </div>
 
         <div class="database-grid">
@@ -701,6 +705,25 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
             <button type="button" data-command="COUNT">COUNT</button>
             <button type="button" data-command="SELECT *">SELECT *</button>
             <button type="button" data-command="INSERT 1 5 tag some text">INSERT 1 5 tag some text</button>
+          </div>
+          <div class="bench-panel" aria-labelledby="bench-title">
+            <div>
+              <p class="sec__kicker">Bench</p>
+              <h4 class="bench-panel__title" id="bench-title">Run BENCH against this database</h4>
+              <p class="bench-panel__note">This writes real rows into the selected database.</p>
+            </div>
+            <div class="bench-panel__controls">
+              <label class="field bench-panel__field" for="bench-size">
+                <span>rows</span>
+                <select id="bench-size">
+                  <option value="10000">10k</option>
+                  <option value="100000">100k</option>
+                  <option value="1000000">1M</option>
+                </select>
+              </label>
+              <button class="btn btn--primary" id="bench-run" type="button">Bench</button>
+            </div>
+            <div class="bench-result mono" id="bench-result" role="status" aria-live="polite">No bench run yet.</div>
           </div>
         </section>
       </section>

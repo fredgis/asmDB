@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExecRestoresTSVAfterSuccessfulCommand(t *testing.T) {
@@ -145,6 +146,13 @@ func TestFakeEngineHelper(t *testing.T) {
 			fmt.Println("[ OK ] 1 row(s)")
 		case "COUNT":
 			fmt.Println("[ OK ] 1")
+		case "SLOW":
+			d, _ := time.ParseDuration(os.Getenv("ASMDB_FAKE_SLOW"))
+			if d <= 0 {
+				d = 50 * time.Millisecond
+			}
+			time.Sleep(d)
+			fmt.Println("[ OK ] slow")
 		case "FAIL":
 			fmt.Println("[ERR] forced failure")
 		case "EXIT", "QUIT":

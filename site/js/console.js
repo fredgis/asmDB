@@ -48,6 +48,11 @@
   var termForm = id("term-form");
   var termCommand = id("term-command");
   var termSend = id("term-send");
+  var loadSampleBtn = id("load-sample");
+  var deleteDbBtn = id("delete-db");
+  var benchSize = id("bench-size");
+  var benchRun = id("bench-run");
+  var benchResult = id("bench-result");
   var binaryList = id("binary-list");
   var bannerMarkup = termScreen.innerHTML;
 
@@ -63,6 +68,7 @@
   var loadingList = false;
   var activeView = "create";
   var auth = { config: null, client: null, account: null, ready: false };
+  var COLD_RETRY_DELAYS = [0, 1000, 2000, 4000, 8000, 10000, 10000, 10000];
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>]/g, function (c) {
@@ -132,16 +138,31 @@
     listBtn.disabled = on;
     if (btn) { btn.textContent = on ? label : btn.dataset.label; }
   }
-  [createBtn, listBtn, authSignIn, authSignOut, saveToken].forEach(function (b) {
+  [createBtn, listBtn, authSignIn, authSignOut, saveToken, loadSampleBtn, deleteDbBtn, benchRun].forEach(function (b) {
     if (b) { b.dataset.label = b.textContent; }
   });
 
   function jsonFromResponse(r) {
     return r.text().then(function (body) {
+      var type = (r.headers && r.headers.get("content-type") || "").toLowerCase();
+      var isJson = type.indexOf("application/json") !== -1 || type.indexOf("+json") !== -1;
       var data = null;
-      try { data = body ? JSON.parse(body) : null; } catch (e) { /* not JSON */ }
+      if (body && isJson) {
+        try { data = JSON.parse(body); } catch (e) {
+          var parseErr = new Error("the server returned invalid JSON");
+          parseErr.status = r.status;
+          parseErr.code = "invalid_json";
+          throw parseErr;
+        }
+      }
+      if (body && !isJson) {
+        var textErr = new Error(nonJsonMessage(r.status, body));
+        textErr.status = r.status;
+        textErr.code = isColdStartResponse(r.status, body) ? "cold_start" : "non_json_response";
+        throw textErr;
+      }
       if (!r.ok) {
-        var msg = (data && data.error && data.error.message) || body || (r.status + " " + r.statusText);
+        var msg = (data && data.error && data.error.message) || (r.status + " " + r.statusText);
         var err = new Error(msg);
         err.status = r.status;
         err.code = (data && data.error && data.error.code) || "http_" + r.status;
@@ -150,6 +171,31 @@
       }
       return data;
     });
+  }
+  function isColdStartResponse(status, body) {
+    return status === 404 && /Azure Container App|Container App is stopped|stopped or does not exist|id="unavailable"/i.test(String(body || ""));
+  }
+  function nonJsonMessage(status, body) {
+    if (isColdStartResponse(status, body)) {
+      return "the instance is waking; Azure returned its cold-start page instead of JSON";
+    }
+    return "the server returned a non-JSON response (" + status + ")";
+  }
+  function delay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+  function withColdRetry(operation, onWake) {
+    var started = Date.now();
+    function attempt(i) {
+      return operation().catch(function (e) {
+        if (e && e.code === "cold_start" && Date.now() - started < 45000 && i < COLD_RETRY_DELAYS.length - 1) {
+          if (onWake) { onWake(i + 1); }
+          return delay(COLD_RETRY_DELAYS[i + 1]).then(function () { return attempt(i + 1); });
+        }
+        throw e;
+      });
+    }
+    return attempt(0);
   }
   function fetchConfig() {
     if (window.location.protocol === "file:") {
@@ -335,24 +381,24 @@
     else { rowsMeter.removeAttribute("data-tiny"); }
   }
   function databaseLabel(db) { return db && (db.name || db.id) || "database"; }
-  function stoppedLabel(reason) {
+  function asleepLabel(reason) {
     if (!reason) { return "unavailable"; }
-    if (/^(stopped|scaledtozero|scaled_to_zero|sleeping|sleep)$/i.test(String(reason))) { return "stopped"; }
+    if (/^(stopped|scaledtozero|scaled_to_zero|sleeping|sleep|zero replicas)$/i.test(String(reason))) { return "asleep"; }
     return String(reason).replace(/_/g, " ");
   }
-  function isStopped(db) {
+  function isAsleep(db) {
     var state = String(db && db.state || "").toLowerCase().replace(/[^a-z0-9]/g, "");
     return state === "stopped" || state === "scaledtozero" || state === "sleeping" || state === "sleep";
   }
   function renderStatsUnavailable(reason) {
-    var label = stoppedLabel(reason);
+    var label = asleepLabel(reason);
     monitorState.textContent = label;
-    metricRows.textContent = label === "stopped" ? "stopped" : "No sample";
-    metricRowsHint.textContent = label === "stopped"
-      ? "Free and standard instances can scale to zero; no stats request is sent while stopped."
+    metricRows.textContent = label === "asleep" ? "asleep" : "No sample";
+    metricRowsHint.textContent = label === "asleep"
+      ? "Free and standard instances can scale to zero. Open the CLI or preview to wake it."
       : "Stats unavailable for the selected database.";
     metricCpu.textContent = "—";
-    metricMemory.textContent = label === "stopped" ? "stopped" : "No sample";
+    metricMemory.textContent = label === "asleep" ? "asleep" : "No sample";
     metricStorage.textContent = "allocated storage —";
     setRowsMeter("0", "0");
   }
@@ -367,7 +413,7 @@
   }
   function renderStats(db, payload) {
     if (!db) { renderStatsEmpty(); return; }
-    if (isStopped(db)) { renderStatsUnavailable(db.state); return; }
+    if (isAsleep(db)) { renderStatsUnavailable(db.state); return; }
     if (!payload) {
       monitorState.textContent = "waiting";
       metricRows.textContent = "No sample yet";
@@ -431,7 +477,7 @@
     }
     databaseList.innerHTML = databases.map(function (db) {
       var selected = currentDb && currentDb.id === db.id;
-      var state = isStopped(db) ? "stopped" : (db.state || "state");
+      var state = isAsleep(db) ? "asleep" : (db.state || "state");
       return '<button class="db-item" type="button" role="option" aria-selected="' + (selected ? "true" : "false") + '" data-db-id="' + attr(db.id) + '">' +
         '<span class="db-item__main"><span class="db-item__name">' + esc(databaseLabel(db)) + '</span>' +
         '<span class="db-item__id">' + esc(db.id) + '</span></span>' +
@@ -488,10 +534,6 @@
       renderPreviewMessage("Open a database from Access first.");
       return Promise.resolve();
     }
-    if (isStopped(currentDb)) {
-      renderPreviewMessage("Instance is stopped. No row request is sent from the monitoring view.");
-      return Promise.resolve();
-    }
     var token = instanceToken();
     if (!token) {
       renderPreviewMessage("Paste the instance token in Access to preview rows for " + databaseLabel(currentDb) + ".");
@@ -499,14 +541,18 @@
     }
     rememberInstanceToken(token);
     previewStatus.textContent = "loading";
-    return fetch(currentDb.endpoint.replace(/\/$/, "") + "/v1/rows?limit=" + PREVIEW_LIMIT + "&offset=0", {
-      headers: { "Authorization": "Bearer " + token, "accept": "application/json" }
+    return withColdRetry(function () {
+      return fetch(currentDb.endpoint.replace(/\/$/, "") + "/v1/rows?limit=" + PREVIEW_LIMIT + "&offset=0", {
+        headers: { "Authorization": "Bearer " + token, "accept": "application/json" }
+      }).then(jsonFromResponse);
+    }, function () {
+      previewStatus.textContent = "waking";
+      renderPreviewMessage("Waking the instance. Azure returned a cold-start page; retrying…");
     })
-      .then(jsonFromResponse)
       .then(function (data) { renderPreviewRows((data && data.rows) || []); })
       .catch(function (e) {
-        previewStatus.textContent = "unavailable";
-        renderPreviewMessage(e && e.message ? e.message : "Preview unavailable.");
+        previewStatus.textContent = e && e.code === "cold_start" ? "waking" : "unavailable";
+        renderPreviewMessage(e && e.code === "cold_start" ? "The instance is still waking after 45 seconds. Try preview again." : (e && e.message ? e.message : "Preview unavailable."));
       });
   }
   function loadDatabases(options) {
@@ -535,7 +581,7 @@
   }
   function refreshSelectedStats() {
     if (!currentDb) { renderStats(null, null); return Promise.resolve(); }
-    if (isStopped(currentDb)) { renderStatsUnavailable(currentDb.state); return Promise.resolve(); }
+    if (isAsleep(currentDb)) { renderStatsUnavailable(currentDb.state); return Promise.resolve(); }
     monitorState.textContent = "loading";
     return request("/databases/" + encodeURIComponent(currentDb.id) + "/stats", { method: "GET" })
       .then(function (data) { renderStats(currentDb, data); })
@@ -583,32 +629,37 @@
     if (instanceToken()) { termToken.value = instanceToken(); }
     termCommand.disabled = false;
     termSend.disabled = false;
-    setTerminalState(isStopped(db) ? "stopped" : "ready");
+    setTerminalState(isAsleep(db) ? "asleep" : "ready");
     transcript = [bannerMarkup, "", esc("database " + db.id)];
     paintTerminal();
   }
   function execRequest(command) {
-    var ctl = new AbortController();
-    var timer = setTimeout(function () { ctl.abort(); }, 60000);
-    return fetch(API + "/databases/" + encodeURIComponent(currentDb.id) + "/exec", {
-      method: "POST",
-      signal: ctl.signal,
-      headers: { "content-type": "application/json", "Authorization": "Bearer " + instanceToken() },
-      body: JSON.stringify({ command: command })
-    })
-      .then(function (r) {
-        clearTimeout(timer);
-        return jsonFromResponse(r).then(function (data) { return data || {}; });
+    return withColdRetry(function () {
+      var ctl = new AbortController();
+      var timer = setTimeout(function () { ctl.abort(); }, 60000);
+      return fetch(API + "/databases/" + encodeURIComponent(currentDb.id) + "/exec", {
+        method: "POST",
+        signal: ctl.signal,
+        headers: { "content-type": "application/json", "Authorization": "Bearer " + instanceToken() },
+        body: JSON.stringify({ command: command })
       })
-      .catch(function (e) {
-        clearTimeout(timer);
-        if (e.name === "AbortError") {
-          var t = new Error("the instance did not answer within 60 seconds");
-          t.code = "timeout";
-          throw t;
-        }
-        throw e;
-      });
+        .then(function (r) {
+          clearTimeout(timer);
+          return jsonFromResponse(r).then(function (data) { return data || {}; });
+        })
+        .catch(function (e) {
+          clearTimeout(timer);
+          if (e.name === "AbortError") {
+            var t = new Error("the instance did not answer within 60 seconds");
+            t.code = "timeout";
+            throw t;
+          }
+          throw e;
+        });
+    }, function () {
+      setTerminalState("waking");
+      writeTerminal(["waking the instance; retrying…"]);
+    });
   }
   function runTerminalCommand(command) {
     if (!currentDb || !currentDb.id) { setHash("#console-access"); return; }
@@ -640,7 +691,7 @@
         writeTerminal((d.output || []).concat([""]));
         if (/^(INSERT|UPDATE|DELETE|TRUNCATE|SELECT|COUNT)\b/i.test(command)) {
           refreshSelectedStats();
-          if (!isStopped(currentDb)) { loadPreview(); }
+          loadPreview();
         }
       })
       .catch(function (e) {
@@ -672,6 +723,124 @@
     else { databases.unshift(d); }
     selectDatabase(d, { route: "#database" });
     loadDatabases({ selectFirst: false });
+  }
+  function sampleCommands() {
+    var base = String(Date.now()) + "0";
+    return [
+      "INSERT " + base + " 1 engine asmdb stores one fixed-shape row per slot",
+      "INSERT " + String(BigInt(base) + 1n) + " 2 wal write-ahead log keeps committed updates durable",
+      "INSERT " + String(BigInt(base) + 2n) + " 3 mcp MCP tools call the same engine commands",
+      "INSERT " + String(BigInt(base) + 3n) + " 4 cdc CDC frames preserve committed change order",
+      "INSERT " + String(BigInt(base) + 4n) + " 5 bench BENCH writes rows for test data"
+    ];
+  }
+  function runCommandsInOrder(commands, index, outputs) {
+    outputs = outputs || [];
+    if (index >= commands.length) { return Promise.resolve(outputs); }
+    return execRequest(commands[index]).then(function (d) {
+      outputs.push({ command: commands[index], data: d });
+      return runCommandsInOrder(commands, index + 1, outputs);
+    });
+  }
+  function loadSampleData() {
+    if (!currentDb) { setHash("#console-access"); return; }
+    if (!instanceToken()) {
+      setHash("#console-access");
+      termToken.focus();
+      renderPreviewMessage("Paste the instance token before loading sample data.");
+      return;
+    }
+    rememberInstanceToken(instanceToken());
+    loadSampleBtn.disabled = true;
+    previewStatus.textContent = "loading";
+    renderPreviewMessage("Loading sample data into " + databaseLabel(currentDb) + "…");
+    runCommandsInOrder(sampleCommands(), 0)
+      .then(function () {
+        previewStatus.textContent = "loading";
+        return loadPreview();
+      })
+      .then(function () { refreshSelectedStats(); })
+      .catch(function (e) {
+        previewStatus.textContent = e.code === "cold_start" ? "waking" : "unavailable";
+        renderPreviewMessage((e && e.message) || "Sample load failed.");
+      })
+      .then(function () { loadSampleBtn.disabled = false; });
+  }
+  function deleteCurrentDatabase() {
+    if (!currentDb) { setHash("#console-access"); return; }
+    var expected = databaseLabel(currentDb);
+    var typed = window.prompt("Type " + expected + " to delete this database and its data.");
+    if (typed !== expected) { return; }
+    deleteDbBtn.disabled = true;
+    request("/databases/" + encodeURIComponent(currentDb.id), { method: "DELETE" })
+      .then(function () {
+        databases = databases.filter(function (db) { return db.id !== currentDb.id; });
+        currentDb = null;
+        termToken.value = "";
+        renderDatabases();
+        renderStats(null, null);
+        renderPreviewMessage("Database deleted. Select another instance.");
+        showTerminal(null);
+        setHash("#console-access");
+      })
+      .catch(function (e) {
+        renderPreviewMessage((e && e.message) || "Delete failed.");
+      })
+      .then(function () { deleteDbBtn.disabled = false; });
+  }
+  function parseBenchOutput(lines) {
+    var text = (lines || []).join("\n");
+    function pick(re) {
+      var m = text.match(re);
+      return m ? m[1] : "";
+    }
+    return {
+      rows: pick(/([0-9][0-9,]*)\s+rows?\b/i) || pick(/inserted[^0-9]*([0-9][0-9,]*)/i),
+      elapsed: pick(/([0-9][0-9,.]*\s*(?:ms|s|sec|secs|seconds))\b/i),
+      rate: pick(/([0-9][0-9,.]*)\s*(?:rows\/s|rows per second|row\/s)\b/i)
+    };
+  }
+  function renderBenchResult(result) {
+    var parts = [];
+    if (result.rows) { parts.push("rows " + result.rows); }
+    if (result.elapsed) { parts.push("elapsed " + result.elapsed); }
+    if (result.rate) { parts.push("rows/s " + result.rate); }
+    benchResult.textContent = parts.length ? parts.join(" · ") : "Bench complete. See engine output above.";
+  }
+  function runBench() {
+    if (!currentDb) { setHash("#console-access"); return; }
+    if (!instanceToken()) {
+      setHash("#console-access");
+      termToken.focus();
+      benchResult.textContent = "Paste the instance token before running BENCH.";
+      return;
+    }
+    var command = "BENCH " + benchSize.value;
+    rememberInstanceToken(instanceToken());
+    benchRun.disabled = true;
+    termCommand.disabled = true;
+    termSend.disabled = true;
+    setTerminalState("bench");
+    benchResult.textContent = "Running " + command + ". This writes real rows.";
+    writeTerminal(["asmdb> " + command, "BENCH writes real rows into this database."]);
+    execRequest(command)
+      .then(function (d) {
+        setTerminalState(d.ok === false ? "engine error" : "ready");
+        writeTerminal((d.output || []).concat([""]));
+        renderBenchResult(parseBenchOutput(d.output || []));
+        refreshSelectedStats();
+        loadPreview();
+      })
+      .catch(function (e) {
+        setTerminalState("transport error");
+        benchResult.textContent = (e && e.message) || "BENCH failed.";
+        writeTerminal(["[ERR] " + (e.code || "error"), "      " + ((e && e.message) || "BENCH failed."), ""]);
+      })
+      .then(function () {
+        benchRun.disabled = false;
+        termCommand.disabled = false;
+        termSend.disabled = false;
+      });
   }
   function fail(e) {
     if (e.code === "not_signed_in") { showSignedOut("Not signed in.", "Sign in with Microsoft before using the console.", ""); return; }
@@ -720,6 +889,9 @@
     setTimeout(function () { saveToken.textContent = saveToken.dataset.label; }, 900);
     if (activeView === "database") { loadPreview(); }
   });
+  loadSampleBtn.addEventListener("click", loadSampleData);
+  deleteDbBtn.addEventListener("click", deleteCurrentDatabase);
+  benchRun.addEventListener("click", runBench);
   authSignIn.addEventListener("click", signIn);
   authSignOut.addEventListener("click", signOut);
   termForm.addEventListener("submit", function (e) { e.preventDefault(); runTerminalCommand(termCommand.value); });

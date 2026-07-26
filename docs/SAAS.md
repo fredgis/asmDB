@@ -51,8 +51,9 @@ Four consequences are worth keeping visible:
 5. [Authentication and tokens](#5-authentication-and-tokens)
 6. [Instance lifecycle, storage and isolation](#6-instance-lifecycle-storage-and-isolation)
 7. [Observability, stats and costs](#7-observability-stats-and-costs)
+7b. [Benchmarking a hosted instance](#7b-benchmarking-a-hosted-instance)
 8. [Installation and deployment](#8-installation-and-deployment)
-8b. [⚠️ **ALERT** — the TLS certificate expires every 90 days](#8b-️-alert--the-tls-certificate-expires-every-90-days)
+8b. [ALERT — the TLS certificate expires every 90 days](#8b-alert--the-tls-certificate-expires-every-90-days)
 8c. [Releasing a new engine version](#8c-releasing-a-new-engine-version)
 9. [Durability, upgrade and recovery](#9-durability-upgrade-and-recovery)
 10. [Limits and non-goals](#10-limits-and-non-goals)
@@ -83,7 +84,7 @@ The service is already reachable through APIM for the control-plane paths and
 site content listed in [§11](#11-verified-smoke-checks). The public custom
 hostname is becoming `https://www.asmdb.cloud`; the apex `asmdb.cloud` redirects
 to it at the registrar. The certificate story is deliberately called out in
-[§8b](#8b-️-alert--the-tls-certificate-expires-every-90-days).
+[§8b](#8b-alert--the-tls-certificate-expires-every-90-days).
 
 ---
 
@@ -304,6 +305,43 @@ that turns per-operation events into invoices.
 
 ---
 
+## 7b. Benchmarking a hosted instance
+
+`BENCH` writes real rows into the open database. It replaces the contents with
+synthetic rows, so run it against a throwaway database unless the data is
+disposable.
+
+The console has a Bench button for this path. To run the same command by hand,
+send it through the control-plane exec proxy:
+
+```http
+POST https://www.asmdb.cloud/api/v1/databases/{id}/exec
+Authorization: Bearer INSTANCE_TOKEN
+Content-Type: application/json
+
+{"command": "BENCH 100000"}
+```
+
+The command is the engine's own [`BENCH <n>`](COMMANDS.md#bench): it inserts
+*n* synthetic rows in a tight in-RAM loop, with no text protocol and no per-row
+disk I/O, times that loop inside the engine, then checkpoints once. The result
+is the engine insert path for that instance. It is not a measurement of the
+browser, the gateway, the REST layer or network latency.
+
+The README's nearly 12 million rows/second figure is an in-RAM insert loop on
+one core of a workstation. A hosted `free` instance has 0.25 vCPU, so expect a
+fraction of that. Do not compare the number with the README as if the machines
+were the same.
+
+Cold start also matters. A `free` or `standard` instance that has scaled to zero
+can spend the first 10-20 seconds starting. Warm the instance first, then run
+`BENCH` and read the throughput line it returns.
+
+The row ceiling is 4,194,304. `BENCH 1000000` consumes roughly a quarter of the
+table's capacity in one command.
+
+---
+
 ## 8. Installation and deployment
 
 Deployment is run from a workstation, never from CI.
@@ -357,7 +395,7 @@ half-applying a private-network migration.
 
 ---
 
-## 8b. ⚠️ ALERT — the TLS certificate expires every 90 days
+## 8b. ALERT — the TLS certificate expires every 90 days
 
 > **`www.asmdb.cloud` is served with a Let's Encrypt certificate that is valid
 > for 90 days. If nobody renews it, the site stops loading in every browser
@@ -388,6 +426,9 @@ minutes, most of which is waiting for DNS.
 **1 — ask Let's Encrypt for a new challenge**
 
 ```powershell
+if (-not (Get-Module -ListAvailable Posh-ACME)) {
+    Install-Module Posh-ACME -Scope CurrentUser
+}
 Import-Module Posh-ACME
 Set-PAServer LE_PROD
 New-PAOrder -Domain 'www.asmdb.cloud' -Force

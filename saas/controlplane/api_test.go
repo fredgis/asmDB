@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -12,6 +13,10 @@ import (
 	"testing"
 	"time"
 )
+
+const azureColdStartHTML = `<!doctype html>
+<html><head><title>Azure Container App - Unavailable</title></head>
+<body><h1 id="unavailable">Error 404 - This Container App is stopped or does not exist.</h1></body></html>`
 
 type fakeProvisioner struct {
 	created          []instance
@@ -127,6 +132,20 @@ func newTestAPI(store store, prov provisioner) *api {
 
 func newStatsTestAPI(store store, prov provisioner) *api {
 	return newAPI(store, prov, testStatsConfig(), allowVerifier())
+}
+
+func decodeErrorCode(t *testing.T, body io.Reader) string {
+	t.Helper()
+	var got struct {
+		Error struct {
+			Code   string `json:"code"`
+			Detail string `json:"detail"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	return got.Error.Code + "|" + got.Error.Detail
 }
 
 func TestValidName(t *testing.T) {
@@ -824,6 +843,81 @@ func TestStatsRequiresAdminGroup(t *testing.T) {
 	}
 }
 
+func TestWakeRouteReturnsPromptlyAndRequiresAuth(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "standard", TokenHash: tokenHash("t"), ContainerAppName: "db-test"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Engine: "1.5.0"})
+	}))
+	defer server.Close()
+	api := newStatsTestAPI(store, &fakeProvisioner{
+		internalEndpoint: server.URL,
+		states:           map[string]liveState{id: {State: "stopped"}},
+	})
+	api.wakeClient = server.Client()
+	api.wakeClient.Timeout = 300 * time.Millisecond
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/wake", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no auth status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	start := time.Now()
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/wake", nil)
+	req.Header.Set("Authorization", "Bearer admin")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("wake blocked for %s; want prompt response", elapsed)
+	}
+	if !strings.Contains(rec.Body.String(), `"state":"stopped"`) {
+		t.Fatalf("body = %s, want current stopped state", rec.Body.String())
+	}
+}
+
+func TestStatsAzureColdStartIsStartingNotBroken(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "standard", TokenHash: tokenHash("t"), ContainerAppName: "db-test"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(azureColdStartHTML))
+	}))
+	defer server.Close()
+	api := newStatsTestAPI(store, &fakeProvisioner{internalEndpoint: server.URL, states: map[string]liveState{id: {State: "running"}}})
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/databases/"+id+"/stats", nil)
+	req.Header.Set("Authorization", "Bearer admin")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var got statsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Available || got.Reason != "instance_starting" {
+		t.Fatalf("stats = %+v, want instance_starting", got)
+	}
+}
+
 func TestListWithStatsFetchesConcurrently(t *testing.T) {
 	store := newMemoryStore()
 	ids := []string{"db_abcdefghijklmnopqrstuvwx", "db_bcdefghijklmnopqrstuvwxy"}
@@ -1008,6 +1102,112 @@ func TestExecValidTokenProxies(t *testing.T) {
 	}
 	if !got.OK || len(got.Output) != 1 || got.Output[0] != "row" {
 		t.Fatalf("response = %+v", got)
+	}
+}
+
+func TestExecRetriesAzureColdStartHTML(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	token := "customer-token"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "standard", TokenHash: tokenHash(token), ContainerAppName: "db-test"}); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(azureColdStartHTML))
+			return
+		}
+		writeJSON(w, http.StatusOK, execResponse{Output: []string{"awake"}, OK: true})
+	}))
+	defer server.Close()
+
+	api := newStatsTestAPI(store, &fakeProvisioner{internalEndpoint: server.URL, states: map[string]liveState{}})
+	api.execRetryBackoff = 5 * time.Millisecond
+	api.execRetryBudget = 100 * time.Millisecond
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/exec", bytes.NewBufferString(`{"command":"SELECT *"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3 retries through cold start", calls)
+	}
+}
+
+func TestExecColdStartBudgetExhaustedUsesSpecificError(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	token := "customer-token"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "standard", TokenHash: tokenHash(token), ContainerAppName: "db-test"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(azureColdStartHTML))
+	}))
+	defer server.Close()
+
+	api := newStatsTestAPI(store, &fakeProvisioner{internalEndpoint: server.URL, states: map[string]liveState{}})
+	api.execRetryBackoff = 5 * time.Millisecond
+	api.execRetryBudget = 20 * time.Millisecond
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/exec", bytes.NewBufferString(`{"command":"SELECT *"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	codeAndDetail := decodeErrorCode(t, rec.Body)
+	if !strings.HasPrefix(codeAndDetail, "instance_starting|") {
+		t.Fatalf("error = %q, want instance_starting", codeAndDetail)
+	}
+	if strings.Contains(codeAndDetail, "<html") || strings.Contains(codeAndDetail, "Container App - Unavailable") {
+		t.Fatalf("detail leaked raw HTML: %q", codeAndDetail)
+	}
+}
+
+func TestExecDoesNotRetrySidecar500(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	token := "customer-token"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "standard", TokenHash: tokenHash(token), ContainerAppName: "db-test"}); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		writeError(w, http.StatusInternalServerError, "internal", "engine failed", "")
+	}))
+	defer server.Close()
+
+	api := newStatsTestAPI(store, &fakeProvisioner{internalEndpoint: server.URL, states: map[string]liveState{}})
+	api.execRetryBackoff = 5 * time.Millisecond
+	api.execRetryBudget = 100 * time.Millisecond
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/exec", bytes.NewBufferString(`{"command":"SELECT *"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want no retry for sidecar 500", calls)
 	}
 }
 
