@@ -88,6 +88,11 @@ type healthResponse struct {
 	Rows   int64  `json:"rows"`
 }
 
+type versionResponse struct {
+	Engine string `json:"engine,omitempty"`
+	Image  string `json:"image,omitempty"`
+}
+
 func newAPI(store store, provisioner provisioner, cfg config, verifier accessTokenVerifier) *api {
 	return &api{
 		store:       store,
@@ -102,6 +107,7 @@ func newAPI(store store, provisioner provisioner, cfg config, verifier accessTok
 
 func (a *api) register(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/api/v1/version", a.withCORS(a.handleVersion))
 	mux.HandleFunc("/api/v1/config", a.withCORS(a.handleConfig))
 	mux.HandleFunc("/api/v1/costs", a.withCORS(a.handleCosts))
 	mux.HandleFunc("/api/v1/databases", a.withCORS(a.handleDatabases))
@@ -126,6 +132,17 @@ func (a *api) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"tenantId": a.cfg.EntraTenantID,
 		"clientId": a.cfg.EntraClientID,
 		"scope":    a.cfg.EntraScope,
+	})
+}
+
+func (a *api) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, versionResponse{
+		Engine: a.availableEngine(),
+		Image:  a.cfg.Image,
 	})
 }
 
@@ -451,6 +468,8 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "platform credential is not configured", "")
 		return
 	}
+	state, stateErr := a.provisioner.GetState(r.Context(), in)
+	wasStopped := stateErr == nil && state.State == "stopped"
 	if err := a.backupInstance(r.Context(), in); err != nil {
 		writeError(w, http.StatusBadGateway, "bad_gateway", "backup failed; upgrade aborted", err.Error())
 		return
@@ -460,7 +479,9 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 	// lock and maxReplicas is 1, so the replacement can open the files only
 	// after the outgoing process lets go. We record the new image only after
 	// Azure reports the update done; a failed revision leaves metadata on the
-	// old image so the console still offers the upgrade.
+	// old image so the console still offers the upgrade. If an instance was
+	// stopped, we deliberately wake it to run BACKUP before changing the image:
+	// backup-before-upgrade is safer than silently skipping sleeping databases.
 	if err := a.provisioner.UpgradeImage(r.Context(), in, a.cfg.Image); err != nil {
 		writeError(w, http.StatusBadGateway, "bad_gateway", "upgrade revision failed", err.Error())
 		return
@@ -474,9 +495,13 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	res := a.responseFor(r.Context(), in)
+	warning := "Upgrade restarts the instance and briefly interrupts active connections."
+	if wasStopped {
+		warning += " The instance was stopped, so it was started to take a backup before applying the upgrade."
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"database": res,
-		"warning":  "Upgrade restarts the instance and briefly interrupts active connections.",
+		"warning":  warning,
 	})
 }
 
@@ -704,7 +729,9 @@ func includeStats(r *http.Request) bool {
 }
 
 func (a *api) upgradeAvailable(in instance) bool {
-	return a.cfg.Image != "" && in.Image != "" && in.Image != a.cfg.Image
+	currentTag, currentOK := imageTag(a.cfg.Image)
+	recordedTag, recordedOK := imageTag(in.Image)
+	return currentOK && recordedOK && currentTag != recordedTag && in.Image != a.cfg.Image
 }
 
 func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
@@ -723,23 +750,36 @@ func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
 		CreatedAt:        in.CreatedAt.Format(time.RFC3339),
 		Error:            state.Error,
 		UpgradeAvailable: a.upgradeAvailable(in),
-		AvailableEngine:  engineLabelFromImage(a.cfg.Image),
-		AvailableImage:   a.cfg.Image,
+		AvailableEngine:  a.availableEngine(),
+		AvailableImage:   a.availableImage(),
 	}
 }
 
-func engineLabelFromImage(image string) string {
-	if image == "" {
+func (a *api) availableEngine() string {
+	tag, ok := imageTag(a.cfg.Image)
+	if !ok {
 		return ""
 	}
-	if at := strings.IndexByte(image, '@'); at >= 0 {
-		return image[at+1:]
+	return tag
+}
+
+func (a *api) availableImage() string {
+	if _, ok := imageTag(a.cfg.Image); !ok {
+		return ""
+	}
+	return a.cfg.Image
+}
+
+func imageTag(image string) (string, bool) {
+	if image == "" || strings.Contains(image, "@") {
+		return "", false
 	}
 	lastSlash := strings.LastIndexByte(image, '/')
 	if colon := strings.LastIndexByte(image, ':'); colon > lastSlash {
-		return image[colon+1:]
+		tag := image[colon+1:]
+		return tag, tag != ""
 	}
-	return image
+	return "", false
 }
 
 func (a *api) authorized(w http.ResponseWriter, r *http.Request) bool {

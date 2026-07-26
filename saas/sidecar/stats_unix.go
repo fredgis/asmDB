@@ -7,13 +7,15 @@ import (
 	"syscall"
 )
 
-func fileAllocatedBytes(path string) (uint64, error) {
+func statFileUsage(path string) (fileUsage, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return 0, err
+		return fileUsage{}, err
 	}
+	usage := fileUsage{apparent: uint64(info.Size())}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		return uint64(st.Blocks) * 512, nil
+		allocated := uint64(st.Blocks) * 512
+		usage.allocated = &allocated
 	}
-	return uint64(info.Size()), nil
+	return usage, nil
 }

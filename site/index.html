@@ -32,6 +32,8 @@
       <a href="#mcp">mcp</a>
       <a href="#web">web</a>
       <a href="#tiers">tiers</a>
+      <a href="#cli">CLI</a>
+      <a href="#binaries">binaries</a>
       <a href="https://github.com/fredgis/asmDB">source</a>
       <a class="nav__cta nav__keep" href="#create">create a database</a>
     </div>
@@ -56,6 +58,7 @@
 
         <div class="hero__actions">
           <a class="btn btn--primary" href="#create">Create a database →</a>
+          <a class="btn btn--ghost" href="#console-access">Access database</a>
           <a class="btn btn--ghost" href="#mcp">Use it from an AI agent</a>
         </div>
       </div>
@@ -458,16 +461,41 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
   </div>
 </section>
 
-<!-- ============================== console =============================== -->
-<section class="sec" id="create">
+<!-- ============================== binaries ============================== -->
+<section class="sec binaries" id="binaries">
   <div class="shell">
     <div class="sec__head">
-      <p class="sec__kicker">Provision</p>
-      <h2 class="sec__title">Create a database. It is a real container.</h2>
+      <p class="sec__kicker">Binaries</p>
+      <h2 class="sec__title">Download the engine bytes being served.</h2>
       <p class="sec__sub">
-        This calls the control plane, which creates an Azure Container App running the
-        assembly engine and returns a live endpoint and a bearer token. The token is
-        shown once and never stored in plaintext — copy it before you leave the page.
+        The Windows and Linux binaries are assembled from the same source tree with
+        <code>nasm -f bin</code>. There is no linker and no C runtime; the PE64 build is
+        emitted on Linux by writing different bytes, not by cross-compiling through a toolchain.
+      </p>
+    </div>
+
+    <div class="binary-note">
+      <p>Standalone executable files. Nothing to install, no dependencies.</p>
+      <p>Linux downloads need <code>chmod +x</code> before running.</p>
+      <p>Security posture is documented in <a href="https://github.com/fredgis/asmDB/blob/main/docs/SECURITY.md">SECURITY.md</a>, including the single RWX image at a fixed address.</p>
+    </div>
+
+    <div class="binary-list" id="binary-list" aria-live="polite">
+      <div class="binary-empty">Loading manifest…</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== console =============================== -->
+<section class="sec" id="create">
+  <div class="shell shell-wide">
+    <div class="sec__head">
+      <p class="sec__kicker">Provision</p>
+      <h2 class="sec__title">Create or open one database at a time.</h2>
+      <p class="sec__sub">
+        Creation, access, monitoring and CLI commands are separated so the selected
+        database is always explicit. The instance token is shown once at creation;
+        paste it again when opening an existing database from a fresh browser session.
       </p>
     </div>
 
@@ -493,96 +521,160 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
 
     <div class="console-session" id="console-app" hidden>
       <div class="console-session__bar">
-        <span class="badge">signed in</span>
-        <span id="auth-user">Microsoft account</span>
+        <div class="console-session__identity">
+          <span class="badge">signed in</span>
+          <span id="auth-user">Microsoft account</span>
+        </div>
+        <div class="selected-db" aria-live="polite">
+          <span class="selected-db__label">selected database</span>
+          <strong id="selected-db-name">none</strong>
+          <span id="selected-db-id">choose an instance before previewing rows or running CLI commands</span>
+        </div>
         <button class="btn btn--ghost" id="auth-signout" type="button">Sign out</button>
       </div>
 
-      <div class="console console-create">
-        <div class="console-create__form">
-          <div class="field">
-            <label for="db-name">name</label>
-            <input id="db-name" type="text" value="my-notes" maxlength="40"
-                   pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" autocomplete="off" spellcheck="false">
-            <span class="hint">lowercase letters, digits and hyphens</span>
+      <nav class="console-tabs" aria-label="Console views">
+        <a href="#create" data-console-tab="create">Create</a>
+        <a href="#console-access" data-console-tab="access">Access</a>
+        <a href="#database" data-console-tab="database">Database view</a>
+        <a href="#cli" data-console-tab="cli">CLI</a>
+      </nav>
+
+      <section class="console-view" id="console-view-create" data-console-view="create" aria-labelledby="create-title">
+        <div class="console console-panel console-panel--narrow">
+          <div class="console-card__head">
+            <div>
+              <p class="sec__kicker">Create</p>
+              <h3 class="console-card__title" id="create-title">New database</h3>
+            </div>
           </div>
-          <div class="field">
-            <label for="db-tier">tier</label>
-            <select id="db-tier">
-              <option value="free">free — 0.25 vCPU · sleeps after 5 min</option>
-              <option value="standard" selected>standard — 0.5 vCPU · sleeps after 30 min</option>
-              <option value="premium">premium — 1 vCPU · always warm</option>
-            </select>
+          <div class="console-form-grid">
+            <div class="field">
+              <label for="db-name">name</label>
+              <input id="db-name" type="text" value="my-notes" maxlength="40"
+                     pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" autocomplete="off" spellcheck="false">
+              <span class="hint">lowercase letters, digits and hyphens</span>
+            </div>
+            <div class="field field--tier">
+              <label for="db-tier">tier</label>
+              <select id="db-tier">
+                <option value="free">free — 0.25 vCPU · sleeps after 5 min</option>
+                <option value="standard" selected>standard — 0.5 vCPU · sleeps after 30 min</option>
+                <option value="premium">premium — 1 vCPU · always warm</option>
+              </select>
+            </div>
           </div>
-          <div class="console-create__actions">
+          <div class="console-actions">
             <button class="btn btn--primary" id="db-create" type="button">Create database</button>
-            <button class="btn btn--ghost" id="db-list" type="button">Refresh list</button>
+            <a class="btn btn--ghost" href="#console-access">Access database</a>
           </div>
+          <div class="out mono" id="db-out" role="status" aria-live="polite">Ready. Pick a name and tier, then create.</div>
         </div>
-        <div class="out mono" id="db-out" role="status" aria-live="polite">Ready. Pick a tier and press create.</div>
-      </div>
+      </section>
 
-      <div class="console-grid" id="console-grid">
-        <section class="console-card db-list-card" aria-labelledby="db-list-title">
-          <div class="console-card__head">
-            <div>
-              <p class="sec__kicker">Databases</p>
-              <h3 class="console-card__title" id="db-list-title">Your instances</h3>
+      <section class="console-view" id="console-access" data-console-view="access" aria-labelledby="access-title" hidden>
+        <div class="console-access-grid">
+          <section class="console-card db-list-card" aria-labelledby="access-title">
+            <div class="console-card__head">
+              <div>
+                <p class="sec__kicker">Access</p>
+                <h3 class="console-card__title" id="access-title">Existing databases</h3>
+              </div>
+              <span class="badge" id="db-list-status">loading</span>
             </div>
-            <span class="badge" id="db-list-status">loading</span>
-          </div>
-          <div class="db-list" id="database-list" role="listbox" aria-label="databases"></div>
-        </section>
+            <p class="console-card__note">Choose the instance you intend to inspect. Management calls use your Entra token.</p>
+            <div class="db-list" id="database-list" role="listbox" aria-label="databases"></div>
+            <div class="console-actions console-actions--compact">
+              <button class="btn btn--ghost" id="db-list" type="button">Refresh list</button>
+              <a class="btn btn--primary" href="#database" id="open-selected-db">Open selected</a>
+            </div>
+          </section>
 
-        <section class="console-card preview-card" aria-labelledby="preview-title">
-          <div class="console-card__head">
-            <div>
-              <p class="sec__kicker">Preview</p>
-              <h3 class="console-card__title" id="preview-title">Table rows</h3>
+          <section class="console-card" aria-labelledby="token-title">
+            <div class="console-card__head">
+              <div>
+                <p class="sec__kicker">Token</p>
+                <h3 class="console-card__title" id="token-title">Instance token</h3>
+              </div>
             </div>
-            <span class="badge" id="preview-status">bounded</span>
-          </div>
-          <p class="console-card__note">Reads <code>/v1/rows?limit=20&amp;offset=0</code>. No unbounded listing is issued. Scroll sideways on small screens.</p>
-          <div class="table-wrap" id="preview-wrap" tabindex="0" aria-label="table preview, scroll horizontally if needed">
-            <table class="preview-table">
-              <thead>
-                <tr><th>id</th><th>value</th><th>tag</th><th>content</th><th>updated</th></tr>
-              </thead>
-              <tbody id="preview-rows">
-                <tr><td colspan="5">Select a database.</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
+            <p class="console-card__note">Paste the selected database token to preview rows or run CLI commands. It is not an Entra token.</p>
+            <div class="field terminal__token" id="term-token-wrap">
+              <label for="term-token">token for selected database</label>
+              <input id="term-token" type="password" autocomplete="off" spellcheck="false" placeholder="paste bearer token">
+              <span class="hint">Shown once at creation. Stored only in this page session.</span>
+            </div>
+            <div class="console-actions console-actions--compact">
+              <button class="btn btn--primary" id="save-token" type="button">Use token</button>
+              <a class="btn btn--ghost" href="#cli">Open CLI</a>
+            </div>
+          </section>
+        </div>
+      </section>
 
-        <section class="console-card monitor-card" aria-labelledby="monitor-title">
-          <div class="console-card__head">
-            <div>
-              <p class="sec__kicker">Monitoring</p>
-              <h3 class="console-card__title" id="monitor-title">Live stats</h3>
-            </div>
-            <span class="badge" id="monitor-state">—</span>
+      <section class="console-view" id="database" data-console-view="database" aria-labelledby="database-title" hidden>
+        <div class="database-heading console-card">
+          <div>
+            <p class="sec__kicker">Database view</p>
+            <h3 class="console-card__title" id="database-title">Rows and live stats for <span id="database-view-name">no database selected</span></h3>
+            <p class="console-card__note" id="database-view-meta">Open a database from Access before previewing data.</p>
           </div>
-          <div class="metrics">
-            <div class="metric">
-              <p class="metric__k">rows</p>
-              <p class="metric__v" id="metric-rows">—</p>
-              <div class="meter" aria-hidden="true"><span id="rows-meter"></span></div>
-            </div>
-            <div class="metric">
-              <p class="metric__k">cpu</p>
-              <p class="metric__v" id="metric-cpu">—</p>
-              <p class="metric__hint">derived from two samples</p>
-            </div>
-            <div class="metric">
-              <p class="metric__k">memory</p>
-              <p class="metric__v" id="metric-memory">—</p>
-              <p class="metric__hint" id="metric-storage">allocated storage —</p>
-            </div>
-          </div>
-        </section>
+          <a class="btn btn--ghost" href="#console-access">Change database</a>
+        </div>
 
-        <section class="terminal console-card" id="db-terminal" aria-labelledby="terminal-title">
+        <div class="database-grid">
+          <section class="console-card preview-card" aria-labelledby="preview-title">
+            <div class="console-card__head">
+              <div>
+                <p class="sec__kicker">Preview</p>
+                <h3 class="console-card__title" id="preview-title">Table rows</h3>
+              </div>
+              <span class="badge" id="preview-status">bounded</span>
+            </div>
+            <p class="console-card__note">Reads <code>/v1/rows?limit=20&amp;offset=0</code>. The table scrolls inside this frame on narrow screens.</p>
+            <div class="table-wrap" id="preview-wrap" tabindex="0" aria-label="table preview, scroll horizontally if needed">
+              <table class="preview-table">
+                <thead>
+                  <tr><th>id</th><th>value</th><th>tag</th><th>content</th><th>updated</th></tr>
+                </thead>
+                <tbody id="preview-rows">
+                  <tr><td colspan="5">Select a database.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="console-card monitor-card" aria-labelledby="monitor-title">
+            <div class="console-card__head">
+              <div>
+                <p class="sec__kicker">Monitoring</p>
+                <h3 class="console-card__title" id="monitor-title">Live stats</h3>
+              </div>
+              <span class="badge" id="monitor-state">—</span>
+            </div>
+            <div class="metrics">
+              <div class="metric">
+                <p class="metric__k">rows</p>
+                <p class="metric__v" id="metric-rows">No sample yet</p>
+                <p class="metric__hint" id="metric-rows-hint">Rows are shown against capacity when the instance is running.</p>
+                <div class="meter" id="rows-meter-wrap" aria-hidden="true" data-empty="true"><span id="rows-meter"></span></div>
+              </div>
+              <div class="metric">
+                <p class="metric__k">cpu</p>
+                <p class="metric__v" id="metric-cpu">—</p>
+                <p class="metric__hint">derived from two samples; first sample is not displayed as zero</p>
+              </div>
+              <div class="metric">
+                <p class="metric__k">memory</p>
+                <p class="metric__v" id="metric-memory">No sample yet</p>
+                <p class="metric__hint" id="metric-storage">allocated storage —</p>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="console-view" id="cli" data-console-view="cli" aria-labelledby="terminal-title" hidden>
+        <section class="terminal console-card" id="db-terminal">
           <div class="terminal__head">
             <div>
               <p class="sec__kicker">CLI</p>
@@ -591,12 +683,14 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
             <span class="badge" id="term-state">ready</span>
           </div>
           <p class="terminal__meta" id="term-meta">Select a database. Commands are proxied through the control plane.</p>
-          <div class="field terminal__token" id="term-token-wrap" hidden>
-            <label for="term-token">instance token</label>
-            <input id="term-token" type="password" autocomplete="off" spellcheck="false" placeholder="paste bearer token">
-            <span class="hint">Shown once at creation. Paste it here if this browser session does not have it.</span>
-          </div>
-          <pre class="terminal__screen mono" id="term-screen" aria-live="polite"></pre>
+          <pre class="terminal__screen mono" id="term-screen" aria-live="polite"><span class="banner-art">                              ____  
+    ____ __________ ___  ____/ / /_ 
+   / __ `/ ___/ __ `__ \/ __  / __ \
+  / /_/ (__  ) / / / / / /_/ / /_/ /
+  \__,_/____/_/ /_/ /_/\__,_/_.___/ </span>
+<span class="banner-tagline">  a minimalist transactional database engine, in x86-64 assembly</span>
+<span class="banner-meta">  nasm -f bin  .  no linker  .  no CRT  .  WAL-durable  .  Windows + Linux</span>
+<span class="banner-hint">  type <span class="banner-hot">HELP</span> for commands, or <span class="banner-hot">QUIT</span> to exit</span></pre>
           <form class="terminal__form" id="term-form">
             <label class="terminal__prompt" for="term-command">asmdb&gt;</label>
             <input id="term-command" type="text" autocomplete="off" spellcheck="false" placeholder="HELP">
@@ -609,7 +703,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
             <button type="button" data-command="INSERT 1 5 tag some text">INSERT 1 5 tag some text</button>
           </div>
         </section>
-      </div>
+      </section>
     </div>
   </div>
 </section>

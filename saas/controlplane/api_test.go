@@ -164,7 +164,9 @@ func TestHealthz(t *testing.T) {
 func TestCreateDatabaseAndTokenOnlyOnce(t *testing.T) {
 	store := newMemoryStore()
 	prov := &fakeProvisioner{states: map[string]liveState{}}
-	api := newTestAPI(store, prov)
+	cfg := testConfig()
+	cfg.Image = "reg.azurecr.io/asmdb-instance:1.5.0"
+	api := newAPI(store, prov, cfg, allowVerifier())
 	api.now = func() time.Time { return time.Date(2026, 7, 25, 19, 40, 0, 0, time.UTC) }
 
 	rec := httptest.NewRecorder()
@@ -179,6 +181,9 @@ func TestCreateDatabaseAndTokenOnlyOnce(t *testing.T) {
 	}
 	if created.Token == "" || created.State != "provisioning" {
 		t.Fatalf("bad create response: %+v", created)
+	}
+	if created.Image != cfg.Image {
+		t.Fatalf("created image = %q, want %q", created.Image, cfg.Image)
 	}
 
 	rec = httptest.NewRecorder()
@@ -282,6 +287,93 @@ func TestOpenHealthzAndConfig(t *testing.T) {
 	cfg := testConfig()
 	if got["tenantId"] != cfg.EntraTenantID || got["clientId"] != cfg.EntraClientID || got["scope"] != cfg.EntraScope {
 		t.Fatalf("config = %+v, want tenant/client/scope from config", got)
+	}
+}
+
+func TestVersionEndpointIsOpen(t *testing.T) {
+	api := newAPI(newMemoryStore(), &fakeProvisioner{states: map[string]liveState{}}, testStatsConfig(), nil)
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/version", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var got versionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Engine != "1.6.0" || got.Image != "reg.azurecr.io/asmdb-instance:1.6.0" {
+		t.Fatalf("version = %+v", got)
+	}
+}
+
+func TestUpgradeAvailabilityFromVersionTags(t *testing.T) {
+	tests := []struct {
+		name             string
+		recorded         string
+		current          string
+		wantAvailable    bool
+		wantEngine       string
+		wantAvailableImg string
+	}{
+		{
+			name:             "equal tags",
+			recorded:         "reg.azurecr.io/asmdb-instance:1.5.0",
+			current:          "reg.azurecr.io/asmdb-instance:1.5.0",
+			wantEngine:       "1.5.0",
+			wantAvailableImg: "reg.azurecr.io/asmdb-instance:1.5.0",
+		},
+		{
+			name:             "different tags",
+			recorded:         "reg.azurecr.io/asmdb-instance:1.5.0",
+			current:          "reg.azurecr.io/asmdb-instance:1.5.1",
+			wantAvailable:    true,
+			wantEngine:       "1.5.1",
+			wantAvailableImg: "reg.azurecr.io/asmdb-instance:1.5.1",
+		},
+		{
+			name:             "recorded missing tag cannot tell",
+			recorded:         "reg.azurecr.io/asmdb-instance",
+			current:          "reg.azurecr.io/asmdb-instance:1.5.1",
+			wantEngine:       "1.5.1",
+			wantAvailableImg: "reg.azurecr.io/asmdb-instance:1.5.1",
+		},
+		{
+			name:     "current missing tag cannot tell",
+			recorded: "reg.azurecr.io/asmdb-instance:1.5.0",
+			current:  "reg.azurecr.io/asmdb-instance",
+		},
+		{
+			name:     "digest current cannot tell",
+			recorded: "reg.azurecr.io/asmdb-instance:1.5.0",
+			current:  "reg.azurecr.io/asmdb-instance@sha256:abc",
+		},
+		{
+			name:     "empty current cannot tell",
+			recorded: "reg.azurecr.io/asmdb-instance:1.5.0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.Image = tt.current
+			api := newAPI(newMemoryStore(), &fakeProvisioner{states: map[string]liveState{}}, cfg, allowVerifier())
+			got := api.responseFor(context.Background(), instance{
+				ID:               "db_abcdefghijklmnopqrstuvwx",
+				Name:             "db",
+				Tier:             "free",
+				Image:            tt.recorded,
+				Engine:           "1.5.0",
+				CreatedAt:        time.Now().UTC(),
+				ContainerAppName: "db-test",
+			})
+			if got.UpgradeAvailable != tt.wantAvailable || got.AvailableEngine != tt.wantEngine || got.AvailableImage != tt.wantAvailableImg {
+				t.Fatalf("response = %+v, want available=%v engine=%q image=%q", got, tt.wantAvailable, tt.wantEngine, tt.wantAvailableImg)
+			}
+		})
 	}
 }
 
@@ -441,7 +533,8 @@ func TestUpgradeRefusedWhenCurrentImage(t *testing.T) {
 func TestUpgradeBackupFailureAborts(t *testing.T) {
 	store := newMemoryStore()
 	id := "db_abcdefghijklmnopqrstuvwx"
-	if err := store.Save(context.Background(), instance{ID: id, Tier: "free", Image: "old", ContainerAppName: "db-test"}); err != nil {
+	oldImage := "reg.azurecr.io/asmdb-instance:1.5.0"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "free", Image: oldImage, ContainerAppName: "db-test"}); err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -464,15 +557,16 @@ func TestUpgradeBackupFailureAborts(t *testing.T) {
 		t.Fatalf("upgrade called after backup failure: %#v", prov.upgraded)
 	}
 	got, _ := store.Get(context.Background(), id)
-	if got.Image != "old" {
-		t.Fatalf("image = %q, want old", got.Image)
+	if got.Image != oldImage {
+		t.Fatalf("image = %q, want %q", got.Image, oldImage)
 	}
 }
 
 func TestUpgradeRevisionFailureLeavesRecordedImageUnchanged(t *testing.T) {
 	store := newMemoryStore()
 	id := "db_abcdefghijklmnopqrstuvwx"
-	if err := store.Save(context.Background(), instance{ID: id, Tier: "free", Image: "old", ContainerAppName: "db-test"}); err != nil {
+	oldImage := "reg.azurecr.io/asmdb-instance:1.5.0"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "free", Image: oldImage, ContainerAppName: "db-test"}); err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -492,15 +586,59 @@ func TestUpgradeRevisionFailureLeavesRecordedImageUnchanged(t *testing.T) {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
 	got, _ := store.Get(context.Background(), id)
-	if got.Image != "old" {
-		t.Fatalf("image = %q, want old after failed revision", got.Image)
+	if got.Image != oldImage {
+		t.Fatalf("image = %q, want %q after failed revision", got.Image, oldImage)
+	}
+}
+
+func TestUpgradeStoppedInstanceIsDeliberatelyStarted(t *testing.T) {
+	store := newMemoryStore()
+	id := "db_abcdefghijklmnopqrstuvwx"
+	oldImage := "reg.azurecr.io/asmdb-instance:1.5.0"
+	if err := store.Save(context.Background(), instance{ID: id, Tier: "free", Image: oldImage, ContainerAppName: "db-test"}); err != nil {
+		t.Fatal(err)
+	}
+	backupCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/exec" {
+			backupCalls++
+			writeJSON(w, http.StatusOK, execResponse{Output: []string{"backup ok"}, OK: true})
+			return
+		}
+		writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Engine: "1.6.0"})
+	}))
+	defer server.Close()
+	prov := &fakeProvisioner{
+		internalEndpoint: server.URL,
+		states:           map[string]liveState{id: {State: "stopped"}},
+	}
+	api := newAPI(store, prov, testStatsConfig(), allowVerifier())
+	mux := http.NewServeMux()
+	api.register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/upgrade", nil)
+	req.Header.Set("Authorization", "Bearer admin")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backupCalls != 1 || len(prov.upgraded) != 1 {
+		t.Fatalf("backupCalls=%d upgraded=%#v, want one backup and one upgrade", backupCalls, prov.upgraded)
+	}
+	if !strings.Contains(rec.Body.String(), "was stopped") {
+		t.Fatalf("response does not explain stopped upgrade: %s", rec.Body.String())
+	}
+	got, _ := store.Get(context.Background(), id)
+	if got.Image != testStatsConfig().Image || got.Engine != "1.6.0" {
+		t.Fatalf("stored instance = %+v", got)
 	}
 }
 
 func TestUpgradeAuthEnforced(t *testing.T) {
 	id := "db_abcdefghijklmnopqrstuvwx"
 	store := newMemoryStore()
-	_ = store.Save(context.Background(), instance{ID: id, Tier: "free", Image: "old", ContainerAppName: "db-test"})
+	_ = store.Save(context.Background(), instance{ID: id, Tier: "free", Image: "reg.azurecr.io/asmdb-instance:1.5.0", ContainerAppName: "db-test"})
 	api := newAPI(store, &fakeProvisioner{states: map[string]liveState{}}, testStatsConfig(), allowVerifier())
 	mux := http.NewServeMux()
 	api.register(mux)

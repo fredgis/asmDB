@@ -428,6 +428,12 @@ The header carries the engine version that last wrote the file at
 influences whether the database can be opened. Files written before 0.9.0 have
 zero there and are reported as unstamped.
 
+In asmdb Cloud the same `ENGINE_MAJOR` / `ENGINE_MINOR` / `ENGINE_PATCH` values
+also drive the release tag, downloadable binary names and upgrade detection; see
+[`SAAS.md §8c`](SAAS.md#8c-releasing-a-new-engine-version). That platform use
+does not change the engine rule above: on disk, compatibility is still governed
+by `DB_VERSION`, record size and capacity.
+
 **The upgrade path.** `db_open` refuses anything it does not fully understand
 (above), which is safe but leaves the operator stuck. `asmdb <db> --upgrade`
 (`db_upgrade`) is the escape hatch:

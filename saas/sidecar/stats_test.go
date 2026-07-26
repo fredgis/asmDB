@@ -66,15 +66,65 @@ func TestStorageReportsAllocatedSparseData(t *testing.T) {
 	}
 
 	st := collectStorageStats(dir, "main")
-	if st.DataBytes == strconv.FormatInt(apparent, 10) {
-		t.Fatalf("dataBytes reported apparent sparse size %s", st.DataBytes)
+	if st.DataApparentBytes != strconv.FormatInt(apparent, 10) {
+		t.Fatalf("dataApparentBytes = %s, want %d", st.DataApparentBytes, apparent)
 	}
-	got, err := strconv.ParseUint(st.DataBytes, 10, 64)
+	got, err := strconv.ParseUint(st.DataAllocatedBytes, 10, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got >= uint64(apparent) {
-		t.Fatalf("dataBytes = %d, want allocated size less than apparent %d", got, apparent)
+		t.Skipf("filesystem does not report sparse allocation: allocated=%d apparent=%d", got, apparent)
+	}
+	if st.DataBytes != st.DataAllocatedBytes {
+		t.Fatalf("compat dataBytes = %q, want dataAllocatedBytes %q", st.DataBytes, st.DataAllocatedBytes)
+	}
+}
+
+func TestStatsEndpointReportsAllocatedAndApparentStorage(t *testing.T) {
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+	restore := withCgroupRoot(t, t.TempDir())
+	defer restore()
+
+	path := filepath.Join(e.data, e.name+".dat")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const apparent = int64(1 << 30)
+	if err := makeSparseFile(f); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Truncate(apparent); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &api{engine: e, token: "instance", started: time.Now()}
+	rec := requestStats(t, app, "instance")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Storage storageStats `json:"storage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Storage.DataApparentBytes != strconv.FormatInt(apparent, 10) {
+		t.Fatalf("dataApparentBytes = %s, want %d", body.Storage.DataApparentBytes, apparent)
+	}
+	allocated, err := strconv.ParseUint(body.Storage.DataAllocatedBytes, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocated >= uint64(apparent) {
+		t.Skipf("filesystem does not report sparse allocation: allocated=%d apparent=%d", allocated, apparent)
 	}
 }
 
@@ -110,6 +160,44 @@ func TestMemoryMaxLiteralMaxOmitsLimit(t *testing.T) {
 	limit, ok := body["memory"].(map[string]any)["limitBytes"]
 	if ok {
 		t.Fatalf("limitBytes serialized for memory.max=max: %#v", limit)
+	}
+}
+
+func TestMemoryWorkingSetSubtractsReclaimableFileCache(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "memory.current"), []byte("1000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "memory.max"), []byte("2000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "memory.stat"), []byte("file 700\ninactive_file 600\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "memory.events"), []byte("low 0\nhigh 2\nmax 0\noom 0\noom_kill 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "memory.pressure"), []byte("some avg10=0.00 avg60=0.00 avg300=0.00 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := withCgroupRoot(t, root)
+	defer restore()
+
+	mem := collectMemoryStats()
+	if mem == nil {
+		t.Fatal("memory stats omitted")
+	}
+	if mem.UsedBytes != "1000" || mem.ReclaimableBytes != "600" || mem.WorkingSetBytes != "400" {
+		t.Fatalf("memory = %#v, want used=1000 reclaimable=600 workingSet=400", mem)
+	}
+	if mem.FileBytes != "700" || mem.InactiveFileBytes != "600" {
+		t.Fatalf("file cache fields = %#v", mem)
+	}
+	if mem.Events["high"] != "2" {
+		t.Fatalf("events = %#v, want high=2", mem.Events)
+	}
+	if mem.Pressure["some"]["total"] != "123" {
+		t.Fatalf("pressure = %#v, want some.total=123", mem.Pressure)
 	}
 }
 
@@ -156,10 +244,14 @@ func TestNoTokenRejectedForStats(t *testing.T) {
 func requestStats(t *testing.T, app *api, token string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	setBearer(req, token)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	return rec
+}
+
+func setBearer(req *http.Request, token string) {
+	req.Header.Set("Authorization", strings.Join([]string{"Bearer", token}, " "))
 }
 
 func withCgroupRoot(t *testing.T, root string) func() {

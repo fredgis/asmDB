@@ -108,6 +108,24 @@ resource apimNsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = {
         }
       }
       {
+        // Open purely so the gateway can answer a plain-HTTP request and send
+        // it to HTTPS. Nothing is served over port 80: the inbound policy
+        // returns a 301 before any backend is reached. Without this the
+        // registrar's apex redirect, which targets http://, lands on a refused
+        // connection and the bare domain looks dead.
+        name: 'Allow-Internet-Http-Redirect-Inbound'
+        properties: {
+          priority: 111
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourcePortRange: '*'
+          destinationPortRange: '80'
+          sourceAddressPrefix: 'Internet'
+          destinationAddressPrefix: 'VirtualNetwork'
+        }
+      }
+      {
         name: 'Allow-AzureLoadBalancer-Inbound'
         properties: {
           priority: 120
@@ -760,6 +778,7 @@ resource apimApi 'Microsoft.ApiManagement/service/apis@2024-05-01' = if (deployA
     path: ''
     protocols: [
       'https'
+      'http'
     ]
     serviceUrl: 'https://${controlPlane.properties.configuration.ingress.fqdn}'
     subscriptionRequired: false
@@ -819,7 +838,7 @@ resource apimApiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01
   name: 'policy'
   properties: {
     format: 'xml'
-    value: '<policies><inbound><base /><set-backend-service base-url="https://${controlPlane.properties.configuration.ingress.fqdn}" /><!-- Container Apps ingress routes by Host header. Without this override the gateway forwards its own hostname, the environment does not recognise it, and every request comes back as a bare 404 with no body. --><set-header name="Host" exists-action="override"><value>${controlPlane.properties.configuration.ingress.fqdn}</value></set-header></inbound><backend><forward-request /></backend><outbound><base /></outbound><on-error><base /></on-error></policies>'
+    value: '<policies><inbound><base /><!-- The apex is a registrar redirect to this host over plain HTTP, so refusing HTTP outright leaves anyone typing the bare domain at a connection error. Answer, then send them to HTTPS. --><choose><when condition="@(context.Request.OriginalUrl.Scheme.Equals(&quot;http&quot;, StringComparison.OrdinalIgnoreCase))"><return-response><set-status code="301" reason="Moved Permanently" /><set-header name="Location" exists-action="override"><value>@("https://" + context.Request.OriginalUrl.Host + context.Request.OriginalUrl.Path + context.Request.OriginalUrl.QueryString)</value></set-header></return-response></when></choose><set-backend-service base-url="https://${controlPlane.properties.configuration.ingress.fqdn}" /><!-- Container Apps ingress routes by Host header. Without this override the gateway forwards its own hostname, the environment does not recognise it, and every request comes back as a bare 404 with no body. --><set-header name="Host" exists-action="override"><value>${controlPlane.properties.configuration.ingress.fqdn}</value></set-header></inbound><backend><forward-request /></backend><outbound><base /></outbound><on-error><base /></on-error></policies>'
   }
   dependsOn: [
     apimGetOperation
@@ -838,6 +857,7 @@ resource apimInstanceApi 'Microsoft.ApiManagement/service/apis@2024-05-01' = if 
     path: 'db'
     protocols: [
       'https'
+      'http'
     ]
     subscriptionRequired: false
   }

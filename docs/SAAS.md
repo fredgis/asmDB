@@ -53,6 +53,7 @@ Four consequences are worth keeping visible:
 7. [Observability, stats and costs](#7-observability-stats-and-costs)
 8. [Installation and deployment](#8-installation-and-deployment)
 8b. [⚠️ **ALERT** — the TLS certificate expires every 90 days](#8b-️-alert--the-tls-certificate-expires-every-90-days)
+8c. [Releasing a new engine version](#8c-releasing-a-new-engine-version)
 9. [Durability, upgrade and recovery](#9-durability-upgrade-and-recovery)
 10. [Limits and non-goals](#10-limits-and-non-goals)
 11. [Verified smoke checks](#11-verified-smoke-checks)
@@ -79,7 +80,10 @@ The live platform is in resource group `<service-resource-group>`, region `swede
 | Control plane app | `asmdb-cp` | Ingress is `external: true`, which in an internal Container Apps environment means the environment's private load balancer, not the internet. |
 
 The service is already reachable through APIM for the control-plane paths and
-site content listed in [§11](#11-verified-smoke-checks).
+site content listed in [§11](#11-verified-smoke-checks). The public custom
+hostname is becoming `https://www.asmdb.cloud`; the apex `asmdb.cloud` redirects
+to it at the registrar. The certificate story is deliberately called out in
+[§8b](#8b-️-alert--the-tls-certificate-expires-every-90-days).
 
 ---
 
@@ -203,6 +207,22 @@ The control plane exposes:
 | `POST /api/v1/databases/{id}/rotate-token` | Rotate the instance token. |
 | `POST /api/v1/databases/{id}/upgrade` | Backup, restart and upgrade an instance. |
 | `GET /api/v1/costs` | Estimated cost view. |
+
+The control-plane image also serves downloadable engine binaries as static
+files:
+
+```text
+/downloads/manifest.json
+/downloads/asmdb-<version>-windows-x64.exe
+/downloads/asmdb-<version>-linux-x64
+```
+
+The manifest is generated at build time and contains the engine version plus the
+filename, byte size and SHA-256 for each binary. Both binaries are assembled
+inside the same control-plane image that serves the site, from the same source
+tree. That keeps the download page, the manifest and the running fleet on the
+same build by construction. The release procedure in [§8c](#8c-releasing-a-new-engine-version)
+explains why the image is pinned to the version tag rather than `latest`.
 
 ---
 
@@ -585,6 +605,8 @@ flowchart TB
         Backups["backup/PITR beyond NFS<br/>and pre-upgrade BACKUP"]
         BuildPool["build agent inside VNet"]
         Replicas["read replicas / failover"]
+        ShareGrowth["automated share growth"]
+        Prealloc["preallocation economics"]
     end
 
     Contracts --> Sidecar --> Control --> Infra --> Network --> Auth
@@ -607,6 +629,8 @@ flowchart TB
 | Backups beyond provisioned share | Not landed, except the explicit `BACKUP` before upgrade. |
 | Build agent inside VNet | Not landed; ACR public network access remains enabled for workstation builds. |
 | Read replicas / failover | Not landed and incompatible with the current `maxReplicas: 1` instance shape. |
+| Grow the instance share ahead of demand | Not automated. Premium Files bills on provisioned capacity, so capacity must be added before the share fills — roughly 100 databases per 100 GiB. |
+| Revisit the engine's 1 GiB preallocation | Open question. The slot region drives the per-database GiB; a smaller region, or storage that honours sparseness, would change the economics. |
 
 ---
 
@@ -652,12 +676,12 @@ not wait. That is the product.
 
 Two economics worth stating plainly:
 
-- **The free tier is not free to run.** About $1.08/month each, funded by the
+- **The free tier is not free to run.** About $1.20/month each, funded by the
   paying tiers. The three-instance cap is a pricing control, not a technical
   limit.
-- **This is a volume model.** Fixed platform cost is ~$161/month regardless of
-  customers, so it stops dominating at roughly **150 databases**. Below that the
-  standard tier loses money.
+- **This is a volume model.** Fixed platform cost is about $142/month before
+  per-database storage, so it stops dominating at roughly **150 databases**.
+  Below that the standard tier loses money.
 
 ### Later tiers, not yet built
 

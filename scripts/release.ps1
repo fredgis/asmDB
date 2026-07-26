@@ -1,0 +1,128 @@
+<#
+.SYNOPSIS
+    Release asmdb: verify, build, publish, and make the upgrade available.
+
+.DESCRIPTION
+    One command takes a version from this source tree to the live service.
+
+    The version in src/asmdb.inc is the only input. It becomes the image tag,
+    which is what the control plane compares against each instance's recorded
+    image to decide whether to offer an upgrade — so the version is not a label,
+    it is the mechanism. It is also what the download page serves, because the
+    binaries are assembled inside the same image that serves the site.
+
+    Nothing is published that has not passed the test suite first.
+
+.EXAMPLE
+    .\scripts\release.ps1
+    Release the version currently in src/asmdb.inc.
+
+.EXAMPLE
+    .\scripts\release.ps1 -Bump patch
+    Bump the patch number, then release it.
+
+.EXAMPLE
+    .\scripts\release.ps1 -WhatIf
+    Show what would be released, and change nothing.
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('major', 'minor', 'patch')]
+    [string]$Bump,
+
+    # Skip the local build and test suite. Only for re-running a publish that
+    # already passed; a release has no business skipping its own tests.
+    [switch]$SkipTests,
+
+    [switch]$WhatIf
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$EngineHeader = Join-Path $RepoRoot 'src\asmdb.inc'
+
+function Write-Step($text) { Write-Host "`n== $text" -ForegroundColor Cyan }
+
+function Get-EngineVersion {
+    $header = Get-Content $EngineHeader -Raw
+    [pscustomobject]@{
+        Major = [int][regex]::Match($header, '%define\s+ENGINE_MAJOR\s+(\d+)').Groups[1].Value
+        Minor = [int][regex]::Match($header, '%define\s+ENGINE_MINOR\s+(\d+)').Groups[1].Value
+        Patch = [int][regex]::Match($header, '%define\s+ENGINE_PATCH\s+(\d+)').Groups[1].Value
+    }
+}
+
+function Set-EngineVersion($major, $minor, $patch) {
+    $header = Get-Content $EngineHeader -Raw
+    $header = [regex]::Replace($header, '(%define\s+ENGINE_MAJOR\s+)\d+', "`${1}$major")
+    $header = [regex]::Replace($header, '(%define\s+ENGINE_MINOR\s+)\d+', "`${1}$minor")
+    $header = [regex]::Replace($header, '(%define\s+ENGINE_PATCH\s+)\d+', "`${1}$patch")
+    Set-Content -Path $EngineHeader -Value $header -NoNewline
+}
+
+# ---------------------------------------------------------------- version ----
+
+$version = Get-EngineVersion
+if ($Bump) {
+    switch ($Bump) {
+        'major' { $version = [pscustomobject]@{ Major = $version.Major + 1; Minor = 0; Patch = 0 } }
+        'minor' { $version = [pscustomobject]@{ Major = $version.Major; Minor = $version.Minor + 1; Patch = 0 } }
+        'patch' { $version = [pscustomobject]@{ Major = $version.Major; Minor = $version.Minor; Patch = $version.Patch + 1 } }
+    }
+    if (-not $WhatIf) {
+        Set-EngineVersion $version.Major $version.Minor $version.Patch
+        Write-Host ">> bumped src/asmdb.inc to $($version.Major).$($version.Minor).$($version.Patch)" -ForegroundColor Yellow
+    }
+}
+$tag = "$($version.Major).$($version.Minor).$($version.Patch)"
+
+Write-Step "Releasing asmdb $tag"
+
+# ------------------------------------------------------------------ tests ----
+
+if (-not $SkipTests) {
+    Write-Step 'Building and testing locally'
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\build.ps1') | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Build failed. Nothing was published.' }
+
+    $smoke = & powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'tests\smoke.ps1') -NoBuild 2>&1
+    $smoke | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'The smoke suite failed. Nothing was published.' }
+
+    $summary = $smoke | Where-Object { $_ -match 'PASS=\d+' } | Select-Object -Last 1
+    if ($summary -and $summary -notmatch 'FAIL=0') {
+        throw "The smoke suite reported failures: $summary. Nothing was published."
+    }
+    Write-Host ">> $summary" -ForegroundColor Green
+} else {
+    Write-Host '>> tests skipped at request' -ForegroundColor Yellow
+}
+
+if ($WhatIf) {
+    Write-Step 'What would happen'
+    Write-Host "  images pushed as asmdb-instance:$tag and asmdb-controlplane:$tag (plus latest)"
+    Write-Host "  ASMDB_IMAGE pinned to asmdb-instance:$tag"
+    Write-Host "  /downloads serves the $tag binaries"
+    Write-Host "  every database on an older tag gets an upgrade offered"
+    return
+}
+
+# ---------------------------------------------------------------- publish ----
+
+Write-Step 'Publishing'
+& powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'saas\infra\deploy.ps1') -Tag $tag | Out-Host
+if ($LASTEXITCODE -ne 0) { throw 'Deployment failed.' }
+
+# ----------------------------------------------------------------- report ----
+
+Write-Step "Released $tag"
+Write-Host "  binaries : /downloads/asmdb-$tag-windows-x64.exe"
+Write-Host "             /downloads/asmdb-$tag-linux-x64"
+Write-Host "  instances: every database still on an older image now shows an"
+Write-Host "             upgrade, and takes it when its owner asks. Upgrading"
+Write-Host "             restarts the instance; the engine is single-writer, so"
+Write-Host "             that is a real interruption, not a rolling update."
+Write-Host ''
+Write-Host "  Remember to update the changelog in README.md for $tag." -ForegroundColor Yellow

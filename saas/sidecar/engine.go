@@ -157,6 +157,24 @@ func (e *Engine) startLocked() error {
 		return err
 	}
 	db := filepath.Join(e.data, e.name)
+	if err := e.recoverUpgradeSwapLocked(db); err != nil {
+		return err
+	}
+	err := e.startEngineLocked(db)
+	if !isIncompatibleFormatError(err) {
+		return err
+	}
+	logJSON("warn", "upgrade_required", map[string]any{"database": db, "error": err.Error()})
+	if err := e.runUpgradeLocked(db); err != nil {
+		return fmt.Errorf("database upgrade failed: %w", err)
+	}
+	if err := e.swapUpgradeLocked(db); err != nil {
+		return fmt.Errorf("database upgrade swap failed: %w", err)
+	}
+	return e.startEngineLocked(db)
+}
+
+func (e *Engine) startEngineLocked(db string) error {
 	cmd := exec.Command(e.bin, db)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -191,15 +209,18 @@ func (e *Engine) startLocked() error {
 		select {
 		case line, ok := <-lines:
 			if !ok {
+				e.clearFailedStartLocked(cmd)
 				return errors.New("engine exited during startup")
 			}
 			if strings.Contains(line, "type HELP") {
 				goto format
 			}
 			if isERR(line) {
+				e.clearFailedStartLocked(cmd)
 				return errors.New(statusDetail(line))
 			}
 		case <-deadline:
+			e.clearFailedStartLocked(cmd)
 			_ = cmd.Process.Kill()
 			return errors.New("engine startup timed out")
 		}
@@ -211,6 +232,18 @@ format:
 	}
 	logJSON("info", "engine_started", map[string]any{"database": db})
 	return nil
+}
+
+func (e *Engine) clearFailedStartLocked(cmd *exec.Cmd) {
+	e.stateMu.Lock()
+	if e.cmd == cmd {
+		e.cmd, e.stdin, e.lines, e.done = nil, nil, nil, nil
+		e.gen++
+	}
+	e.stateMu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
 }
 
 func (e *Engine) restartLocked(reason string) {

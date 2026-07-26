@@ -100,8 +100,9 @@ A [`FIND`](docs/COMMANDS.md#find) or
 
 ## asmdb Cloud
 
-asmdb Cloud is the same engine run as a managed service, with **asmdb.cloud** as
-the intended public domain. You create a database and get a real isolated asmdb
+asmdb Cloud is the same engine run as a managed service. The public hostname is
+becoming **https://www.asmdb.cloud**, with `asmdb.cloud` redirected to it by the
+registrar. You create a database and get a real isolated asmdb
 instance, reachable through the REST data API, an MCP endpoint for AI agents and
 a CLI. The endpoint and the instance access token are returned together once at
 creation; the token is then stored only as a hash and can be rotated from the
@@ -169,6 +170,25 @@ does not carry a client secret. The full design is in
 - **A real CLI** — colored banner, sectioned `HELP`, catalog commands, boxed result tables.
 
 ## Quickstart
+
+The hosted site publishes standalone binaries for both platforms:
+
+```text
+/downloads/manifest.json
+/downloads/asmdb-<version>-windows-x64.exe
+/downloads/asmdb-<version>-linux-x64
+```
+
+The manifest is generated at build time and carries the version, byte size and
+SHA-256 for each binary, so the page can only advertise the files it is serving.
+There is nothing to install; download the matching file and run it. On Linux,
+mark it executable first:
+
+```bash
+chmod +x asmdb-<version>-linux-x64
+```
+
+If you are building from source instead:
 
 **Windows** — requires x64 + NASM 3.x (`winget install --id NASM.NASM -e`):
 
@@ -1453,6 +1473,10 @@ Rules:
   guess never destroys data.
 - Run `VERSION` to see the engine build, the storage format, and which engine
   last wrote the open database.
+
+For asmdb Cloud releases, the same engine version in `src/asmdb.inc` drives the
+image tag, downloadable binaries and upgrade detection. The release procedure is
+kept in [`docs/SAAS.md §8c`](docs/SAAS.md#8c-releasing-a-new-engine-version).
 
 ## Project layout
 
