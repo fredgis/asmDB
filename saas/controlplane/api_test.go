@@ -185,6 +185,9 @@ func TestCreateDatabaseAndTokenOnlyOnce(t *testing.T) {
 	if created.Image != cfg.Image {
 		t.Fatalf("created image = %q, want %q", created.Image, cfg.Image)
 	}
+	if created.Engine != "1.5.0" {
+		t.Fatalf("created engine = %q, want 1.5.0", created.Engine)
+	}
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/databases/"+created.ID, nil)
@@ -316,6 +319,7 @@ func TestUpgradeAvailabilityFromVersionTags(t *testing.T) {
 		recorded         string
 		current          string
 		wantAvailable    bool
+		wantRunsEngine   string
 		wantEngine       string
 		wantAvailableImg string
 	}{
@@ -323,6 +327,7 @@ func TestUpgradeAvailabilityFromVersionTags(t *testing.T) {
 			name:             "equal tags",
 			recorded:         "reg.azurecr.io/asmdb-instance:1.5.0",
 			current:          "reg.azurecr.io/asmdb-instance:1.5.0",
+			wantRunsEngine:   "1.5.0",
 			wantEngine:       "1.5.0",
 			wantAvailableImg: "reg.azurecr.io/asmdb-instance:1.5.0",
 		},
@@ -331,6 +336,7 @@ func TestUpgradeAvailabilityFromVersionTags(t *testing.T) {
 			recorded:         "reg.azurecr.io/asmdb-instance:1.5.0",
 			current:          "reg.azurecr.io/asmdb-instance:1.5.1",
 			wantAvailable:    true,
+			wantRunsEngine:   "1.5.0",
 			wantEngine:       "1.5.1",
 			wantAvailableImg: "reg.azurecr.io/asmdb-instance:1.5.1",
 		},
@@ -338,22 +344,45 @@ func TestUpgradeAvailabilityFromVersionTags(t *testing.T) {
 			name:             "recorded missing tag cannot tell",
 			recorded:         "reg.azurecr.io/asmdb-instance",
 			current:          "reg.azurecr.io/asmdb-instance:1.5.1",
+			wantRunsEngine:   "unknown",
 			wantEngine:       "1.5.1",
 			wantAvailableImg: "reg.azurecr.io/asmdb-instance:1.5.1",
 		},
 		{
-			name:     "current missing tag cannot tell",
-			recorded: "reg.azurecr.io/asmdb-instance:1.5.0",
-			current:  "reg.azurecr.io/asmdb-instance",
+			name:           "current missing tag cannot tell",
+			recorded:       "reg.azurecr.io/asmdb-instance:1.5.0",
+			current:        "reg.azurecr.io/asmdb-instance",
+			wantRunsEngine: "1.5.0",
+			wantEngine:     "unknown",
 		},
 		{
-			name:     "digest current cannot tell",
-			recorded: "reg.azurecr.io/asmdb-instance:1.5.0",
-			current:  "reg.azurecr.io/asmdb-instance@sha256:abc",
+			name:           "digest current cannot tell",
+			recorded:       "reg.azurecr.io/asmdb-instance:1.5.0",
+			current:        "reg.azurecr.io/asmdb-instance@sha256:abc",
+			wantRunsEngine: "1.5.0",
+			wantEngine:     "unknown",
 		},
 		{
-			name:     "empty current cannot tell",
-			recorded: "reg.azurecr.io/asmdb-instance:1.5.0",
+			name:           "empty current cannot tell",
+			recorded:       "reg.azurecr.io/asmdb-instance:1.5.0",
+			wantRunsEngine: "1.5.0",
+			wantEngine:     "unknown",
+		},
+		{
+			name:             "latest recorded is unknown",
+			recorded:         "reg.azurecr.io/asmdb-instance:latest",
+			current:          "reg.azurecr.io/asmdb-instance:1.5.1",
+			wantRunsEngine:   "unknown",
+			wantEngine:       "1.5.1",
+			wantAvailableImg: "reg.azurecr.io/asmdb-instance:1.5.1",
+		},
+		{
+			name:             "digest recorded is unknown",
+			recorded:         "reg.azurecr.io/asmdb-instance@sha256:abc",
+			current:          "reg.azurecr.io/asmdb-instance:1.5.1",
+			wantRunsEngine:   "unknown",
+			wantEngine:       "1.5.1",
+			wantAvailableImg: "reg.azurecr.io/asmdb-instance:1.5.1",
 		},
 	}
 	for _, tt := range tests {
@@ -366,14 +395,29 @@ func TestUpgradeAvailabilityFromVersionTags(t *testing.T) {
 				Name:             "db",
 				Tier:             "free",
 				Image:            tt.recorded,
-				Engine:           "1.5.0",
 				CreatedAt:        time.Now().UTC(),
 				ContainerAppName: "db-test",
 			})
-			if got.UpgradeAvailable != tt.wantAvailable || got.AvailableEngine != tt.wantEngine || got.AvailableImage != tt.wantAvailableImg {
-				t.Fatalf("response = %+v, want available=%v engine=%q image=%q", got, tt.wantAvailable, tt.wantEngine, tt.wantAvailableImg)
+			if got.UpgradeAvailable != tt.wantAvailable || got.Engine != tt.wantRunsEngine || got.AvailableEngine != tt.wantEngine || got.AvailableImage != tt.wantAvailableImg {
+				t.Fatalf("response = %+v, want available=%v runs=%q availableEngine=%q image=%q", got, tt.wantAvailable, tt.wantRunsEngine, tt.wantEngine, tt.wantAvailableImg)
 			}
 		})
+	}
+}
+
+func TestHealthEngineOverridesImageTag(t *testing.T) {
+	api := newAPI(newMemoryStore(), &fakeProvisioner{states: map[string]liveState{}}, testStatsConfig(), allowVerifier())
+	got := api.responseFor(context.Background(), instance{
+		ID:               "db_abcdefghijklmnopqrstuvwx",
+		Name:             "db",
+		Tier:             "free",
+		Image:            "reg.azurecr.io/asmdb-instance:1.5.0",
+		Engine:           "1.5.0+hotfix",
+		CreatedAt:        time.Now().UTC(),
+		ContainerAppName: "db-test",
+	})
+	if got.Engine != "1.5.0+hotfix" {
+		t.Fatalf("engine = %q, want health-reported version", got.Engine)
 	}
 }
 

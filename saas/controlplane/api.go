@@ -26,8 +26,9 @@ const (
 )
 
 var (
-	namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
-	idPattern   = regexp.MustCompile(`^db_[a-z2-7]{24}$`)
+	namePattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
+	idPattern         = regexp.MustCompile(`^db_[a-z2-7]{24}$`)
+	versionTagPattern = regexp.MustCompile(`^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$`)
 )
 
 type api struct {
@@ -258,6 +259,7 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 		Name:             req.Name,
 		Tier:             req.Tier,
 		Image:            a.cfg.Image,
+		Engine:           engineFromImage(a.cfg.Image),
 		TokenHash:        tokenHash(token),
 		CreatedAt:        a.now(),
 		ContainerAppName: containerAppName(id),
@@ -272,10 +274,6 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 		_ = a.provisioner.Delete(context.Background(), in)
 		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
 		return
-	}
-	if engine, ok := a.refreshEngine(r.Context(), in); ok {
-		in.Engine = engine
-		_ = a.store.Save(context.Background(), in)
 	}
 
 	writeJSON(w, http.StatusCreated, databaseResponse{
@@ -487,6 +485,7 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	in.Image = a.cfg.Image
+	in.Engine = engineFromImage(in.Image)
 	if engine, ok := a.refreshEngine(r.Context(), in); ok {
 		in.Engine = engine
 	}
@@ -729,9 +728,9 @@ func includeStats(r *http.Request) bool {
 }
 
 func (a *api) upgradeAvailable(in instance) bool {
-	currentTag, currentOK := imageTag(a.cfg.Image)
-	recordedTag, recordedOK := imageTag(in.Image)
-	return currentOK && recordedOK && currentTag != recordedTag && in.Image != a.cfg.Image
+	_, currentOK := imageTag(a.cfg.Image)
+	_, recordedOK := imageTag(in.Image)
+	return currentOK && recordedOK && in.Image != a.cfg.Image
 }
 
 func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
@@ -744,7 +743,7 @@ func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
 		Name:             in.Name,
 		Tier:             in.Tier,
 		Image:            in.Image,
-		Engine:           in.Engine,
+		Engine:           engineForInstance(in),
 		State:            state.State,
 		Endpoint:         a.provisioner.Endpoint(in),
 		CreatedAt:        in.CreatedAt.Format(time.RFC3339),
@@ -756,11 +755,7 @@ func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
 }
 
 func (a *api) availableEngine() string {
-	tag, ok := imageTag(a.cfg.Image)
-	if !ok {
-		return ""
-	}
-	return tag
+	return engineFromImage(a.cfg.Image)
 }
 
 func (a *api) availableImage() string {
@@ -777,9 +772,23 @@ func imageTag(image string) (string, bool) {
 	lastSlash := strings.LastIndexByte(image, '/')
 	if colon := strings.LastIndexByte(image, ':'); colon > lastSlash {
 		tag := image[colon+1:]
-		return tag, tag != ""
+		return tag, versionTagPattern.MatchString(tag)
 	}
 	return "", false
+}
+
+func engineFromImage(image string) string {
+	if tag, ok := imageTag(image); ok {
+		return tag
+	}
+	return "unknown"
+}
+
+func engineForInstance(in instance) string {
+	if strings.TrimSpace(in.Engine) != "" {
+		return in.Engine
+	}
+	return engineFromImage(in.Image)
 }
 
 func (a *api) authorized(w http.ResponseWriter, r *http.Request) bool {
