@@ -397,7 +397,7 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 	// if Azure rejects the update, we restore the previous hash so failure
 	// leaves the old token working instead of returning a token the instance
 	// will not accept.
-	if err := a.store.Save(r.Context(), in); err != nil {
+	if err := a.store.Save(context.Background(), in); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
 		return
 	}
@@ -502,7 +502,7 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 	if engine, ok := a.refreshEngine(r.Context(), in); ok {
 		in.Engine = engine
 	}
-	if err := a.store.Save(r.Context(), in); err != nil {
+	if err := a.store.Save(context.Background(), in); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
 		return
 	}

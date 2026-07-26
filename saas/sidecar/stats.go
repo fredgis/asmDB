@@ -10,9 +10,8 @@ import (
 )
 
 const (
-	engineVersion = "1.5.0"
-	rowCapacity   = uint64(4_194_304)
-	statsTTL      = 2 * time.Second
+	rowCapacity = uint64(4_194_304)
+	statsTTL    = 2 * time.Second
 )
 
 var cgroupRoot = "/sys/fs/cgroup"
@@ -21,6 +20,7 @@ type statsResponse struct {
 	Rows          string       `json:"rows"`
 	Capacity      string       `json:"capacity"`
 	Engine        string       `json:"engine"`
+	StorageFormat string       `json:"storageFormat"`
 	UptimeSeconds int64        `json:"uptimeSeconds"`
 	Storage       storageStats `json:"storage"`
 	Memory        *memoryStats `json:"memory,omitempty"`
@@ -71,10 +71,12 @@ func (a *api) stats(r *http.Request) (*statsResponse, error) {
 	if started.IsZero() {
 		started = now
 	}
+	info := a.engine.engineInfo()
 	stats := &statsResponse{
 		Rows:          strconv.FormatUint(count, 10),
 		Capacity:      strconv.FormatUint(rowCapacity, 10),
-		Engine:        engineVersion,
+		Engine:        info.Version,
+		StorageFormat: info.StorageFormat,
 		UptimeSeconds: int64(now.Sub(started).Seconds()),
 		Storage:       collectStorageStats(a.engine.data, a.engine.name),
 		Memory:        collectMemoryStats(),

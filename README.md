@@ -7,7 +7,8 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). ~40 KB. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64): 42,749 bytes and 51,221 bytes respectively at 1.5.1.
+    And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -17,7 +18,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-~40%20KB%20PE%20%2F%20~48%20KB%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-42%2C749%20B%20PE%20%2F%2051%2C221%20B%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -80,7 +81,7 @@ time rather than silently trimmed.
 | **`id`** | `u64`, unique, ≥ 1 |
 | **`value`** | `i64` |
 | **Rows per transaction** | 4 096 distinct rows |
-| **Database on disk** | `<db>.dat` ~1 GiB sparse, plus `<db>.wal` and `<db>.cdc` |
+| **Database on disk** | `<db>.dat` ~1 GiB, sparse on local filesystems, plus `<db>.wal` and `<db>.cdc` |
 | **Concurrency** | one writer, unlimited `--reader` sessions |
 | **Not there** | no SQL, no joins, no query planner, no secondary indexes, no auth, no encryption |
 
@@ -101,9 +102,9 @@ A [`FIND`](docs/COMMANDS.md#find) or
 ## asmdb Cloud
 
 asmdb Cloud is the same engine run as a managed service. The public hostname is
-becoming **https://www.asmdb.cloud**, with `asmdb.cloud` redirected to it by the
-registrar. You create a database and get a real isolated asmdb
-instance, reachable through the REST data API, an MCP endpoint for AI agents and
+**https://www.asmdb.cloud**, with `asmdb.cloud` redirected to it by the
+registrar. You create a database and get a real isolated asmdb instance,
+reachable through the REST data API, an MCP endpoint for AI agents and
 a CLI. The endpoint and the instance access token are returned together once at
 creation; the token is then stored only as a hash and can be rotated from the
 management API.
@@ -226,8 +227,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · ~40 KB</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · ~48 KB</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 42,749 bytes</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · 51,221 bytes</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -444,7 +445,7 @@ flowchart LR
 
 ### The deep dive
 
-How ~40 KB of assembly becomes a durable database.
+How a 42,749-byte PE64 and a 51,221-byte ELF64 become a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -457,8 +458,8 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the binaries stay ~40 KB (PE) / ~48 KB (ELF) on disk — and why a
-million-row database needs only a few MB of RAM.
+which is why the binaries are 42,749 bytes (PE) and 51,221 bytes (ELF) at
+1.5.1 — and why a million-row database needs only a few MB of RAM.
 
 #### The record store — four cache lines per row
 
@@ -852,7 +853,7 @@ Two numbers are tracked separately and should not be confused:
 
 | | What it is | How often it moves | Effect |
 |---|---|---|---|
-| **Engine version** | the software (`1.4.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
+| **Engine version** | the software (`1.5.1`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
 | **Storage format** | the byte layout of `<db>.dat` (`2`) | rarely | decides whether a file can be opened, and what `--upgrade` migrates |
 
 Run `VERSION` inside the REPL to see both, plus which engine last wrote the open
@@ -1468,7 +1469,7 @@ holding a file the new binary declines:
 
 ```text
 [ERR] incompatible database format - refusing to open sales.dat
-      this build : version 1, record 256 B, capacity 4194304 slots
+      this build : version 2, record 256 B, capacity 4194304 slots
       that file  : version 1, record 256 B, capacity 262144 slots
 ```
 
@@ -1487,7 +1488,7 @@ and swap the files yourself:
   asmdb upgrade
   source   : sales.dat
   found    : format 1, record 256 B, capacity 262144 slots
-  this build expects format 1, record 256 B, capacity 4194304 slots
+  this build expects format 2, record 256 B, capacity 4194304 slots
   writing   : sales.upgraded.dat
 [ OK ] migrated 3 row(s)
 ```
@@ -1495,8 +1496,9 @@ and swap the files yourself:
 Rules:
 
 - **Already current** → nothing is written, exit 0.
-- **A capacity that differs** → migrated, as above.
-- **A storage format or record size with no migration path in this build** →
+- **An older storage format or capacity that this build can migrate** →
+  migrated, as above.
+- **A newer storage format, or a record size with no migration path in this build** →
   refused (`[ERR] no automatic migration from that format in this build`), so a
   guess never destroys data.
 - Run `VERSION` to see the engine build, the storage format, and which engine

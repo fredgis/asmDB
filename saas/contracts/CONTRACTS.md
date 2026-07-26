@@ -1,9 +1,9 @@
-# asmdb Cloud — frozen contracts
+# asmdb Cloud — contracts
 
-Wave 0 output. **Only the orchestrator changes this file.** Every stream codes
-against it; a stream that needs a change raises it and waits.
+Current contract for the deployed SaaS control plane, sidecar, and Azure shape.
+Every stream codes against it; a stream that needs a change raises it and waits.
 
-Version `2026-07-25.1`.
+Version `2026-07-26.1`.
 
 ---
 
@@ -15,12 +15,13 @@ Version `2026-07-25.1`.
 | **instance id** | `db_` + 24 lowercase base32 chars. Immutable. Also the Container App name suffix. |
 | **tier** | `free` · `standard` · `premium`. Selects CPU/memory and whether the app scales to zero. |
 | **access token** | opaque bearer string, 43 chars base64url, issued once at creation, stored hashed. |
+| **platform token** | per-instance read-only introspection bearer token derived as `HMAC-SHA256(ASMDB_PLATFORM_SECRET, instance id)`, accepted only by `/v1/stats`. |
 
 ---
 
 ## 2. Control-plane API
 
-Base: `https://<controlplane-host>/api/v1`. All JSON. All errors use §5.
+Base: `https://www.asmdb.cloud/api/v1`. All JSON. All errors use §5.
 
 ### `POST /databases`
 
@@ -36,16 +37,67 @@ Base: `https://<controlplane-host>/api/v1`. All JSON. All errors use §5.
   "id": "db_7k2m9x4qp1va8ne03wjr5tzy",
   "name": "my-notes",
   "tier": "free",
+  "image": "<registry>.azurecr.io/asmdb-instance:1.5.1",
+  "engine": "1.5.1",
   "state": "provisioning",
-  "endpoint": "https://db-7k2m9x4qp1va8ne03wjr5tzy.<env-domain>",
+  "endpoint": "https://www.asmdb.cloud/db/7k2m9x4qp1va8ne03wjr5tzy",
   "token": "<shown once, never again>",
-  "created_at": "2026-07-25T19:40:00Z"
+  "created_at": "2026-07-25T19:40:00Z",
+  "upgradeAvailable": false,
+  "availableEngine": "1.5.1",
+  "availableImage": "<registry>.azurecr.io/asmdb-instance:1.5.1"
 }
 ```
 
+### `GET /version` → `200 {"engine":"1.5.1","image":"<current instance image>"}`
+### `GET /config` → `200 {"tenantId","clientId","scope"}`
+### `GET /costs?from=&to=` → estimated costs from Azure Monitor `Replicas`
+Entra-authenticated. If absent, `from`/`to` default to the current calendar
+month and the window is capped at 31 days. Uses Azure Monitor metric
+`Replicas`, namespace `Microsoft.App/containerApps`, `Average` aggregation,
+`PT15M` grain. Response:
+
+```json
+{
+  "basis": "estimated from Azure Monitor Replicas average time at public list rates; not an invoice",
+  "from": "2026-07-01T00:00:00Z",
+  "to": "2026-07-26T12:00:00Z",
+  "totalUsd": 1.2345,
+  "counts": { "free": 1, "standard": 2 },
+  "databases": [
+    {
+      "id": "db_...",
+      "name": "my-notes",
+      "tier": "standard",
+      "size": "0.5 vCPU / 1Gi",
+      "state": "running",
+      "activeHours": 12.25,
+      "pausedHours": 600.75,
+      "estimatedComputeUsd": 0.5432,
+      "windowPredatesInstance": false,
+      "metricsUnavailable": false
+    }
+  ]
+}
+```
+
+It is an estimate, not an invoice; paused time from zero replicas has zero
+compute cost.
+
 ### `GET /databases` → `{ "databases": [ <object without token> ] }`
+`?include_stats=true` adds the compact `stats` block described below to each database object.
 ### `GET /databases/{id}` → the object without `token`
 ### `DELETE /databases/{id}` → **204**, idempotent (deleting a gone instance is 204)
+
+Database objects include:
+
+| field | meaning |
+|---|---|
+| `image` | image reference recorded at provisioning, including the version tag when known |
+| `engine` | engine version actually reported by `/health` if known; otherwise the provisioned image tag, or `"unknown"` |
+| `upgradeAvailable` | true only when both recorded and current images have parseable version tags and the full image references differ |
+| `availableEngine` | tag on current `ASMDB_IMAGE`, or `"unknown"` |
+| `availableImage` | current instance image when it has a parseable version tag |
 
 ### `POST /databases/{id}/exec`
 
@@ -69,10 +121,58 @@ the one control-plane route that speaks the data plane's credential.
 `ok` is `false` when the engine answered `[ERR]`. That is still **200** — an
 engine error is a normal thing to print in a terminal, not a transport failure.
 Reserve status codes for transport: `401` bad token, `404` no such instance,
-`400` malformed body, `502` instance unreachable, `504` instance timed out.
+`400` malformed body, `502` instance unreachable or malformed, `504`
+`instance_starting` when Azure returns its stopped-app HTML page for the whole
+cold-start retry budget.
 
-The client timeout must exceed 20 s: `free` and `standard` scale to zero, so
-the first command after an idle period waits for a cold start.
+The proxy retries Azure cold-start HTML for about 45 s and never returns that
+HTML body to clients. The browser can also call `POST /databases/{id}/wake` to
+start activation before the first terminal command.
+
+### `POST /databases/{id}/wake`
+
+Entra-authenticated. Triggers activation with an internal `/health` request and
+returns promptly with the current Azure state:
+
+```json
+{ "id": "db_...", "state": "stopped", "error": "" }
+```
+
+### `GET /databases/{id}/stats`
+
+Entra-authenticated. Calls the instance's internal `/v1/stats` with the
+per-instance platform token. It does not wake stopped instances.
+
+```json
+{ "available": true, "stats": { "...": "sidecar payload" } }
+```
+
+or
+
+```json
+{ "available": false, "reason": "stopped|instance_starting|unavailable|timeout|platform_token_unconfigured" }
+```
+
+### `POST /databases/{id}/rotate-token`
+
+Entra-authenticated. Generates a new instance token, updates the child Container
+App's `ASMDB_TOKEN`, and returns the new token once:
+
+```json
+{ "token": "<shown once>", "warning": "Token rotation restarts the instance and briefly interrupts active connections." }
+```
+
+If the Container App update fails, metadata is restored to the previous hash so
+the old token still works.
+
+### `POST /databases/{id}/upgrade`
+
+Entra-authenticated. Refused with `409 no_upgrade` when the instance already
+uses the current tagged image. Otherwise it runs `BACKUP` first, updates the
+Container App image in place, waits for Azure to report the revision healthy,
+and records the new image only after success. It is not zero-downtime: the
+instance restarts and active connections are interrupted. A stopped instance is
+deliberately started so the backup can run before the image change.
 
 ### Instance states
 
@@ -87,9 +187,9 @@ Two credentials, never interchangeable.
 
 | Routes | Credential |
 |---|---|
-| `POST`/`GET`/`DELETE /databases` | **Microsoft Entra ID** access token |
+| management routes under `/databases`, plus `/costs` | **Microsoft Entra ID** access token |
 | `POST /databases/{id}/exec` | the **instance** access token |
-| `GET /healthz`, `GET /config`, the static site | none |
+| `GET /healthz`, `GET /version`, `GET /config`, the static site | none |
 
 Management is gated on Entra sign-in. The token must be a **v2 access token**
 for `api://<client-id>/console.access`, verified against the tenant's JWKS —
@@ -113,11 +213,11 @@ Configuration arrives as `ASMDB_ENTRA_TENANT_ID`, `ASMDB_ENTRA_CLIENT_ID` and
 
 ## 3. Data-plane API (the sidecar, one per instance)
 
-Base: the instance `endpoint`. **Every route requires** `Authorization: Bearer <token>`.
+Base: the instance `endpoint`. Except for `/health`, routes require the instance access token in the `Authorization` header. `/v1/stats` also accepts the platform token.
 
 | Route | Body | Success |
 |---|---|---|
-| `GET /health` | — | `200 {"status":"ok","engine":"1.5.0","rows":<n>}` — **no auth** |
+| `GET /health` | — | `200 {"status":"ok","engine":"1.5.1","rows":<n>}` — **no auth** |
 | `GET /v1/rows?limit=&offset=` | — | `200 {"rows":[Row],"count":<n>,"hasMore":<bool>,"nextOffset":<n>}` |
 | `GET /v1/rows/{id}` | — | `200 {"row":Row}` / `404` |
 | `POST /v1/rows` | `Row` without timestamps | `201 {"row":Row}` |
@@ -128,9 +228,46 @@ Base: the instance `endpoint`. **Every route requires** `Authorization: Bearer <
 | `GET /v1/range?lo=&hi=&limit=&offset=` | — | same shape as `/v1/rows` |
 | `POST /v1/verify` | — | `200 {"ok":<bool>,"detail":"<engine output>"}` |
 | `POST /v1/exec` | `{"command":"<one line>"}` | `200 {"output":[<lines>],"ok":<bool>}` |
+| `GET /v1/stats` | — | `200` live stats payload; instance token or platform token |
 | `POST /mcp` | MCP streamable-HTTP | the MCP session |
 
 `limit` default 100, max 1000. `offset` default 0.
+
+`/v1/stats` is the only route that accepts the platform token. That token is
+not accepted for CRUD, `/v1/exec`, `/v1/verify`, or `/mcp`.
+
+Stats shape:
+
+```json
+{
+  "rows": "1",
+  "capacity": "4194304",
+  "engine": "1.5.1",
+  "uptimeSeconds": 123,
+  "storage": {
+    "dataBytes": "1073741824",
+    "dataAllocatedBytes": "1073741824",
+    "dataApparentBytes": "1073741824",
+    "walBytes": "0",
+    "walAllocatedBytes": "0",
+    "walApparentBytes": "0",
+    "cdcBytes": "0",
+    "cdcAllocatedBytes": "0",
+    "cdcApparentBytes": "0"
+  },
+  "memory": {
+    "usedBytes": "123",
+    "limitBytes": "456",
+    "fileBytes": "0",
+    "inactiveFileBytes": "0",
+    "reclaimableBytes": "0",
+    "workingSetBytes": "123",
+    "events": {},
+    "pressure": {}
+  },
+  "cpu": { "usageUsec": "1234", "limitCores": 0.5 }
+}
+```
 
 ### `/v1/exec` — the terminal's route
 
@@ -185,8 +322,10 @@ The sidecar owns exactly one child process: `asmdb <db> ` (writer). It **must**:
 3. Bound every listing with `PAGE <limit> <offset>` before the command.
 4. Treat a line starting `[ OK ]` as success and `[ERR]` as failure; the result
    set of a listing ends at the first status line.
-5. Serialise commands — one in flight at a time, with a 30 s timeout.
-6. Restart the engine if it exits, and fail all queued commands rather than hang.
+5. Serialise commands — one in flight at a time, with a short default timeout;
+   `BENCH`, `BACKUP`, `RESTORE`, `VERIFY`, and `TRUNCATE` get a long timeout.
+6. Restart the engine if it exits, wait/back off for the file lock, and fail
+   queued commands rather than hang.
 
 Engine facts the sidecar must not fight:
 
@@ -214,6 +353,9 @@ Every non-2xx from either plane:
 | `quota_exceeded` | 429 |
 | `engine_error` | 502 |
 | `internal` | 500 |
+| `instance_starting` | 504 |
+| `no_upgrade` | 409 |
+| `gateway_timeout` | 504 |
 
 ---
 
@@ -222,11 +364,13 @@ Every non-2xx from either plane:
 Capabilities are real. Prices are derived in [`docs/COST.md`](../../docs/COST.md)
 from Azure list rates, at **15 % margin on run**.
 
-| tier | price | CPU | memory | scale-to-zero | max instances / account |
+| tier/capability | price | CPU | memory | scale-to-zero | max instances / account |
 |---|---|---|---|---|---|
 | `free` | $0 | 0.25 | 0.5Gi | yes (idle 5 min) | 3 |
 | `standard` | $15/mo | 0.5 | 1Gi | yes (idle 30 min) | 20 |
 | `premium` | $49/mo | 1.0 | 2Gi | no (always warm) | 100 |
+| Microsoft Fabric Workload | planned for GA, premium capability | — | — | — | — |
+| automated backups | planned for GA, standard and premium capability | — | — | — | — |
 
 The sizes are not free choices: Container Apps Consumption accepts only fixed
 vCPU/memory pairs at a 1:2 ratio, and **0.25 / 0.5Gi is the floor** — there is
@@ -258,6 +402,7 @@ the volume is not configured.
 | Isolation | volume mount `subPath` = the instance id, so each database owns a directory |
 | Auth | none to carry: NFS is reachable only from the private VNet, so no account key exists to leak |
 | Mount path | `/data` — must equal `ASMDB_DATA`, asserted in `provisioner_test.go` |
+| Sparse files | not honoured on the live share; each database occupies about 1 GiB |
 
 SMB was rejected: Container Apps' SMB mount needs a storage account key, and
 the accounts here run with `allowSharedKeyAccess: false`.
@@ -296,3 +441,4 @@ deployment finds the same registry instead of creating a second one.
 | `saas/infra/` | Agent I |
 | `site/` | orchestrator only |
 | `src/`, `tests/`, `docs/`, `mcp/`, `README.md` | orchestrator only — **do not touch** |
+

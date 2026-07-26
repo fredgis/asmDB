@@ -25,7 +25,7 @@ binary or into the on-disk format.
 | `content` | 175 bytes | Documents, embeddings and blobs live elsewhere; the row holds a reference. |
 | `value` | one `i64` | The only numeric column, and the only one `RANGE` can filter on. |
 | Rows per transaction | 4 096 distinct | Bulk writes must be chunked by the API or the client. |
-| Disk per database | ~1 GiB sparse `.dat`, plus `.wal` and `.cdc` | The durable volume must be real; a Container App filesystem is not enough. |
+| Disk per database | ~1 GiB allocated `.dat` on Azure Files NFS, plus `.wal` and `.cdc` | The durable volume must be real; a Container App filesystem is not enough. |
 | Concurrency | one writer, unlimited `--reader` sessions | `maxReplicas` is fixed at 1. A second engine process is not extra capacity. |
 | Absent from the engine | no SQL, joins, planner, secondary indexes, auth, encryption or audit log | The platform supplies the controls it can; missing database features are not hidden. |
 
@@ -82,7 +82,7 @@ The live platform is in resource group `<service-resource-group>`, region `swede
 
 The service is already reachable through APIM for the control-plane paths and
 site content listed in [§11](#11-verified-smoke-checks). The public custom
-hostname is becoming `https://www.asmdb.cloud`; the apex `asmdb.cloud` redirects
+hostname is `https://www.asmdb.cloud`; the apex `asmdb.cloud` redirects
 to it at the registrar. The certificate story is deliberately called out in
 [§8b](#8b-alert--the-tls-certificate-expires-every-90-days).
 
@@ -149,15 +149,15 @@ APIM has two APIs.
 A customer receives this base endpoint:
 
 ```text
-https://asmdb-apim.azure-api.net/db/<instance>
+https://www.asmdb.cloud/db/<instance>
 ```
 
 The data-plane paths sit beneath it:
 
 ```text
-https://asmdb-apim.azure-api.net/db/<instance>/v1/rows
-https://asmdb-apim.azure-api.net/db/<instance>/mcp
-https://asmdb-apim.azure-api.net/db/<instance>/health
+https://www.asmdb.cloud/db/<instance>/v1/rows
+https://www.asmdb.cloud/db/<instance>/mcp
+https://www.asmdb.cloud/db/<instance>/health
 ```
 
 The instance API deliberately has no CORS policy. A browser calling an instance
@@ -364,15 +364,12 @@ az provider register -n Microsoft.Network
 Feature registration is asynchronous; wait for it to show as registered before
 running the first deployment.
 
-### 8.2 Build the image
+### 8.2 Build the images
 
-Docker is not required on the workstation. Images build with ACR Tasks. Run from
-the repository root so the Docker build context includes the engine and service
-files, not only the Dockerfile directory:
-
-```powershell
-az acr build --registry <acr> --image asmdb-instance:latest --file saas/sidecar/Dockerfile .
-```
+Docker is not required on the workstation. `saas/infra/deploy.ps1` builds both
+images with ACR Tasks from the repository root, tags them with the engine
+version and also writes `latest` as a convenience tag. Releases normally go
+through [§8c](#8c-releasing-a-new-engine-version), which runs the tests first.
 
 ### 8.3 Run the deployment script
 
@@ -566,12 +563,12 @@ image instances run, and whether an upgrade is offered. It lives in
 ```nasm
 %define ENGINE_MAJOR 1
 %define ENGINE_MINOR 5
-%define ENGINE_PATCH 0
+%define ENGINE_PATCH 1
 ```
 
-`deploy.ps1` reads it and uses it as the release tag. That is not cosmetic. The
-control plane offers an upgrade when an instance's recorded image differs from
-the current `ASMDB_IMAGE`, so **a tag of `latest` would make upgrades
+`scripts/release.ps1` reads it and uses it as the release tag. That is not
+cosmetic. The control plane offers an upgrade when an instance's recorded image
+differs from the current `ASMDB_IMAGE`, so **a tag of `latest` would make upgrades
 impossible** — `latest` never differs from itself. Pinning the version tag is
 what makes the upgrade path work at all.
 
@@ -606,7 +603,7 @@ a release doubly so.
 **4 — deploy**
 
 ```powershell
-.\saas\infra\deploy.ps1
+.\scripts\release.ps1
 ```
 
 which, without further arguments:
@@ -614,7 +611,7 @@ which, without further arguments:
 - reads the version from `src/asmdb.inc` and prints it as the release tag;
 - assembles both binaries and both images from that source;
 - pushes each image twice, as `<version>` and as `latest`;
-- points `ASMDB_IMAGE` at the **version** tag.
+- calls `saas/infra/deploy.ps1` so `ASMDB_IMAGE` points at the **version** tag.
 
 **5 — what happens on its own**
 
@@ -684,7 +681,7 @@ revision starts.
 
 ## 11. Verified smoke checks
 
-The following have been proven through `https://asmdb-apim.azure-api.net`:
+The following have been proven through `https://www.asmdb.cloud`:
 
 | Request | Result |
 |---|---|
@@ -763,7 +760,7 @@ flowchart TB
 
 ## 14. Pricing & packaging
 
-Three tiers ship today, priced from Azure list rates at **15 % margin on run**.
+The planned public packaging has three tiers, priced from Azure list rates at **15 % margin on run**.
 The derivation — every rate, every assumption, and what would break the model —
 is in [`COST.md`](COST.md).
 
@@ -775,7 +772,9 @@ is in [`COST.md`](COST.md).
 
 Every tier runs the identical engine, with the same 4 194 304-row ceiling and
 the same durability. Tiers buy **latency and headroom, not features** — there is
-no paid feature flag in the codebase and there is not meant to be one.
+no paid feature flag in the codebase and there is not meant to be one. The site
+may list planned GA rows such as Microsoft Fabric Workload and automated
+backups; those are not deployed capabilities today.
 
 The sizes are not free choices. Container Apps Consumption accepts only fixed
 vCPU/memory pairs at a 1:2 ratio and **0.25 vCPU / 0.5 GiB is the floor**, so

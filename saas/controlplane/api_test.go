@@ -549,7 +549,11 @@ func TestRotateTokenPushFailureRestoresOldHash(t *testing.T) {
 	if err := store.Save(context.Background(), instance{ID: id, Name: "db", Tier: "free", TokenHash: oldHash, ContainerAppName: "db-test"}); err != nil {
 		t.Fatal(err)
 	}
-	api := newTestAPI(store, &fakeProvisioner{rotateErr: errors.New("update failed"), states: map[string]liveState{}})
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, execResponse{Output: []string{"ok"}, OK: true})
+	}))
+	defer sidecar.Close()
+	api := newTestAPI(store, &fakeProvisioner{rotateErr: errors.New("update failed"), states: map[string]liveState{}, internalEndpoint: sidecar.URL})
 	mux := http.NewServeMux()
 	api.register(mux)
 
@@ -566,6 +570,14 @@ func TestRotateTokenPushFailureRestoresOldHash(t *testing.T) {
 	}
 	if got.TokenHash != oldHash {
 		t.Fatalf("hash = %q, want old hash restored", got.TokenHash)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/databases/"+id+"/exec", strings.NewReader(`{"command":"SELECT *"}`))
+	req.Header.Set("Authorization", "Bearer old-token")
+	mux.ServeHTTP(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("old token was rejected after failed rotation: %s", rec.Body.String())
 	}
 }
 

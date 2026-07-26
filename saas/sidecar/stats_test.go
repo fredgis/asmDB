@@ -34,8 +34,11 @@ func TestStatsReturnsRowsCapacityAndStringNumbers(t *testing.T) {
 	if got, ok := body["capacity"].(string); !ok || got != strconv.FormatUint(rowCapacity, 10) {
 		t.Fatalf("capacity = %#v, want string %q", body["capacity"], strconv.FormatUint(rowCapacity, 10))
 	}
-	if got := body["engine"]; got != engineVersion {
-		t.Fatalf("engine = %#v, want %q", got, engineVersion)
+	if got := body["engine"]; got != "9.8.7" {
+		t.Fatalf("engine = %#v, want %q", got, "9.8.7")
+	}
+	if got := body["storageFormat"]; got != "42" {
+		t.Fatalf("storageFormat = %#v, want %q", got, "42")
 	}
 	if _, ok := body["memory"]; ok {
 		t.Fatalf("memory present with missing cgroup files: %#v", body["memory"])

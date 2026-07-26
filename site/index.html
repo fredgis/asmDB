@@ -522,7 +522,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
       <p class="sec__sub">
         Creation, access, monitoring and CLI commands are separated so the selected
         database is always explicit. The instance token is shown once at creation;
-        paste it again when opening an existing database from a fresh browser session.
+        this tab can hold it for the session, or you can rotate it if it is lost.
       </p>
     </div>
 
@@ -569,7 +569,7 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
       </nav>
 
       <section class="console-view" id="console-view-create" data-console-view="create" aria-labelledby="create-title">
-        <div class="console console-panel console-panel--narrow">
+        <div class="console console-panel">
           <div class="console-card__head">
             <div>
               <p class="sec__kicker">Create</p>
@@ -625,16 +625,26 @@ db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<
                 <h3 class="console-card__title" id="token-title">Instance token</h3>
               </div>
             </div>
+            <div class="token-needed" id="token-needed" hidden></div>
             <p class="console-card__note">Paste the selected database token to preview rows or run CLI commands. It is not an Entra token.</p>
+            <div class="token-held" id="token-held" hidden>
+              <span>Token held for this tab: <code id="token-mask">masked</code></span>
+              <button class="btn btn--ghost token-reveal" id="token-reveal" type="button">Hold to reveal</button>
+            </div>
             <div class="field terminal__token" id="term-token-wrap">
               <label for="term-token">token for selected database</label>
               <input id="term-token" type="password" autocomplete="off" spellcheck="false" placeholder="paste bearer token">
-              <span class="hint">Shown once at creation. Stored only in this page session.</span>
+              <span class="hint">The token lives in sessionStorage for this tab until it closes.</span>
             </div>
+            <p class="console-card__note token-rotation-warning">
+              Rotate token if the original was lost. Rotation issues a new token, invalidates the old one immediately, restarts the instance, and interrupts existing clients until they are updated.
+            </p>
             <div class="console-actions console-actions--compact">
               <button class="btn btn--primary" id="save-token" type="button">Use token</button>
+              <button class="btn btn--ghost btn--danger" id="rotate-token" type="button">Rotate token</button>
               <a class="btn btn--ghost" href="#cli">Open CLI</a>
             </div>
+            <pre class="out mono token-output" id="rotated-token-output" hidden></pre>
           </section>
         </div>
       </section>

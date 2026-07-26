@@ -81,9 +81,9 @@ agent pool inside the VNet; that is not deployed.
 
 Database traffic is routed through the gateway by path:
 
-- `https://asmdb-apim.azure-api.net/db/<instance>/v1/rows`
-- `https://asmdb-apim.azure-api.net/db/<instance>/mcp`
-- `https://asmdb-apim.azure-api.net/db/<instance>/health`
+- `https://www.asmdb.cloud/db/<instance>/v1/rows`
+- `https://www.asmdb.cloud/db/<instance>/mcp`
+- `https://www.asmdb.cloud/db/<instance>/health`
 
 Everything after the instance identifier is forwarded verbatim to the instance,
 so the REST and MCP contracts are unchanged except for the `/db/<instance>`
@@ -94,7 +94,7 @@ Container Apps ingress does not set `allowInsecure`; the platform default is
 false, so HTTP is redirected to HTTPS. There is no plaintext hop in the request
 path.
 
-The public hostname is becoming `https://www.asmdb.cloud`, with `asmdb.cloud`
+The public hostname is `https://www.asmdb.cloud`, with `asmdb.cloud`
 redirected to it by the registrar. That hostname uses a Let's Encrypt
 certificate that expires every 90 days. The manual renewal procedure and alert
 are documented in [`SAAS.md`](SAAS.md) §8b.

@@ -5,6 +5,10 @@ the **asmdb** transactional engine as a **generic CRUD store** over MCP. Any MCP
 client can insert, update, get, delete, search, list and count rows — all backed
 by the WAL-durable x86-64 assembly engine.
 
+Current engine: **1.5.1**, storage format **2**. The binaries are 42,749 bytes
+(PE64) and 51,221 bytes (ELF64), and downloads are published at
+<https://www.asmdb.cloud/downloads/> with SHA-256 hashes in the manifest.
+
 **Agent memory is one example use case** (address each memory by a string key,
 use `tag` as a namespace and `content` as the remembered text) — but the tools
 are a general-purpose database interface, not memory-specific.
@@ -14,7 +18,7 @@ flowchart LR
     CLIENT["MCP client<br/>(agent, IDE)"]
     SERVER["asmdb-mcp<br/>(Node server)"]
     ENGINE["asmdb / asmdb.exe<br/>(engine)"]
-    FILES[("asmdb.dat<br/>asmdb.wal")]
+    FILES[("asmdb.dat<br/>asmdb.wal<br/>asmdb.cdc")]
     CLIENT -->|"MCP (stdio) · tool calls"| SERVER
     SERVER -->|"stdin/stdout · commands"| ENGINE
     ENGINE --> FILES
@@ -37,12 +41,19 @@ the pages actually touched become resident; every tool call is then an in-memory
 hash lookup plus a small durable write. When the MCP client disconnects, the
 server shuts the engine down cleanly (no orphaned process).
 
+For hosted databases, every instance also speaks MCP over HTTP at
+`https://www.asmdb.cloud/db/<instance>/mcp` using the instance bearer token; REST
+is available at `/v1/rows`. See [`../docs/SAAS.md`](../docs/SAAS.md) for the
+platform details. The local engine itself has no authentication, encryption or
+audit log; those are supplied by the host around it.
+
 ## Addressing rows: `id` or `key`
 
 Every record-addressed tool accepts **either**:
 
 - `id` — a decimal string primary key (`u64`), used as-is (the generic-DB
-  pattern; JS safe-integer numbers are accepted for convenience), or
+  pattern; small JS safe-integer numbers are accepted, but strings are the
+  portable form), or
 - `key` — a free-text string that the server hashes to a `u64` id with 64-bit
   **FNV-1a** (the named-record / agent-memory pattern).
 
@@ -53,8 +64,8 @@ For keyed rows, the server stores a hidden content prefix
 content round-trips unchanged. On `db_get`/`db_delete` by `key`, the decoded key
 must exactly match the requested key; otherwise the server reports a
 `keyCollision` error instead of returning or deleting a row that belongs to a
-different key. Because the engine content column holds 175 usable bytes, keyed rows must
-fit the caller content plus this metadata in 176 UTF-8 bytes.
+different key. Because the engine content column holds 175 usable bytes, keyed
+rows must fit the caller content plus this metadata in 175 UTF-8 bytes.
 
 The rest of the record maps as:
 
@@ -111,7 +122,7 @@ platforms the default executable name is `build/asmdb`.
 
 | MCP server | Engine | Storage format | CLI protocol |
 |------------|--------|----------------|--------------|
-| 1.2.0 | 1.2.0 – 1.4.x | 2 (`.dat` + `.wal` + `.cdc`) | REPL with `FORMAT TSV` rows (`R<TAB>…`) and `PAGE <limit> <offset>` |
+| 1.2.0 | 1.2.0 – 1.5.1 | 2 (`.dat` + `.wal` + `.cdc`) | REPL with `FORMAT TSV` rows (`R<TAB>…`) and `PAGE <limit> <offset>` |
 | 1.1.0 | 1.1.0 | 2 (`.dat` + `.wal` + `.cdc`) | Human table parsing — content silently truncated at 39 bytes; do not use |
 | 1.0.0 | 1.0.0 | 2 (`.dat` + `.wal` + `.cdc`) | Human table parsing — content silently truncated at 39 bytes; do not use |
 
@@ -141,8 +152,8 @@ Add the server to your client's MCP configuration (example for a
 **Generic key/value+text store**, addressing rows by numeric id:
 
 ```jsonc
-db_insert { "id": 1001, "tag": "order", "value": 4200, "content": "invoice #1001 paid" }
-db_get    { "id": 1001 }
+db_insert { "id": "1001", "tag": "order", "value": "4200", "content": "invoice #1001 paid" }
+db_get    { "id": "1001" }
 db_find   { "query": "invoice" }
 ```
 

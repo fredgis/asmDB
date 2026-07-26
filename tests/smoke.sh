@@ -605,6 +605,54 @@ if command -v python3 > /dev/null 2>&1; then
     check 'CDCTRIM below the base refused'       'below the log base'    "$rt5"
 fi
 
+# Every command response must end in exactly one status line so line-oriented
+# machine consumers can stay synchronized.
+terminators() {
+    local base="$1"; shift
+    local out
+    out="$(printf '%s\n' "$@" 'EXIT' | ./asmdb "$base" 2>&1)"
+    grep -oE '\[( OK |ERR)\]' <<< "$out" | wc -l | tr -d ' '
+}
+protocol_cmds=('HELP' 'SCHEMA' 'VERSION' 'SELECT *' 'COUNT' 'FORMAT TSV' 'PAGE 10 0' 'STATUS' 'INFO')
+for cmd in "${protocol_cmds[@]}"; do
+    safe="${cmd//[^A-Za-z0-9]/_}"
+    n="$(terminators "proto_$safe" "$cmd")"
+    if [[ "$n" == "1" ]]; then
+        echo "  [PASS] protocol terminator: $cmd"
+    else
+        echo "  [FAIL] protocol terminator: $cmd (got $n)"; fail=$((fail+1))
+    fi
+done
+for cmd in "${protocol_cmds[@]}"; do
+    safe="${cmd//[^A-Za-z0-9]/_}"
+    if [[ "$cmd" == "FORMAT TSV" ]]; then
+        n="$(terminators "protot_$safe" "$cmd")"
+    else
+        n="$(( $(terminators "protot_$safe" 'FORMAT TSV' "$cmd") - 1 ))"
+    fi
+    if [[ "$n" == "1" ]]; then
+        echo "  [PASS] protocol terminator in TSV: $cmd"
+    else
+        echo "  [FAIL] protocol terminator in TSV: $cmd (got $n)"; fail=$((fail+1))
+    fi
+done
+printf '%s\n' 'INSERT 1 1 a one' 'INSERT 2 2 b two' 'EXIT' | ./asmdb proto_rows > /dev/null
+for cmd in 'SELECT *' 'SELECT 1' 'FIND one' 'RANGE 0 2' 'TABLES' 'DATABASES' 'TYPES'; do
+    n="$(terminators proto_rows "$cmd")"
+    if [[ "$n" == "1" ]]; then
+        echo "  [PASS] protocol terminator: $cmd with rows"
+    else
+        echo "  [FAIL] protocol terminator: $cmd with rows (got $n)"; fail=$((fail+1))
+    fi
+done
+sync_out="$(printf '%s\n' 'FORMAT TABLE' 'HELP' 'COUNT' 'EXIT' | ./asmdb proto_sync 2>&1)"
+mapfile -t sync_terms < <(grep -oE '\[( OK |ERR)\][^\r]*' <<< "$sync_out")
+if [[ "${sync_terms[0]:-}" =~ format\ table && "${sync_terms[1]:-}" =~ help\ shown && "${sync_terms[2]:-}" =~ 0\ row\(s\) ]]; then
+    echo "  [PASS] protocol stays synchronized after HELP"
+else
+    echo "  [FAIL] protocol stays synchronized after HELP"; fail=$((fail+1))
+fi
+
 # A whole-table operation is crash-atomic. TRUNCATE clears the slots one write
 # at a time, so a crash used to leave some rows deleted, some not, and a row
 # count matching neither. It is announced in the header before it starts, and

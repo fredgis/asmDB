@@ -1,9 +1,14 @@
 # Connecting to asmdb from your application
 
+Current engine: **1.5.1**, storage format **2**. The binaries are 42,749 bytes
+(PE64) and 51,221 bytes (ELF64), and downloads are published at
+<https://www.asmdb.cloud/downloads/> with SHA-256 hashes in the manifest.
+
 **asmdb is not a server and there is no driver / client library.** It is a
 single executable that behaves as a REPL: it reads one command per line from
 **stdin** and writes results to **stdout**. There is no socket, shared library,
-or long-lived daemon to connect to.
+or long-lived daemon to connect to. The local engine also has no authentication,
+encryption or audit log; put those controls around it if you embed it.
 
 So "connecting" means one thing: **spawn `asmdb` as a child process and pipe
 text to it.** The executable is `asmdb.exe` on Windows and `asmdb` elsewhere.
@@ -34,6 +39,16 @@ R<TAB>id<TAB>value<TAB>created<TAB>updated<TAB>tag<TAB>content
 In `tag` and `content`, only backslash, tab, LF, and CR are escaped as `\\`,
 `\t`, `\n`, and `\r`. `PAGE 0 0` restores unlimited listing. `FORMAT TABLE`
 returns to the human-readable table format.
+
+Keep `id` and `value` as decimal strings in any JSON or network protocol. A
+`u64` id and `i64` value do not fit safely in every JavaScript number. Tags are
+limited to 39 usable UTF-8 bytes, content to 175 usable UTF-8 bytes, and the
+engine refuses over-long values rather than truncating them. The fixed record
+size is 256 bytes and the row ceiling is 4,194,304.
+
+There is also a hosted option: cloud instances expose REST at `/v1/rows` and MCP
+at `https://www.asmdb.cloud/db/<instance>/mcp` with the instance bearer token.
+See [`../docs/SAAS.md`](../docs/SAAS.md) for the platform shape.
 
 ## Examples in this folder
 

@@ -635,6 +635,39 @@ open(sys.argv[1], 'wb').write(bytes(hdr) + bytes(data))
         Check 'CDCTRIM below the base refused' ($rt5 -match 'below the log base')
     }
 
+    # Run 17a: every command response must end in exactly one status line so
+    # line-oriented machine consumers can stay synchronized.
+    function TerminatorCount([string[]]$commands, [string]$base) {
+        $out = (($commands + @('EXIT')) -join "`n") | .\asmdb.exe $base 2>&1
+        return ([regex]::Matches(($out -join "`n"), '\[(?: OK |ERR)\]')).Count
+    }
+    $protocolCommands = @('HELP', 'SCHEMA', 'VERSION', 'SELECT *', 'COUNT', 'FORMAT TSV', 'PAGE 10 0', 'STATUS', 'INFO')
+    foreach ($cmd in $protocolCommands) {
+        $base = 'proto_' + ($cmd -replace '[^A-Za-z0-9]', '_')
+        Check "protocol terminator: $cmd" ((TerminatorCount @($cmd) $base) -eq 1)
+    }
+    foreach ($cmd in $protocolCommands) {
+        $base = 'protot_' + ($cmd -replace '[^A-Za-z0-9]', '_')
+        $n = if ($cmd -eq 'FORMAT TSV') {
+            TerminatorCount @($cmd) $base
+        } else {
+            (TerminatorCount @('FORMAT TSV', $cmd) $base) - 1
+        }
+        Check "protocol terminator in TSV: $cmd" ($n -eq 1)
+    }
+    (@('INSERT 1 1 a one', 'INSERT 2 2 b two', 'EXIT') -join "`n") | .\asmdb.exe proto_rows | Out-Null
+    foreach ($cmd in @('SELECT *', 'SELECT 1', 'FIND one', 'RANGE 0 2', 'TABLES', 'DATABASES', 'TYPES')) {
+        $base = 'proto_rows'
+        Check "protocol terminator: $cmd with rows" ((TerminatorCount @($cmd) $base) -eq 1)
+    }
+    $sync = (@('FORMAT TABLE', 'HELP', 'COUNT', 'EXIT') -join "`n") | .\asmdb.exe proto_sync
+    $terms = [regex]::Matches(($sync -join "`n"), '\[(?: OK |ERR)\][^\r\n]*') | ForEach-Object { $_.Value }
+    Check 'protocol stays synchronized after HELP' (
+        $terms.Count -ge 3 -and
+        $terms[0] -match 'format table' -and
+        $terms[1] -match 'help shown' -and
+        $terms[2] -match '0 row\(s\)')
+
     # ---------------------------------------------------------------------
     # Run 17b: a whole-table operation is crash-atomic. TRUNCATE clears four
     # million slots one write at a time, so a crash used to leave some rows

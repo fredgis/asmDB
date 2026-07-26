@@ -778,8 +778,8 @@ asmdb [<database>] [<table>] [--upgrade]
 
 ### `--upgrade`
 
-Migrates a `.dat` this build would otherwise refuse — today, one written when
-the table had a different capacity, which is what produces
+Migrates a `.dat` this build would otherwise refuse — today, one written with
+an older storage format or a different capacity, which is what produces
 `[ERR] incompatible database format`.
 
 ```text
@@ -787,7 +787,7 @@ the table had a different capacity, which is what produces
   asmdb upgrade
   source   : sales.dat
   found    : format 1, record 256 B, capacity 262144 slots
-  this build expects format 1, record 256 B, capacity 4194304 slots
+  this build expects format 2, record 256 B, capacity 4194304 slots
   writing   : sales.upgraded.dat
 [ OK ] migrated 3 row(s)
   The original was NOT modified. Check the new file, then swap them:
@@ -801,6 +801,6 @@ migration costs nothing — you inspect the result and swap the files yourself.
 | Situation | Outcome | Exit |
 |---|---|--:|
 | already in this build's format | nothing written | 0 |
-| capacity differs | migrated to `<db>.upgraded.dat` | 0 |
-| storage format or record size differs | `[ERR] no automatic migration from that format in this build` | 1 |
+| older storage format or capacity differs | migrated to `<db>.upgraded.dat` | 0 |
+| newer storage format, or record size differs | `[ERR] no automatic migration from that format in this build` | 1 |
 | no such database | `[ERR] no database file to upgrade` | 1 |

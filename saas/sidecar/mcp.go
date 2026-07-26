@@ -26,10 +26,10 @@ type rpcRequest struct {
 }
 
 type rpcResponse struct {
-	JSONRPC string     `json:"jsonrpc"`
-	ID      any        `json:"id,omitempty"`
-	Result  any        `json:"result,omitempty"`
-	Error   *rpcError  `json:"error,omitempty"`
+	JSONRPC string    `json:"jsonrpc"`
+	ID      any       `json:"id,omitempty"`
+	Result  any       `json:"result,omitempty"`
+	Error   *rpcError `json:"error,omitempty"`
 }
 
 type rpcError struct {
@@ -47,10 +47,11 @@ func (a *api) handleMCP(w http.ResponseWriter, r *http.Request) {
 	resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
 	switch req.Method {
 	case "initialize":
+		info := a.engine.engineInfo()
 		resp.Result = map[string]any{
 			"protocolVersion": "2024-11-05",
-			"capabilities":     map[string]any{"tools": map[string]any{}},
-			"serverInfo":       map[string]any{"name": "asmdb", "version": "1.5.0-sidecar"},
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo":      map[string]any{"name": "asmdb", "version": info.Version + "-sidecar", "storageFormat": info.StorageFormat},
 		}
 	case "tools/list":
 		resp.Result = map[string]any{"tools": mcpTools()}

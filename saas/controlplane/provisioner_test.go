@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"regexp"
+	"slices"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/appcontainers/armappcontainers/v3"
 )
 
@@ -245,4 +248,143 @@ func TestMapAzureState(t *testing.T) {
 			}
 		})
 	}
+}
+
+type fakeAppUpdateBackend struct {
+	app       armappcontainers.ContainerApp
+	ops       []string
+	startErr  error
+	finalOnly bool
+}
+
+func (b *fakeAppUpdateBackend) GetContainerApp(context.Context, instance) (armappcontainers.ContainerApp, error) {
+	return b.app, nil
+}
+
+func (b *fakeAppUpdateBackend) StopContainerApp(context.Context, instance) error {
+	b.ops = append(b.ops, "stop")
+	return nil
+}
+
+func (b *fakeAppUpdateBackend) CreateOrUpdateContainerApp(_ context.Context, _ instance, app armappcontainers.ContainerApp) error {
+	token := firstEnvValue(app, "ASMDB_TOKEN")
+	b.ops = append(b.ops, "apply:"+token)
+	b.app = app
+	return nil
+}
+
+func (b *fakeAppUpdateBackend) StartContainerApp(context.Context, instance) error {
+	b.ops = append(b.ops, "start")
+	if b.startErr != nil {
+		err := b.startErr
+		b.startErr = nil
+		return err
+	}
+	return nil
+}
+
+func (b *fakeAppUpdateBackend) WaitContainerAppReady(context.Context, instance) error {
+	token := firstEnvValue(b.app, "ASMDB_TOKEN")
+	b.ops = append(b.ops, "ready:"+token)
+	if b.finalOnly && token != "old" {
+		return errors.New("new revision unhealthy")
+	}
+	return nil
+}
+
+func TestContainerAppUpdateStopsBeforeApplyingAndStarting(t *testing.T) {
+	backend := &fakeAppUpdateBackend{app: testAppWithToken("old")}
+	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", ContainerAppName: "db-test"}
+	err := updateContainerAppStopThenStart(context.Background(), backend, in, func(c *armappcontainers.Container) {
+		setContainerEnv(c, "ASMDB_TOKEN", "new")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"stop", "apply:new", "start", "ready:new"}
+	if !slices.Equal(backend.ops, want) {
+		t.Fatalf("ops = %#v, want %#v", backend.ops, want)
+	}
+}
+
+func TestContainerAppUpdateAlreadyStoppedDoesNotRequireStopCall(t *testing.T) {
+	app := testAppWithToken("old")
+	app.Properties.RunningStatus = to.Ptr(armappcontainers.ContainerAppRunningStatusStopped)
+	backend := &fakeAppUpdateBackend{app: app}
+	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", ContainerAppName: "db-test"}
+	err := updateContainerAppStopThenStart(context.Background(), backend, in, func(c *armappcontainers.Container) {
+		setContainerEnv(c, "ASMDB_TOKEN", "new")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"apply:new", "start", "ready:new"}
+	if !slices.Equal(backend.ops, want) {
+		t.Fatalf("ops = %#v, want %#v", backend.ops, want)
+	}
+}
+
+func TestContainerAppUpdateRollbackRestoresOldSpecWhenNewRevisionUnhealthy(t *testing.T) {
+	backend := &fakeAppUpdateBackend{app: testAppWithToken("old"), finalOnly: true}
+	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", ContainerAppName: "db-test"}
+	err := updateContainerAppStopThenStart(context.Background(), backend, in, func(c *armappcontainers.Container) {
+		setContainerEnv(c, "ASMDB_TOKEN", "new")
+	})
+	if err == nil {
+		t.Fatal("expected update error")
+	}
+	want := []string{"stop", "apply:new", "start", "ready:new", "apply:old", "start", "ready:old"}
+	if !slices.Equal(backend.ops, want) {
+		t.Fatalf("ops = %#v, want %#v", backend.ops, want)
+	}
+	if got := firstEnvValue(backend.app, "ASMDB_TOKEN"); got != "old" {
+		t.Fatalf("final token = %q, want old", got)
+	}
+}
+
+func TestContainerAppUpdateStartFailureRestoresOldSpec(t *testing.T) {
+	backend := &fakeAppUpdateBackend{app: testAppWithToken("old"), startErr: errors.New("start failed")}
+	in := instance{ID: "db_abcdefghijklmnopqrstuvwx", ContainerAppName: "db-test"}
+	err := updateContainerAppStopThenStart(context.Background(), backend, in, func(c *armappcontainers.Container) {
+		setContainerEnv(c, "ASMDB_TOKEN", "new")
+	})
+	if err == nil {
+		t.Fatal("expected update error")
+	}
+	want := []string{"stop", "apply:new", "start", "apply:old", "start", "ready:old"}
+	if !slices.Equal(backend.ops, want) {
+		t.Fatalf("ops = %#v, want %#v", backend.ops, want)
+	}
+	if got := firstEnvValue(backend.app, "ASMDB_TOKEN"); got != "old" {
+		t.Fatalf("final token = %q, want old", got)
+	}
+}
+
+func testAppWithToken(token string) armappcontainers.ContainerApp {
+	return armappcontainers.ContainerApp{
+		Properties: &armappcontainers.ContainerAppProperties{
+			Template: &armappcontainers.Template{
+				Containers: []*armappcontainers.Container{
+					{
+						Name: to.Ptr("asmdb"),
+						Env: []*armappcontainers.EnvironmentVar{
+							{Name: to.Ptr("ASMDB_TOKEN"), Value: to.Ptr(token)},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func firstEnvValue(app armappcontainers.ContainerApp, name string) string {
+	if app.Properties == nil || app.Properties.Template == nil || len(app.Properties.Template.Containers) == 0 {
+		return ""
+	}
+	for _, env := range app.Properties.Template.Containers[0].Env {
+		if env.Name != nil && *env.Name == name && env.Value != nil {
+			return *env.Value
+		}
+	}
+	return ""
 }

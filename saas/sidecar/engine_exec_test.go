@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -72,6 +73,106 @@ func TestExecRejectsExit(t *testing.T) {
 	}
 }
 
+func TestMissingTerminatorCompletesAndNextCommandIsNotDesynchronized(t *testing.T) {
+	withShortTestTimeouts(t)
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	lines, err := e.Command(context.Background(), "NO_STATUS", waitStatus)
+	if err != nil {
+		t.Fatalf("NO_STATUS error = %v, lines = %#v", err, lines)
+	}
+	if len(lines) != 1 || lines[0] != "first response without status" {
+		t.Fatalf("NO_STATUS lines = %#v", lines)
+	}
+
+	lines, err = e.Command(context.Background(), "SECOND", waitStatus)
+	if err != nil {
+		t.Fatalf("SECOND error = %v, lines = %#v", err, lines)
+	}
+	if len(lines) != 1 || lines[0] != "[ OK ] second response" {
+		t.Fatalf("SECOND lines = %#v, want only the second command response", lines)
+	}
+}
+
+func TestPromptTerminatesResponseWithoutStatus(t *testing.T) {
+	withShortTestTimeouts(t)
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	lines, err := e.Command(context.Background(), "NO_STATUS", waitStatus)
+	if err != nil {
+		t.Fatalf("NO_STATUS error = %v, lines = %#v", err, lines)
+	}
+	if len(lines) != 1 || lines[0] != "first response without status" {
+		t.Fatalf("NO_STATUS lines = %#v", lines)
+	}
+}
+
+func TestPromptOnSameLineTerminatesResponse(t *testing.T) {
+	withShortTestTimeouts(t)
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	lines, err := e.Command(context.Background(), "PROMPT_SAME_LINE", waitStatus)
+	if err != nil {
+		t.Fatalf("PROMPT_SAME_LINE error = %v, lines = %#v", err, lines)
+	}
+	if len(lines) != 1 || lines[0] != "same-line output" {
+		t.Fatalf("PROMPT_SAME_LINE lines = %#v", lines)
+	}
+}
+
+func TestMissingTerminatorIsLogged(t *testing.T) {
+	withShortTestTimeouts(t)
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	logged := captureStdout(t, func() {
+		lines, err := e.Command(context.Background(), "NO_STATUS", waitStatus)
+		if err != nil {
+			t.Fatalf("NO_STATUS error = %v, lines = %#v", err, lines)
+		}
+	})
+	if !strings.Contains(logged, `"msg":"engine_response_without_status"`) || !strings.Contains(logged, `"command":"NO_STATUS"`) {
+		t.Fatalf("protocol violation log missing from %q", logged)
+	}
+}
+
+func withShortTestTimeouts(t *testing.T) {
+	t.Helper()
+	oldShort, oldGrace := shortCommandTimeout, engineUnresponsiveGrace
+	shortCommandTimeout = 20 * time.Millisecond
+	engineUnresponsiveGrace = 20 * time.Millisecond
+	t.Cleanup(func() {
+		shortCommandTimeout = oldShort
+		engineUnresponsiveGrace = oldGrace
+	})
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
 func newFakeEngine(t *testing.T) *Engine {
 	t.Helper()
 	bin := writeFakeEngineLauncher(t)
@@ -123,7 +224,9 @@ func TestFakeEngineHelper(t *testing.T) {
 			os.Exit(1)
 		}
 	}
+	printPrompt := func() { fmt.Print("asmdb> ") }
 	fmt.Println("asmdb fake: type HELP for commands")
+	printPrompt()
 	format := "TABLE"
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
@@ -132,9 +235,31 @@ func TestFakeEngineHelper(t *testing.T) {
 		case "FORMAT TSV":
 			format = "TSV"
 			fmt.Println("[ OK ] format tsv")
+			printPrompt()
 		case "FORMAT TABLE":
 			format = "TABLE"
 			fmt.Println("[ OK ] format table")
+			printPrompt()
+		case "VERSION":
+			switch os.Getenv("ASMDB_FAKE_VERSION_MODE") {
+			case "bad":
+				fmt.Println("not a version")
+			case "missing":
+				// no version lines
+			default:
+				v := os.Getenv("ASMDB_FAKE_VERSION")
+				if v == "" {
+					v = "9.8.7"
+				}
+				sf := os.Getenv("ASMDB_FAKE_STORAGE_FORMAT")
+				if sf == "" {
+					sf = "42"
+				}
+				fmt.Println("  asmdb " + v + "   (fake)")
+				fmt.Println("  storage format : " + sf)
+			}
+			fmt.Println("[ OK ] version")
+			printPrompt()
 		case "SELECT *":
 			if format == "TSV" {
 				fmt.Println("R\t1\t5\t10\t10\ttag\tcontent")
@@ -144,8 +269,18 @@ func TestFakeEngineHelper(t *testing.T) {
 				fmt.Println("+----+-------+")
 			}
 			fmt.Println("[ OK ] 1 row(s)")
+			printPrompt()
 		case "COUNT":
 			fmt.Println("[ OK ] 1")
+			printPrompt()
+		case "NO_STATUS":
+			fmt.Println("first response without status")
+			printPrompt()
+		case "PROMPT_SAME_LINE":
+			fmt.Print("same-line outputasmdb> ")
+		case "SECOND":
+			fmt.Println("[ OK ] second response")
+			printPrompt()
 		case "SLOW":
 			d, _ := time.ParseDuration(os.Getenv("ASMDB_FAKE_SLOW"))
 			if d <= 0 {
@@ -153,12 +288,15 @@ func TestFakeEngineHelper(t *testing.T) {
 			}
 			time.Sleep(d)
 			fmt.Println("[ OK ] slow")
+			printPrompt()
 		case "FAIL":
 			fmt.Println("[ERR] forced failure")
+			printPrompt()
 		case "EXIT", "QUIT":
 			os.Exit(0)
 		default:
 			fmt.Println("[ OK ]")
+			printPrompt()
 		}
 	}
 	os.Exit(0)

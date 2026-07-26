@@ -117,7 +117,8 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "engine_unhealthy", "engine is not healthy", detail)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "engine": engineVersion, "rows": count})
+	info := a.engine.engineInfo()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "engine": info.Version, "storageFormat": info.StorageFormat, "rows": count})
 }
 
 func (a *api) handleStats(w http.ResponseWriter, r *http.Request) {

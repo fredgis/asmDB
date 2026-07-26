@@ -781,9 +781,9 @@ cmd_truncate:
 ; --------------------- listing: format and paging ---------------------------
 ;
 ; Every listing command (SELECT *, FIND, RANGE) shares the same emission path so
-; that a machine consumer sees one protocol. In TABLE mode nothing changed. In
-; TSV mode rows are emitted verbatim and terminated by a status line, which is
-; what lets a reader know the result set is complete.
+; that a machine consumer sees one protocol. In TABLE mode rows are framed for
+; humans; in TSV mode rows are emitted verbatim. Both end with a status line,
+; which is what lets a reader know the result set is complete.
 
 ; list_start() - reset the page cursor and, in TABLE mode, open the frame.
 list_start:
@@ -841,20 +841,17 @@ list_row:
     pop  rbp
     ret
 
-; list_report() - in TSV mode, terminate the result set with a row count.
+; list_report() - terminate the result set with a row count.
 list_report:
     push rbp
     mov  rbp, rsp
     sub  rsp, 0x30
-    cmp  qword [rel g_fmt_tsv], 0
-    je   .out
     lea  rcx, [rel s_rows_pre]
     call puts
     mov  rcx, [rel g_list_n]
     call put_u64
     lea  rcx, [rel s_rows_post]
     call puts
-.out:
     mov  rsp, rbp
     pop  rbp
     ret
@@ -954,9 +951,16 @@ cmd_select:
     cmp  qword [rel g_fmt_tsv], 0
     jne  .one_tsv
     call print_detail
-    jmp  .done
+    jmp  .one_ok
 .one_tsv:
     call tsv_row
+.one_ok:
+    lea  rcx, [rel s_rows_pre]
+    call puts
+    mov  rcx, 1
+    call put_u64
+    lea  rcx, [rel s_rows_post]
+    call puts
     jmp  .done
 .all:
     call list_start
@@ -1292,7 +1296,7 @@ cmd_find:
     test r12, r12
     jz   .none
     call tbl_sep
-    jmp  .done
+    jmp  .report
 .report:
     call list_report
     jmp  .done
@@ -1371,7 +1375,7 @@ cmd_range:
     test r12, r12
     jz   .none
     call tbl_sep
-    jmp  .done
+    jmp  .report
 .report:
     call list_report
     jmp  .done
@@ -2233,6 +2237,8 @@ cmd_help:
     lea  rdx, [rel hd_exit]
     call help_row
     call crlf
+    lea  rcx, [rel s_ok_help]
+    call puts
     mov  rsp, rbp
     pop  rbp
     ret
@@ -2316,6 +2322,8 @@ cmd_version:
     lea  rcx, [rel s_ver_older]
     call puts
 .done:
+    lea  rcx, [rel s_ok_version]
+    call puts
     mov  rsp, rbp
     pop  rbp
     ret
@@ -2332,6 +2340,8 @@ cmd_schema:
     lea  rcx, [rel s_schema_body]
     lea  rdx, [rel c_grey]
     call puts_col
+    lea  rcx, [rel s_ok_schema]
+    call puts
     mov  rsp, rbp
     pop  rbp
     ret
@@ -2348,6 +2358,8 @@ cmd_types:
     lea  rcx, [rel s_types_body]
     lea  rdx, [rel c_grey]
     call puts_col
+    lea  rcx, [rel s_ok_types]
+    call puts
     mov  rsp, rbp
     pop  rbp
     ret
@@ -2388,6 +2400,12 @@ cmd_tables:
     call put_u64
     call crlf
     call crlf
+    lea  rcx, [rel s_tables_pre]
+    call puts
+    mov  rcx, 1
+    call put_u64
+    lea  rcx, [rel s_tables_post]
+    call puts
     mov  rsp, rbp
     pop  rbp
     ret
@@ -2400,6 +2418,7 @@ cmd_databases:
     mov  [rbp-8], rbx
     mov  [rbp-16], rsi
     mov  [rbp-24], rdi
+    mov  qword [rbp-32], 0           ; entries rendered
     call crlf
     lea  rcx, [rel s_dbs_title]
     lea  rdx, [rel c_white]
@@ -2415,7 +2434,6 @@ cmd_databases:
     cmp  rax, INVALID_HANDLE
     je   .none
     mov  rbx, rax                    ; directory handle
-    mov  qword [rbp-32], 0           ; entries rendered
 .row:
     mov  rcx, rbx
     lea  rdx, [rel g_finddata]
@@ -2464,6 +2482,12 @@ cmd_databases:
     call crlf
 .done:
     call crlf
+    lea  rcx, [rel s_dbs_pre]
+    call puts
+    mov  rcx, [rbp-32]
+    call put_u64
+    lea  rcx, [rel s_dbs_post]
+    call puts
     mov  rdi, [rbp-24]
     mov  rsi, [rbp-16]
     mov  rbx, [rbp-8]

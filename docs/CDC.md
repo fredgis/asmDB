@@ -98,7 +98,7 @@ offset  size  field
 ```
 
 The 256-byte image is the same layout the engine stores — see
-[`ENGINE.md §4`](ENGINE.md#4-record-layout). Carrying the whole record means a
+[`ENGINE.md §4`](ENGINE.md#4-record-layout-256-byte-record). Carrying the whole record means a
 consumer never has to query the database to resolve an event.
 
 ## What produces an event — and what does not

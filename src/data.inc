@@ -155,6 +155,14 @@ s_find_none:   db '[ OK ] no matching rows', 13, 10, 0
 s_range_none:  db '[ OK ] no rows in range', 13, 10, 0
 s_rows_pre:    db '[ OK ] ', 0
 s_rows_post:   db ' row(s)', 13, 10, 0
+s_ok_help:     db '[ OK ] help shown', 13, 10, 0
+s_ok_schema:   db '[ OK ] schema shown', 13, 10, 0
+s_ok_types:    db '[ OK ] types shown', 13, 10, 0
+s_ok_version:  db '[ OK ] version shown', 13, 10, 0
+s_tables_pre:  db '[ OK ] ', 0
+s_tables_post: db ' table(s)', 13, 10, 0
+s_dbs_pre:     db '[ OK ] ', 0
+s_dbs_post:    db ' database(s)', 13, 10, 0
 s_fmt_table:   db '[ OK ] format table', 13, 10, 0
 s_fmt_tsv:     db '[ OK ] format tsv', 13, 10, 0
 s_page_set:    db '[ OK ] paging set', 13, 10, 0

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ var (
 	shortCommandTimeout     = 30 * time.Second
 	longCommandTimeout      = 30 * time.Minute
 	engineUnresponsiveGrace = 30 * time.Second
+	promptDrainTimeout      = 500 * time.Millisecond
 	restartInitialBackoff   = 200 * time.Millisecond
 	restartMaxBackoff       = 5 * time.Second
 	restartMaxAttempts      = 6
@@ -48,10 +50,23 @@ type Engine struct {
 
 	lastStartErr string
 	failedStarts int
+	info         engineInfo
 }
 
+type engineInfo struct {
+	Version       string
+	StorageFormat string
+}
+
+var unknownEngineInfo = engineInfo{Version: "unknown", StorageFormat: "unknown"}
+
+var (
+	versionLineRE = regexp.MustCompile(`(?i)\basmdb\s+([0-9]+(?:\.[0-9]+){1,3})\b`)
+	storageLineRE = regexp.MustCompile(`(?i)storage\s+format\s*:\s*([0-9]+)`)
+)
+
 func NewEngine(bin, data, name string) (*Engine, error) {
-	e := &Engine{bin: bin, data: data, name: name}
+	e := &Engine{bin: bin, data: data, name: name, info: unknownEngineInfo}
 	e.cmdMu.Lock()
 	defer e.cmdMu.Unlock()
 	if err := e.startLocked(); err != nil {
@@ -241,6 +256,15 @@ func (e *Engine) healthError() string {
 	return e.lastStartErr
 }
 
+func (e *Engine) engineInfo() engineInfo {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	if e.info.Version == "" {
+		return unknownEngineInfo
+	}
+	return e.info
+}
+
 func (e *Engine) startEngineLocked(db string) error {
 	cmd := exec.Command(e.bin, db)
 	stdout, err := cmd.StdoutPipe()
@@ -272,6 +296,7 @@ func (e *Engine) startEngineLocked(db string) error {
 	go e.watch(cmd, done)
 
 	deadline := time.After(5 * time.Second)
+	bannerSeen := false
 	for {
 		select {
 		case line, ok := <-lines:
@@ -280,6 +305,9 @@ func (e *Engine) startEngineLocked(db string) error {
 				return errors.New("engine exited during startup")
 			}
 			if strings.Contains(line, "type HELP") {
+				bannerSeen = true
+			}
+			if bannerSeen && hasEnginePrompt(line) {
 				goto format
 			}
 			if isERR(line) {
@@ -294,11 +322,40 @@ func (e *Engine) startEngineLocked(db string) error {
 	}
 
 format:
+	info := unknownEngineInfo
+	if lines, err := e.runLocked(context.Background(), "VERSION", waitStatus); err != nil {
+		logJSON("warn", "engine_version_unknown", map[string]any{"database": db, "error": err.Error()})
+	} else {
+		info = parseEngineInfo(lines)
+		if info.Version == "unknown" || info.StorageFormat == "unknown" {
+			logJSON("warn", "engine_version_unparsed", map[string]any{"database": db, "output": strings.Join(lines, "\n")})
+		}
+	}
+	e.stateMu.Lock()
+	e.info = info
+	e.stateMu.Unlock()
 	if _, err := e.runLocked(context.Background(), "FORMAT TSV", waitStatus); err != nil {
 		return fmt.Errorf("FORMAT TSV failed: %w", err)
 	}
 	logJSON("info", "engine_started", map[string]any{"database": db})
 	return nil
+}
+
+func parseEngineInfo(lines []string) engineInfo {
+	version := ""
+	storageFormat := ""
+	for _, line := range lines {
+		if m := versionLineRE.FindStringSubmatch(line); len(m) == 2 {
+			version = m[1]
+		}
+		if m := storageLineRE.FindStringSubmatch(line); len(m) == 2 {
+			storageFormat = m[1]
+		}
+	}
+	if version == "" || storageFormat == "" {
+		return unknownEngineInfo
+	}
+	return engineInfo{Version: version, StorageFormat: storageFormat}
 }
 
 func (e *Engine) clearFailedStartLocked(cmd *exec.Cmd) {
@@ -336,9 +393,11 @@ func (e *Engine) restartLocked(reason string) {
 }
 
 func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]string, error) {
+	_ = mode
 	if err := validateLineLength(line); err != nil {
 		return nil, err
 	}
+	commandLine := line
 	e.stateMu.Lock()
 	stdin, lines := e.stdin, e.lines
 	e.stateMu.Unlock()
@@ -361,18 +420,29 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 				e.restartLocked("stdout closed")
 				return nil, errors.New("engine exited")
 			}
+			promptSeen := hasEnginePrompt(raw)
 			line := normalizeEngineLine(raw)
-			if line == "" {
-				continue
+			if line != "" {
+				out = append(out, line)
+				if isERR(line) {
+					if !promptSeen {
+						e.drainPromptAfterStatus(lines, line)
+					}
+					return out, EngineError{Detail: statusDetail(line)}
+				}
+				if isOK(line) {
+					if !promptSeen {
+						e.drainPromptAfterStatus(lines, line)
+					}
+					return out, nil
+				}
 			}
-			out = append(out, line)
-			if isERR(line) {
-				return out, EngineError{Detail: statusDetail(line)}
-			}
-			if isOK(line) {
-				return out, nil
-			}
-			if mode == waitSingleRow && strings.HasPrefix(line, "R\t") {
+			if promptSeen {
+				// A prompt is a frame boundary: the engine is ready for the next command.
+				// If it arrives before a status line, this response is still complete, but
+				// the engine violated the status protocol. Returning here preserves the
+				// invariant that later requests cannot consume this command's leftover output.
+				logJSON("warn", "engine_response_without_status", map[string]any{"command": commandLine})
 				return out, nil
 			}
 		case <-timer.C:
@@ -385,10 +455,32 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 				timer.Reset(engineUnresponsiveGrace)
 				continue
 			}
+			// No status or prompt arrived. The stream position is unknown, so
+			// restart before returning; otherwise the next request could consume
+			// this command's late output and receive a mismatched response.
 			e.restartLocked("engine unresponsive after command timeout")
 			return out, EngineError{Detail: "engine command exceeded its timeout and then stopped responding"}
 		case <-ctx.Done():
 			return out, ctx.Err()
+		}
+	}
+}
+
+func (e *Engine) drainPromptAfterStatus(lines <-chan string, statusLine string) {
+	timer := time.NewTimer(promptDrainTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case raw, ok := <-lines:
+			if !ok {
+				return
+			}
+			if hasEnginePrompt(raw) {
+				return
+			}
+		case <-timer.C:
+			logJSON("warn", "engine_prompt_missing_after_status", map[string]any{"status": statusLine})
+			return
 		}
 	}
 }
@@ -441,10 +533,21 @@ func (e *Engine) watch(cmd *exec.Cmd, done chan struct{}) {
 
 func readEngineLines(r io.Reader, out chan<- string) {
 	defer close(out)
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 1024), 1024*1024)
-	for sc.Scan() {
-		out <- sc.Text()
+	br := bufio.NewReader(r)
+	buf := make([]byte, 0, 256)
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			if len(buf) > 0 {
+				out <- string(buf)
+			}
+			return
+		}
+		buf = append(buf, b)
+		if b == '\n' || strings.HasSuffix(string(buf), "asmdb> ") {
+			out <- string(buf)
+			buf = buf[:0]
+		}
 	}
 }
 
@@ -460,10 +563,12 @@ func logEngineStderr(r io.Reader) {
 
 func normalizeEngineLine(line string) string {
 	line = strings.TrimRight(line, "\r\n")
-	for strings.HasPrefix(line, "asmdb> ") {
-		line = strings.TrimPrefix(line, "asmdb> ")
-	}
+	line = strings.ReplaceAll(line, "asmdb> ", "")
 	return line
+}
+
+func hasEnginePrompt(line string) bool {
+	return strings.Contains(line, "asmdb> ")
 }
 
 func writeFull(w io.Writer, p []byte) error {

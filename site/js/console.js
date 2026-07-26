@@ -8,6 +8,7 @@
   var POLL_BASE_MS = 5000;
   var POLL_MAX_MS = 30000;
   var PREVIEW_LIMIT = "20";
+  var TOKEN_SESSION_PREFIX = "asmdb.instanceToken.";
 
   function id(name) { return document.getElementById(name); }
   var out = id("db-out");
@@ -17,6 +18,8 @@
   var listBtn = id("db-list");
   var openSelected = id("open-selected-db");
   var saveToken = id("save-token");
+  var rotateTokenBtn = id("rotate-token");
+  var rotatedTokenOutput = id("rotated-token-output");
   var authPanel = id("auth-panel");
   var authSignIn = id("auth-signin");
   var authStatus = id("auth-status");
@@ -48,6 +51,10 @@
   var termState = id("term-state");
   var termMeta = id("term-meta");
   var termToken = id("term-token");
+  var tokenNeeded = id("token-needed");
+  var tokenHeld = id("token-held");
+  var tokenMask = id("token-mask");
+  var tokenReveal = id("token-reveal");
   var termScreen = id("term-screen");
   var termForm = id("term-form");
   var termCommand = id("term-command");
@@ -152,7 +159,7 @@
     listBtn.disabled = on;
     if (btn) { btn.textContent = on ? label : btn.dataset.label; }
   }
-  [createBtn, listBtn, authSignIn, authSignOut, saveToken, loadSampleBtn, upgradeDbBtn, deleteDbBtn, benchRun].forEach(function (b) {
+  [createBtn, listBtn, authSignIn, authSignOut, saveToken, rotateTokenBtn, loadSampleBtn, upgradeDbBtn, deleteDbBtn, benchRun].forEach(function (b) {
     if (b) { b.dataset.label = b.textContent; }
   });
 
@@ -269,6 +276,7 @@
   function signOut() {
     if (!auth.client) { return; }
     stopPolling();
+    clearAllSessionTokens();
     authSignOut.disabled = true;
     authSignOut.textContent = "signing out…";
     auth.client.logoutRedirect({ account: auth.account });
@@ -567,8 +575,20 @@
     var nextId = db && db.id;
     var refreshOnly = !!options.refresh || (previousId && nextId && previousId === nextId && options.reset !== true);
     currentDb = db ? Object.assign({}, currentDb && currentDb.id === db.id ? currentDb : {}, db) : null;
-    if (currentDb && tokenById[currentDb.id]) { currentDb.token = tokenById[currentDb.id]; }
-    if (currentDb && !currentDb.token) { termToken.value = ""; }
+    if (currentDb) {
+      var remembered = tokenById[currentDb.id] || readSessionToken(currentDb.id);
+      if (remembered) {
+        tokenById[currentDb.id] = remembered;
+        currentDb.token = remembered;
+        termToken.value = remembered;
+        clearTokenNeeded();
+      } else if (!currentDb.token) {
+        termToken.value = "";
+      }
+      updateTokenHeld();
+    } else {
+      updateTokenHeld();
+    }
     updateSelectedChrome();
     renderDatabases();
     if (refreshOnly) { return; }
@@ -592,14 +612,89 @@
         esc(row.content) + "</td><td>" + esc(formatDecimalString(row.updated)) + "</td></tr>";
     }).join("");
   }
+  function tokenSessionKey(idValue) { return TOKEN_SESSION_PREFIX + idValue; }
+  function readSessionToken(idValue) {
+    try { return window.sessionStorage.getItem(tokenSessionKey(idValue)) || ""; }
+    catch (e) { return ""; }
+  }
+  function writeSessionToken(idValue, token) {
+    try { window.sessionStorage.setItem(tokenSessionKey(idValue), token); }
+    catch (e) { /* session memory is best effort */ }
+  }
+  function clearSessionToken(idValue) {
+    try { window.sessionStorage.removeItem(tokenSessionKey(idValue)); }
+    catch (e) { /* session memory is best effort */ }
+  }
+  function clearAllSessionTokens() {
+    try {
+      Object.keys(window.sessionStorage).forEach(function (key) {
+        if (key.indexOf(TOKEN_SESSION_PREFIX) === 0) { window.sessionStorage.removeItem(key); }
+      });
+    } catch (e) { /* session memory is best effort */ }
+    tokenById = Object.create(null);
+    if (currentDb) { delete currentDb.token; }
+    updateTokenHeld();
+  }
+  function maskToken(token) {
+    token = String(token || "");
+    if (!token) { return "none"; }
+    if (token.length <= 12) { return token.slice(0, 2) + "…" + token.slice(-2); }
+    return token.slice(0, 6) + "…" + token.slice(-6);
+  }
+  function updateTokenHeld(reveal) {
+    var token = currentDb ? instanceToken() : "";
+    if (!tokenHeld || !tokenMask) { return; }
+    if (!token) {
+      tokenHeld.hidden = true;
+      tokenMask.textContent = "none";
+      if (tokenReveal) { tokenReveal.hidden = true; }
+      return;
+    }
+    tokenHeld.hidden = false;
+    tokenMask.textContent = reveal ? token : maskToken(token);
+    if (tokenReveal) {
+      tokenReveal.hidden = false;
+      tokenReveal.setAttribute("aria-pressed", reveal ? "true" : "false");
+    }
+  }
+  function clearTokenNeeded() {
+    if (tokenNeeded) {
+      tokenNeeded.hidden = true;
+      tokenNeeded.textContent = "";
+    }
+  }
+  function showTokenNeeded(action) {
+    var dbName = databaseLabel(currentDb);
+    var dbId = currentDb && currentDb.id ? currentDb.id : "selected database";
+    if (tokenNeeded) {
+      tokenNeeded.hidden = false;
+      tokenNeeded.textContent = action + " needs the instance token for " + dbName + " (" + dbId + "). The token is shown once at creation, and this browser session does not have it. Paste it below, or rotate the token with your Entra sign-in.";
+    }
+    setHash("#console-access");
+    setTimeout(function () { termToken.focus(); }, 0);
+  }
+  function requireInstanceToken(action) {
+    var token = instanceToken();
+    if (token) {
+      rememberInstanceToken(token);
+      clearTokenNeeded();
+      return token;
+    }
+    showTokenNeeded(action);
+    return "";
+  }
   function instanceToken() {
     if (!currentDb) { return ""; }
-    return currentDb.token || tokenById[currentDb.id] || termToken.value.trim();
+    var sessionToken = tokenById[currentDb.id] || readSessionToken(currentDb.id);
+    if (sessionToken && !tokenById[currentDb.id]) { tokenById[currentDb.id] = sessionToken; }
+    return currentDb.token || sessionToken || termToken.value.trim();
   }
   function rememberInstanceToken(token) {
     if (!currentDb || !token) { return; }
     currentDb.token = token;
     tokenById[currentDb.id] = token;
+    writeSessionToken(currentDb.id, token);
+    updateTokenHeld();
   }
   function loadPreview() {
     if (!currentDb || !currentDb.endpoint) {
@@ -643,7 +738,9 @@
         if (!selected && options.selectFirst && databases.length) { selected = databases[0]; }
         if (selected) { selectDatabase(selected, { refresh: refreshingSelected }); }
         else { renderDatabases(); }
-        say(databases.length ? "Ready. Use Access to choose a database, or Create to provision another." : "Ready. Create a database or refresh Access.", "ok");
+        if (!options.silent) {
+          say(databases.length ? "Ready. Use Access to choose a database, or Create to provision another." : "Ready. Create a database or refresh Access.", "ok");
+        }
       })
       .catch(function (e) {
         loadingList = false;
@@ -709,7 +806,7 @@
     stopPolling();
     pollTimer = setTimeout(function () {
       if (document.visibilityState === "hidden" || !auth.account) { return; }
-      loadDatabases({ selectFirst: false }).then(function () {
+      loadDatabases({ selectFirst: false, silent: true }).then(function () {
         if (activeView === "database") { return refreshSelectedStats(); }
         return null;
       }).then(function () { schedulePoll(pollDelay); });
@@ -797,13 +894,7 @@
     }
     command = command.trim();
     if (!command) { return; }
-    if (!instanceToken()) {
-      setHash("#console-access");
-      termToken.focus();
-      writeTerminal(["[ERR] paste the instance token in Access before running a command", ""]);
-      return;
-    }
-    rememberInstanceToken(instanceToken());
+    if (!requireInstanceToken("Running " + command)) { return; }
     history.push(command);
     historyAt = history.length;
     termCommand.value = "";
@@ -834,7 +925,10 @@
       });
   }
   function renderCreated(d) {
-    if (d.token) { tokenById[d.id] = d.token; }
+    if (d.token) {
+      tokenById[d.id] = d.token;
+      writeSessionToken(d.id, d.token);
+    }
     say([
       '<span class="ok">[ OK ]</span> database created\n',
       '<span class="k">id       </span> ' + esc(d.id),
@@ -844,13 +938,13 @@
       '<span class="k">endpoint </span> ' + esc(d.endpoint),
       "",
       '<span class="k">token    </span> ' + esc(d.token),
-      '<span class="err">          shown once — put it in a secret manager now</span>'
+      '<span class="danger">          shown once — put it in a secret manager now</span>',
+      '<span class="token-copy-row"><button class="btn btn--ghost" type="button" data-copy-token-for="' + attr(d.id) + '">Copy token</button><span class="danger">This is the only time the token will be shown in clear text.</span></span>'
     ].join("\n"), "ok");
     var existing = findDb(d.id);
     if (existing) { Object.assign(existing, d); }
     else { databases.unshift(d); }
-    selectDatabase(d, { route: "#database" });
-    loadDatabases({ selectFirst: false });
+    selectDatabase(d);
   }
   function sampleCommands() {
     var base = String(Date.now()) + "0";
@@ -874,13 +968,10 @@
   }
   function loadSampleData() {
     if (!currentDb) { setHash("#console-access"); return; }
-    if (!instanceToken()) {
-      setHash("#console-access");
-      termToken.focus();
-      renderPreviewMessage("Paste the instance token before loading sample data.");
+    if (!requireInstanceToken("Loading sample data")) {
+      renderPreviewMessage("Instance token required before loading sample data.");
       return;
     }
-    rememberInstanceToken(instanceToken());
     loadSampleBtn.disabled = true;
     previewStatus.textContent = "loading";
     renderPreviewMessage("Loading sample data into " + databaseLabel(currentDb) + "…");
@@ -919,6 +1010,60 @@
         updateSelectedChrome();
       });
   }
+  function renderRotatedToken(data) {
+    var token = data && data.token;
+    if (!token) { throw new Error("token rotation did not return a token"); }
+    rememberInstanceToken(token);
+    if (rotatedTokenOutput) {
+      rotatedTokenOutput.hidden = false;
+      rotatedTokenOutput.innerHTML = [
+        '<span class="ok">[ OK ]</span> token rotation response received',
+        '<span class="k">database </span> ' + esc(currentDb.id),
+        '<span class="k">warning  </span> ' + esc((data && data.warning) || "Token rotation restarts the instance and briefly interrupts active connections."),
+        '<span class="k">state    </span> new token returned; the instance may still be restarting',
+        "",
+        '<span class="k">token    </span> ' + esc(token),
+        '<span class="danger">          shown once — put it in a secret manager now</span>',
+        '<span class="token-copy-row"><button class="btn btn--ghost" type="button" data-copy-token-for="' + attr(currentDb.id) + '">Copy token</button><span class="danger">Update every client that used the previous token.</span></span>'
+      ].join("\n");
+      rotatedTokenOutput.setAttribute("data-state", "ok");
+    }
+    clearTokenNeeded();
+    say("New token returned for " + esc(databaseLabel(currentDb)) + ". The instance may still be restarting; update every client that used the previous token.", "ok");
+  }
+  function rotateCurrentToken() {
+    if (!currentDb) {
+      setHash("#console-access");
+      if (tokenNeeded) {
+        tokenNeeded.hidden = false;
+        tokenNeeded.textContent = "Select a database before rotating its instance token.";
+      }
+      return;
+    }
+    var expected = databaseLabel(currentDb);
+    var typed = window.prompt(
+      "Rotate token for " + expected + ".\n\n" +
+      "This issues a new token, invalidates the old one immediately, restarts the instance, and interrupts clients until they are updated.\n\n" +
+      "Type " + expected + " to continue."
+    );
+    if (typed !== expected) { return; }
+    rotateTokenBtn.disabled = true;
+    rotateTokenBtn.textContent = "rotating…";
+    if (rotatedTokenOutput) { rotatedTokenOutput.hidden = true; rotatedTokenOutput.textContent = ""; }
+    request("/databases/" + encodeURIComponent(currentDb.id) + "/rotate-token", { method: "POST" })
+      .then(renderRotatedToken)
+      .catch(function (e) {
+        if (rotatedTokenOutput) {
+          rotatedTokenOutput.hidden = false;
+          rotatedTokenOutput.innerHTML = '<span class="err">[ERR]</span> ' + esc(e.code || "error") + "\n      " + esc(e.message || "token rotation failed");
+          rotatedTokenOutput.setAttribute("data-state", "error");
+        }
+      })
+      .then(function () {
+        rotateTokenBtn.disabled = false;
+        rotateTokenBtn.textContent = rotateTokenBtn.dataset.label;
+      });
+  }
   function deleteCurrentDatabase() {
     if (!currentDb) { setHash("#console-access"); return; }
     var expected = databaseLabel(currentDb);
@@ -927,9 +1072,12 @@
     deleteDbBtn.disabled = true;
     request("/databases/" + encodeURIComponent(currentDb.id), { method: "DELETE" })
       .then(function () {
+        clearSessionToken(currentDb.id);
+        if (currentDb && currentDb.id) { delete tokenById[currentDb.id]; }
         databases = databases.filter(function (db) { return db.id !== currentDb.id; });
         currentDb = null;
         termToken.value = "";
+        updateTokenHeld();
         renderDatabases();
         renderStats(null, null);
         renderPreviewMessage("Database deleted. Select another instance.");
@@ -962,14 +1110,11 @@
   }
   function runBench() {
     if (!currentDb) { setHash("#console-access"); return; }
-    if (!instanceToken()) {
-      setHash("#console-access");
-      termToken.focus();
-      benchResult.textContent = "Paste the instance token before running BENCH.";
+    var command = "BENCH " + benchSize.value;
+    if (!requireInstanceToken("Running " + command)) {
+      benchResult.textContent = "Instance token required before running BENCH.";
       return;
     }
-    var command = "BENCH " + benchSize.value;
-    rememberInstanceToken(instanceToken());
     benchRun.disabled = true;
     termCommand.disabled = true;
     termSend.disabled = true;
@@ -1001,6 +1146,20 @@
     if (e.code === "api_unreachable") { say('<span class="err">[ERR]</span> api_unreachable\n      signed in, but the control plane API is unreachable', "error"); return; }
     say('<span class="err">[ERR]</span> ' + esc(e.code || "error") + "\n      " + esc(e.message), "error");
   }
+  function copyTokenFor(idValue, button) {
+    var token = tokenById[idValue] || readSessionToken(idValue);
+    if (!token) { return; }
+    var label = button.textContent;
+    function done(text) {
+      button.textContent = text;
+      setTimeout(function () { button.textContent = label; }, 900);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(token).then(function () { done("copied"); }).catch(function () { done("copy failed"); });
+    } else {
+      done("copy unavailable");
+    }
+  }
 
   createBtn.addEventListener("click", function () {
     var name = (nameEl.value || "").trim();
@@ -1016,6 +1175,10 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: name, tier: tierEl.value })
     }).then(renderCreated).catch(fail).then(function () { busy(false, createBtn); });
+  });
+  out.addEventListener("click", function (e) {
+    var button = e.target.closest("[data-copy-token-for]");
+    if (button) { copyTokenFor(button.getAttribute("data-copy-token-for"), button); }
   });
   listBtn.addEventListener("click", function () {
     busy(true, listBtn, "loading…");
@@ -1038,11 +1201,28 @@
     if (!currentDb) { setHash("#console-access"); return; }
     if (!token) { termToken.focus(); return; }
     rememberInstanceToken(token);
+    clearTokenNeeded();
     saveToken.textContent = "saved";
     setTimeout(function () { saveToken.textContent = saveToken.dataset.label; }, 900);
     if (activeView === "database") { loadPreview(); }
   });
+  if (tokenReveal) {
+    ["mousedown", "touchstart", "keydown"].forEach(function (eventName) {
+      tokenReveal.addEventListener(eventName, function (e) {
+        if (eventName === "keydown" && e.key !== " " && e.key !== "Enter") { return; }
+        updateTokenHeld(true);
+      });
+    });
+    ["mouseup", "mouseleave", "touchend", "touchcancel", "keyup", "blur"].forEach(function (eventName) {
+      tokenReveal.addEventListener(eventName, function () { updateTokenHeld(false); });
+    });
+  }
   loadSampleBtn.addEventListener("click", loadSampleData);
+  rotateTokenBtn.addEventListener("click", rotateCurrentToken);
+  rotatedTokenOutput.addEventListener("click", function (e) {
+    var button = e.target.closest("[data-copy-token-for]");
+    if (button) { copyTokenFor(button.getAttribute("data-copy-token-for"), button); }
+  });
   upgradeDbBtn.addEventListener("click", upgradeCurrentDatabase);
   deleteDbBtn.addEventListener("click", deleteCurrentDatabase);
   benchRun.addEventListener("click", runBench);
@@ -1051,7 +1231,10 @@
   termForm.addEventListener("submit", function (e) { e.preventDefault(); runTerminalCommand(termCommand.value); });
   termToken.addEventListener("change", function () {
     var token = termToken.value.trim();
-    if (token) { rememberInstanceToken(token); }
+    if (token) {
+      rememberInstanceToken(token);
+      clearTokenNeeded();
+    }
   });
   termCommand.addEventListener("keydown", function (e) {
     if (e.key === "ArrowUp" && history.length) {

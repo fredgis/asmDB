@@ -8,7 +8,7 @@
     "component": {
       "type": "application",
       "name": "asmdb",
-      "version": "1.1.0"
+      "version": "1.5.1"
     },
     "properties": [
       {
@@ -20,9 +20,9 @@
   "components": [
     {
       "type": "application",
-      "bom-ref": "pkg:generic/asmdb-engine@1.1.0",
+      "bom-ref": "pkg:generic/asmdb-engine@1.5.1",
       "name": "asmdb-engine",
-      "version": "1.1.0",
+      "version": "1.5.1",
       "description": "x86-64 assembly database engine assembled directly with nasm -f bin; no linker, no CRT, no runtime libraries.",
       "properties": [
         {
@@ -2999,7 +2999,7 @@
   ],
   "dependencies": [
     {
-      "ref": "pkg:generic/asmdb-engine@1.1.0",
+      "ref": "pkg:generic/asmdb-engine@1.5.1",
       "dependsOn": []
     },
     {
