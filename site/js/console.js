@@ -55,6 +55,7 @@
   var tokenNeeded = id("token-needed");
   var tokenHeld = id("token-held");
   var tokenMask = id("token-mask");
+  var tokenHeldDb = id("token-held-db");
   var tokenReveal = id("token-reveal");
   var termScreen = id("term-screen");
   var termForm = id("term-form");
@@ -669,6 +670,11 @@
     }
     tokenHeld.hidden = false;
     tokenHeld.setAttribute("data-revealed", reveal ? "true" : "false");
+    // Name the database the token belongs to. Without it, a token held for one
+    // database is indistinguishable from a token held for another, and a
+    // credential pasted against the wrong selection looks identical to the
+    // right one.
+    if (tokenHeldDb) { tokenHeldDb.textContent = databaseLabel(currentDb); }
     tokenMask.textContent = reveal ? token : maskToken(token);
     if (tokenReveal) {
       tokenReveal.hidden = false;
@@ -1271,10 +1277,12 @@
     if (activeView === "database") { loadPreview(); }
   });
   if (tokenReveal) {
-    tokenReveal.addEventListener("pointerdown", function () { setTokenReveal(true); });
-    tokenReveal.addEventListener("pointerup", function () { setTokenReveal(false); });
-    tokenReveal.addEventListener("pointercancel", function () { setTokenReveal(false); });
-    tokenReveal.addEventListener("pointerleave", function () { setTokenReveal(false); });
+    // One behaviour, not two. Hold-to-reveal and click-to-reveal-for-10s were
+    // both wired to this button: a click fired pointerdown, pointerup and click
+    // in sequence, and any pointerleave afterwards cancelled the reveal — so
+    // moving the mouse off the button re-masked it immediately and the control
+    // looked broken. The label promises ten seconds, so that is what it does,
+    // and it works from the keyboard.
     tokenReveal.addEventListener("click", revealTokenTemporarily);
     tokenReveal.addEventListener("keydown", function (e) {
       if (e.key === " " || e.key === "Enter") {
