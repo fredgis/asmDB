@@ -30,10 +30,6 @@ param(
     [ValidateSet('major', 'minor', 'patch')]
     [string]$Bump,
 
-    # Skip the local build and test suite. Only for re-running a publish that
-    # already passed; a release has no business skipping its own tests.
-    [switch]$SkipTests,
-
     [switch]$WhatIf
 )
 
@@ -82,23 +78,9 @@ Write-Step "Releasing asmdb $tag"
 
 # ------------------------------------------------------------------ tests ----
 
-if (-not $SkipTests) {
-    Write-Step 'Building and testing locally'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\build.ps1') | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw 'Build failed. Nothing was published.' }
-
-    $smoke = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'tests\smoke.ps1') -NoBuild 2>&1
-    $smoke | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw 'The smoke suite failed. Nothing was published.' }
-
-    $summary = $smoke | Where-Object { $_ -match 'PASS=\d+' } | Select-Object -Last 1
-    if ($summary -and $summary -notmatch 'FAIL=0') {
-        throw "The smoke suite reported failures: $summary. Nothing was published."
-    }
-    Write-Host ">> $summary" -ForegroundColor Green
-} else {
-    Write-Host '>> tests skipped at request' -ForegroundColor Yellow
-}
+Write-Step 'Running the local release gate'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\gate.ps1') | Out-Host
+if ($LASTEXITCODE -ne 0) { throw 'The local release gate failed. Nothing was published.' }
 
 if ($WhatIf) {
     Write-Step 'What would happen'

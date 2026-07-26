@@ -41,8 +41,39 @@ var filePrivateDnsZoneName = 'privatelink.file.core.windows.net'
 var acrPrivateDnsZoneName = 'privatelink.azurecr.io'
 
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-var contributorRoleDefinitionId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 var storageBlobDataContributorRoleDefinitionId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+
+resource controlPlaneRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(resourceGroup().id, 'asmdb-control-plane-container-app-operator')
+  properties: {
+    roleName: 'asmdb Control Plane Container App Operator'
+    description: 'Least-privilege role for the asmdb control plane to operate customer Container Apps.'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: [
+          'Microsoft.App/managedEnvironments/read'
+          'Microsoft.App/containerApps/read'
+          'Microsoft.App/containerApps/write'
+          'Microsoft.App/containerApps/delete'
+          'Microsoft.App/containerApps/start/action'
+          'Microsoft.App/containerApps/stop/action'
+          'Microsoft.App/containerApps/revisions/read'
+          'Microsoft.App/managedEnvironments/join/action'
+          'Microsoft.App/managedEnvironments/storages/read'
+          'Microsoft.ManagedIdentity/userAssignedIdentities/assign/action'
+          'Microsoft.Insights/metrics/read'
+        ]
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      resourceGroup().id
+    ]
+  }
+}
 
 resource logs 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
   name: logsName
@@ -590,10 +621,10 @@ resource acrPullAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' 
   }
 }
 
-resource contributorAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(resourceGroup().id, identity.id, contributorRoleDefinitionId)
+resource controlPlaneRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, identity.id, controlPlaneRoleDefinition.name)
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleDefinitionId)
+    roleDefinitionId: controlPlaneRoleDefinition.id
     principalId: identity.properties.principalId
     principalType: 'ServicePrincipal'
   }
@@ -708,7 +739,7 @@ resource controlPlane 'Microsoft.App/containerApps@2023-05-01' = {
   dependsOn: [
     acrPullAssignment
     acrPrivateDnsZoneGroup
-    contributorAssignment
+    controlPlaneRoleAssignment
     instanceStorage
     storageBlobPrivateDnsZoneGroup
     storageBlobDataContributorAssignment

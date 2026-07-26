@@ -26,6 +26,7 @@ var (
 	restartMaxBackoff       = 5 * time.Second
 	restartMaxAttempts      = 6
 	restartSleep            = time.Sleep
+	maxEngineResponseBytes  = 1 << 20
 	// Opening a database on network storage, and finishing an interrupted
 	// whole-table operation, are both minutes-scale on the hosted service.
 	defaultEngineStartTimeout = 5 * time.Minute
@@ -427,6 +428,9 @@ format:
 	if _, err := e.runLocked(context.Background(), "FORMAT TSV", waitStatus); err != nil {
 		return fmt.Errorf("FORMAT TSV failed: %w", err)
 	}
+	if _, err := e.runLocked(context.Background(), fmt.Sprintf("PAGE %d 0", maxExecPageRows), waitStatus); err != nil {
+		return fmt.Errorf("initial PAGE failed: %w", err)
+	}
 	logJSON("info", "engine_started", map[string]any{"database": db})
 	return nil
 }
@@ -532,6 +536,7 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 	defer timer.Stop()
 	budgetExpired := false
 	out := []string{}
+	responseBytes := 0
 	for {
 		select {
 		case raw, ok := <-lines:
@@ -542,6 +547,11 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 			promptSeen := hasEnginePrompt(raw)
 			line := normalizeEngineLine(raw)
 			if line != "" {
+				responseBytes += len([]byte(line)) + 1
+				if responseBytes > maxEngineResponseBytes {
+					e.restartLocked("engine response exceeded sidecar cap")
+					return out, codedError{code: "response_too_large", msg: fmt.Sprintf("engine response exceeds %d bytes", maxEngineResponseBytes)}
+				}
 				out = append(out, line)
 				if isERR(line) {
 					if !promptSeen {
@@ -585,6 +595,7 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 			e.restartLocked("engine unresponsive after command timeout")
 			return out, EngineError{Detail: "engine command exceeded its timeout and then stopped responding"}
 		case <-ctx.Done():
+			e.restartLocked("request context canceled before engine response completed")
 			return out, ctx.Err()
 		}
 	}
@@ -593,7 +604,7 @@ func (e *Engine) runLocked(ctx context.Context, line string, mode waitMode) ([]s
 func (e *Engine) drainPromptAfterStatus(lines <-chan string, statusLine string) {
 	timer := time.NewTimer(promptDrainTimeout)
 	defer timer.Stop()
-	drained := []string{}
+	drained := 0
 	for {
 		select {
 		case raw, ok := <-lines:
@@ -602,13 +613,13 @@ func (e *Engine) drainPromptAfterStatus(lines <-chan string, statusLine string) 
 			}
 			line := normalizeEngineLine(raw)
 			if line != "" {
-				drained = append(drained, line)
+				drained++
 			}
 			if hasEnginePrompt(raw) {
-				if len(drained) > 0 {
+				if drained > 0 {
 					logJSON("warn", "engine_output_after_status_drained", map[string]any{
 						"status": statusLine,
-						"count":  len(drained),
+						"count":  drained,
 					})
 				}
 				e.drainStaleLinesUntilQuiet(lines, statusLine)
@@ -622,7 +633,7 @@ func (e *Engine) drainPromptAfterStatus(lines <-chan string, statusLine string) 
 }
 
 func (e *Engine) drainReadyStaleLines(lines <-chan string, commandLine string) {
-	drained := []string{}
+	drained := 0
 	for {
 		select {
 		case raw, ok := <-lines:
@@ -631,13 +642,13 @@ func (e *Engine) drainReadyStaleLines(lines <-chan string, commandLine string) {
 			}
 			line := normalizeEngineLine(raw)
 			if line != "" {
-				drained = append(drained, line)
+				drained++
 			}
 		default:
-			if len(drained) > 0 {
+			if drained > 0 {
 				logJSON("warn", "engine_stale_output_drained", map[string]any{
 					"command": commandLine,
-					"count":   len(drained),
+					"count":   drained,
 				})
 			}
 			return
@@ -648,7 +659,7 @@ func (e *Engine) drainReadyStaleLines(lines <-chan string, commandLine string) {
 func (e *Engine) drainStaleLinesUntilQuiet(lines <-chan string, commandLine string) {
 	timer := time.NewTimer(postFrameDrainTimeout)
 	defer timer.Stop()
-	drained := []string{}
+	drained := 0
 	for {
 		select {
 		case raw, ok := <-lines:
@@ -657,7 +668,7 @@ func (e *Engine) drainStaleLinesUntilQuiet(lines <-chan string, commandLine stri
 			}
 			line := normalizeEngineLine(raw)
 			if line != "" {
-				drained = append(drained, line)
+				drained++
 			}
 			if !timer.Stop() {
 				select {
@@ -667,10 +678,10 @@ func (e *Engine) drainStaleLinesUntilQuiet(lines <-chan string, commandLine stri
 			}
 			timer.Reset(postFrameDrainTimeout)
 		case <-timer.C:
-			if len(drained) > 0 {
+			if drained > 0 {
 				logJSON("warn", "engine_stale_output_drained", map[string]any{
 					"command": commandLine,
-					"count":   len(drained),
+					"count":   drained,
 				})
 			}
 			return
@@ -737,7 +748,7 @@ func readEngineLines(r io.Reader, out chan<- string) {
 			return
 		}
 		buf = append(buf, b)
-		if b == '\n' || strings.HasSuffix(string(buf), "asmdb> ") {
+		if b == '\n' || string(buf) == "asmdb> " {
 			out <- string(buf)
 			buf = buf[:0]
 		}
@@ -756,12 +767,14 @@ func logEngineStderr(r io.Reader) {
 
 func normalizeEngineLine(line string) string {
 	line = strings.TrimRight(line, "\r\n")
-	line = strings.ReplaceAll(line, "asmdb> ", "")
+	if line == "asmdb> " {
+		return ""
+	}
 	return line
 }
 
 func hasEnginePrompt(line string) bool {
-	return strings.Contains(line, "asmdb> ")
+	return line == "asmdb> "
 }
 
 func writeFull(w io.Writer, p []byte) error {

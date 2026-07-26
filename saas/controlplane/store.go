@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"sync"
 	"time"
@@ -17,6 +16,8 @@ import (
 )
 
 var errNotFound = errors.New("not found")
+
+const maxMetadataBodyBytes = 1 << 20
 
 type instance struct {
 	ID               string     `json:"id"`
@@ -33,12 +34,14 @@ type instance struct {
 }
 
 type operation struct {
-	Type         string    `json:"type"`
-	State        string    `json:"state"`
-	StartedAt    time.Time `json:"started_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	Error        string    `json:"error,omitempty"`
-	PendingToken string    `json:"pendingToken,omitempty"`
+	Type                  string    `json:"type"`
+	State                 string    `json:"state"`
+	StartedAt             time.Time `json:"started_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	Error                 string    `json:"error,omitempty"`
+	PendingToken          string    `json:"pendingToken,omitempty"`
+	PendingTokenEncrypted string    `json:"pendingTokenEncrypted,omitempty"`
+	PendingTokenExpiresAt time.Time `json:"pendingTokenExpiresAt,omitempty"`
 }
 
 type store interface {
@@ -142,7 +145,7 @@ func (s *blobStore) Get(ctx context.Context, id string) (instance, error) {
 		return instance{}, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readAllLimited(resp.Body, maxMetadataBodyBytes, "metadata blob")
 	if err != nil {
 		return instance{}, err
 	}
@@ -172,7 +175,7 @@ func (s *blobStore) List(ctx context.Context) ([]instance, error) {
 			if err != nil {
 				return nil, err
 			}
-			data, err := io.ReadAll(resp.Body)
+			data, err := readAllLimited(resp.Body, maxMetadataBodyBytes, "metadata blob")
 			closeErr := resp.Body.Close()
 			if err != nil {
 				return nil, err

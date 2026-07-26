@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -50,5 +51,34 @@ func TestERRLineIsDetected(t *testing.T) {
 	}
 	if got := statusDetail(line); got != "key not found" {
 		t.Fatalf("detail = %q", got)
+	}
+}
+
+func TestValidateExecCommandAllowlistRejectsUnknown(t *testing.T) {
+	err := validateExecCommand("RESTOREPOINT")
+	var ce codedError
+	if err == nil || !strings.Contains(err.Error(), "RESTOREPOINT") || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("unknown command error = %v, want clear allowlist refusal", err)
+	}
+	if !errors.As(err, &ce) || ce.code != "invalid_request" {
+		t.Fatalf("unknown command coded error = %#v", err)
+	}
+}
+
+func TestValidateExecCommandRejectsBackupRestorePaths(t *testing.T) {
+	for _, cmd := range []string{`BACKUP C:\data\out.bak`, `RESTORE C:\data\in.bak`} {
+		err := validateExecCommand(cmd)
+		if err == nil || !strings.Contains(err.Error(), "caller-supplied filesystem paths are forbidden") {
+			t.Fatalf("%s error = %v, want path refusal", cmd, err)
+		}
+	}
+}
+
+func TestValidateExecCommandCapsPageLimit(t *testing.T) {
+	if err := validateExecCommand("PAGE 1000 0"); err != nil {
+		t.Fatalf("PAGE 1000 0 rejected: %v", err)
+	}
+	if err := validateExecCommand("PAGE 1001 0"); err == nil || !strings.Contains(err.Error(), "1 through 1000") {
+		t.Fatalf("PAGE 1001 0 error = %v, want cap refusal", err)
 	}
 }

@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -38,10 +41,11 @@ func TestExecRestoresTSVAfterSuccessfulCommand(t *testing.T) {
 }
 
 func TestExecRestoresTSVAfterFailingCommand(t *testing.T) {
+	t.Setenv("ASMDB_FAKE_VERIFY_FAIL", "1")
 	e := newFakeEngine(t)
 	defer e.Close(context.Background())
 
-	lines, ok, err := e.Exec(context.Background(), "FAIL")
+	lines, ok, err := e.Exec(context.Background(), "VERIFY")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,9 +71,97 @@ func TestExecRejectsEmbeddedNewline(t *testing.T) {
 	}
 }
 
+func TestExecRejectsOversizedCommand(t *testing.T) {
+	if _, _, err := (&Engine{}).Exec(context.Background(), strings.Repeat("x", maxLineBytes+1)); err == nil {
+		t.Fatal("Exec accepted oversized command")
+	}
+}
+
 func TestExecRejectsExit(t *testing.T) {
 	if _, _, err := (&Engine{}).Exec(context.Background(), " EXIT "); err == nil {
 		t.Fatal("Exec accepted EXIT")
+	}
+}
+
+func TestPromptTextInRowContentIsData(t *testing.T) {
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	lines, err := e.Command(context.Background(), "PROMPT_CONTENT", waitRowsStatus)
+	if err != nil {
+		t.Fatalf("PROMPT_CONTENT error = %v, lines = %#v", err, lines)
+	}
+	rows, err := parseTSVRows(lines)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %#v, want one row", rows)
+	}
+	if rows[0].Content != "before asmdb> after" {
+		t.Fatalf("content = %q, want prompt text preserved", rows[0].Content)
+	}
+	if !containsLine(lines, "[ OK ] 1 row(s)") {
+		t.Fatalf("lines = %#v, want complete frame status", lines)
+	}
+}
+
+func TestCanceledCommandRestartsInsteadOfLeakingResponse(t *testing.T) {
+	withShortTestTimeouts(t)
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	lines, err := e.Command(ctx, "SLOW_LEAK", waitStatus)
+	if err == nil {
+		t.Fatalf("SLOW_LEAK unexpectedly succeeded: %#v", lines)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SLOW_LEAK error = %v, want deadline exceeded", err)
+	}
+
+	lines, err = e.Command(context.Background(), "SECOND", waitStatus)
+	if err != nil {
+		t.Fatalf("SECOND error = %v, lines = %#v", err, lines)
+	}
+	if len(lines) != 1 || lines[0] != "[ OK ] second response" {
+		t.Fatalf("SECOND lines = %#v, want only the second command response", lines)
+	}
+}
+
+func TestExecRejectsOversizedResponse(t *testing.T) {
+	t.Setenv("ASMDB_FAKE_BIG_BENCH", "1")
+	e := newFakeEngine(t)
+	defer e.Close(context.Background())
+
+	oldMax := maxEngineResponseBytes
+	maxEngineResponseBytes = 1024
+	t.Cleanup(func() { maxEngineResponseBytes = oldMax })
+	lines, ok, err := e.Exec(context.Background(), "BENCH 1")
+	if err == nil {
+		t.Fatalf("BENCH accepted oversized response: ok=%v lines=%d", ok, len(lines))
+	}
+	var ce codedError
+	if !errors.As(err, &ce) || ce.code != "response_too_large" {
+		t.Fatalf("BENCH error = %#v, want response_too_large", err)
+	}
+}
+
+func TestExecHTTPRejectsOversizedRequestBody(t *testing.T) {
+	app := &api{token: "instance"}
+	body := `{"command":"` + strings.Repeat("x", maxExecRequestBodyBytes) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/exec", stringsReader(body))
+	req.Header.Set("Authorization", "Bearer instance")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d body = %s, want 413", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "request_too_large") {
+		t.Fatalf("body = %s, want request_too_large", rec.Body.String())
 	}
 }
 
@@ -109,17 +201,21 @@ func TestPromptTerminatesResponseWithoutStatus(t *testing.T) {
 	}
 }
 
-func TestPromptOnSameLineTerminatesResponse(t *testing.T) {
+func TestPromptOnSameLineWithoutStatusRestarts(t *testing.T) {
 	withShortTestTimeouts(t)
 	e := newFakeEngine(t)
 	defer e.Close(context.Background())
 
 	lines, err := e.Command(context.Background(), "PROMPT_SAME_LINE", waitStatus)
-	if err != nil {
-		t.Fatalf("PROMPT_SAME_LINE error = %v, lines = %#v", err, lines)
+	if err == nil {
+		t.Fatalf("PROMPT_SAME_LINE unexpectedly succeeded: %#v", lines)
 	}
-	if len(lines) != 1 || lines[0] != "same-line output" {
-		t.Fatalf("PROMPT_SAME_LINE lines = %#v", lines)
+	lines, err = e.Command(context.Background(), "SECOND", waitStatus)
+	if err != nil {
+		t.Fatalf("SECOND error = %v, lines = %#v", err, lines)
+	}
+	if len(lines) != 1 || lines[0] != "[ OK ] second response" {
+		t.Fatalf("SECOND lines = %#v, want only the second command response", lines)
 	}
 }
 
@@ -447,9 +543,21 @@ func TestFakeEngineHelper(t *testing.T) {
 			if n == "" {
 				n = "100000"
 			}
+			if os.Getenv("ASMDB_FAKE_BIG_BENCH") == "1" {
+				for i := 0; i < 200; i++ {
+					fmt.Println(strings.Repeat("x", 80))
+				}
+			}
 			fmt.Println("[ OK ] BENCH inserted " + n + " rows")
 			fmt.Println("  in-RAM insert            : 123456 rows/sec  (engine only, no I/O)")
 			fmt.Println("  checkpoint + fsync total : 42 ms  (full-table durable write)")
+			printPrompt()
+		case upper == "VERIFY":
+			if os.Getenv("ASMDB_FAKE_VERIFY_FAIL") == "1" {
+				fmt.Println("[ERR] forced verify failure")
+			} else {
+				fmt.Println("[ OK ] verify")
+			}
 			printPrompt()
 		case upper == "COUNT":
 			count := os.Getenv("ASMDB_FAKE_COUNT")
@@ -457,6 +565,10 @@ func TestFakeEngineHelper(t *testing.T) {
 				count = "1"
 			}
 			fmt.Println("[ OK ] " + count)
+			printPrompt()
+		case upper == "PROMPT_CONTENT":
+			fmt.Println("R\t3\t8\t1785004851551\t1785004851551\ttag\tbefore asmdb> after")
+			fmt.Println("[ OK ] 1 row(s)")
 			printPrompt()
 		case strings.HasPrefix(upper, "BACKUP "):
 			d, _ := time.ParseDuration(os.Getenv("ASMDB_FAKE_BACKUP_SLEEP"))
@@ -498,6 +610,10 @@ func TestFakeEngineHelper(t *testing.T) {
 			}
 			time.Sleep(d)
 			fmt.Println("[ OK ] slow")
+			printPrompt()
+		case upper == "SLOW_LEAK":
+			time.Sleep(30 * time.Millisecond)
+			fmt.Println("[ OK ] leaked old response")
 			printPrompt()
 		case upper == "FAIL":
 			fmt.Println("[ERR] forced failure")

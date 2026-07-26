@@ -13,7 +13,7 @@ This folder contains the idempotent Azure deployment for asmdb Cloud in the exis
 - Premium Azure Files NFS account `asmdbfs<stable-suffix>` with public access disabled, private file endpoint, and NFS share `instances`
 - Control-plane Container App `asmdb-cp` with internal ingress only
 - Azure API Management `asmdb-apim` (Developer, VNet External) as the public front door
-- Resource-group-scoped role assignments for `asmdb-mi`: AcrPull, Contributor, Storage Blob Data Contributor
+- Resource-group-scoped role assignments for `asmdb-mi`: AcrPull, Storage Blob Data Contributor, and a custom least-privilege Container Apps operator role used by the control plane
 
 The suffix is derived from `uniqueString(resourceGroup().id)`, so repeated deployments converge on the same names.
 
@@ -48,7 +48,47 @@ The script is the deployment path and is run from a workstation; there is no CI 
 
 APIM Developer SKU creation commonly takes 30-45 minutes. The deploy script starts the Azure deployment asynchronously, waits up to 90 minutes, and prints progress while APIM is being created.
 
-The custom domain uses the Let's Encrypt certificate found in the local Posh-ACME store. Today renewal is manual; the current `www.asmdb.cloud` certificate expires 2026-10-23.
+The custom domain uses the Let's Encrypt certificate found in the local Posh-ACME store. The renewal path is automated by `renew-certificate.ps1`; the current `www.asmdb.cloud` certificate expires 2026-10-23.
+
+## TLS certificate renewal
+
+`www.asmdb.cloud` uses a Let's Encrypt certificate issued by Posh-ACME with the OVH DNS-01 plugin. The renewal script refuses to run unless the ACME certificate is within 30 days of expiry, unless `-Force` is supplied:
+
+```powershell
+.\renew-certificate.ps1
+```
+
+The script:
+
+1. verifies Azure CLI is logged in to tenant `<tenant-id>` and subscription `<subscription-id>`;
+2. renews the existing Posh-ACME order with the stored OVH DNS-01 plugin arguments, or creates/replaces it when `-OvhAppKey`, `-OvhAppSecret`, and `-OvhConsumerKey` are supplied;
+3. calls `deploy.ps1 -SkipBuild`, which reads `fullchain.pfx` and its password from the ACME store and passes them to Bicep through a temporary secure parameter file. The PFX is not passed on the command line;
+4. checks that the live HTTPS certificate and `/healthz` endpoint are serving after the deployment.
+
+First-time OVH setup, if the order has not already stored plugin arguments:
+
+```powershell
+$appSecret = Read-Host 'OVH application secret' -AsSecureString
+$consumerKey = Read-Host 'OVH consumer key' -AsSecureString
+.\renew-certificate.ps1 -Force -OvhAppKey '<application-key>' -OvhAppSecret $appSecret -OvhConsumerKey $consumerKey
+```
+
+Do not put OVH secrets into a scheduled-task command line. Once the first run has stored the Posh-ACME plugin arguments, register the weekly Windows task:
+
+```powershell
+.\register-certificate-renewal-task.ps1
+```
+
+The scheduled task only runs the renewal script. It is safe to run weekly because the script exits with an error before renewing or deploying when the certificate is not close to expiry.
+
+Failure modes are deliberately loud:
+
+- missing Azure CLI login, wrong tenant/subscription, missing Posh-ACME, or a missing ACME order stops before renewal;
+- a certificate outside the renewal window stops before any Azure deployment unless `-Force` is used;
+- ACME/OVH failures stop before deployment;
+- deployment failures from `deploy.ps1` are surfaced and the deployment script restores the control-plane environment where possible;
+- after a successful deployment, `deploy.ps1` removes the old resource-group Contributor assignment from `asmdb-mi`; if that removal fails, the run fails so the over-privileged identity is not missed;
+- if Azure accepts the deployment but the live gateway still serves an older certificate or `/healthz` is not `200`, the script throws so the scheduled task records a failure.
 
 ## Cost notes
 

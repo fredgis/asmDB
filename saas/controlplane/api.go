@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,7 +19,9 @@ const (
 	statsRequestTimeout  = 2 * time.Second
 	statsListTimeout     = 3 * time.Second
 	healthCheckTimeout   = 3 * time.Second
-	backupTimeout        = 30 * time.Second
+	defaultBackupTimeout = 30 * time.Minute
+	pendingTokenTTL      = 15 * time.Minute
+	maxUpstreamBodyBytes = 4 << 20
 	operationStaleAfter  = 30 * time.Minute
 	execColdStartBudget  = 45 * time.Second
 	execColdStartBackoff = 2 * time.Second
@@ -45,27 +46,28 @@ type api struct {
 	wakeClient       *http.Client
 	execRetryBudget  time.Duration
 	execRetryBackoff time.Duration
+	backupTimeout    time.Duration
 	now              func() time.Time
 }
 
 type databaseResponse struct {
-	ID               string         `json:"id"`
-	Name             string         `json:"name"`
-	Tier             string         `json:"tier"`
-	Image            string         `json:"image,omitempty"`
-	Engine           string         `json:"engine,omitempty"`
-	State            string         `json:"state"`
-	Endpoint         string         `json:"endpoint"`
-	Token            string         `json:"token,omitempty"`
-	CreatedAt        string         `json:"created_at"`
-	Error            string         `json:"error,omitempty"`
-	Stats            *statsResponse `json:"stats,omitempty"`
-	StorageFormat    string         `json:"storageFormat,omitempty"`
-	EngineSource     string         `json:"engineSource,omitempty"`
-	Operation        *operation     `json:"operation,omitempty"`
-	UpgradeAvailable bool           `json:"upgradeAvailable"`
-	AvailableEngine  string         `json:"availableEngine,omitempty"`
-	AvailableImage   string         `json:"availableImage,omitempty"`
+	ID               string             `json:"id"`
+	Name             string             `json:"name"`
+	Tier             string             `json:"tier"`
+	Image            string             `json:"image,omitempty"`
+	Engine           string             `json:"engine,omitempty"`
+	State            string             `json:"state"`
+	Endpoint         string             `json:"endpoint"`
+	Token            string             `json:"token,omitempty"`
+	CreatedAt        string             `json:"created_at"`
+	Error            string             `json:"error,omitempty"`
+	Stats            *statsResponse     `json:"stats,omitempty"`
+	StorageFormat    string             `json:"storageFormat,omitempty"`
+	EngineSource     string             `json:"engineSource,omitempty"`
+	Operation        *operationResponse `json:"operation,omitempty"`
+	UpgradeAvailable bool               `json:"upgradeAvailable"`
+	AvailableEngine  string             `json:"availableEngine,omitempty"`
+	AvailableImage   string             `json:"availableImage,omitempty"`
 }
 
 type createDatabaseRequest struct {
@@ -106,6 +108,14 @@ type prepareUpgradeResponse struct {
 	Detail string          `json:"detail,omitempty"`
 }
 
+type operationResponse struct {
+	Type      string    `json:"type"`
+	State     string    `json:"state"`
+	StartedAt time.Time `json:"started_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Error     string    `json:"error,omitempty"`
+}
+
 type versionResponse struct {
 	Engine string `json:"engine,omitempty"`
 	Image  string `json:"image,omitempty"`
@@ -122,6 +132,7 @@ func newAPI(store store, provisioner provisioner, cfg config, verifier accessTok
 		wakeClient:       &http.Client{Timeout: wakeRequestTimeout},
 		execRetryBudget:  execColdStartBudget,
 		execRetryBackoff: execColdStartBackoff,
+		backupTimeout:    backupTimeoutOrDefault(cfg.BackupTimeout),
 		now:              func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -400,10 +411,15 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 	}
 	in = a.expireStaleOperation(context.Background(), in)
 	if operationActive(in.Operation) {
-		if in.Operation.Type == "rotate-token" && in.Operation.State == "pending_ack" && in.Operation.PendingToken != "" {
+		if in.Operation.Type == "rotate-token" && in.Operation.State == "pending_ack" && in.Operation.PendingTokenEncrypted != "" {
+			token, err := decryptRotationToken(a.cfg.PlatformSecret, in.ID, in.Operation.PendingTokenEncrypted)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "internal", "recover pending token", err.Error())
+				return
+			}
 			writeJSON(w, http.StatusAccepted, map[string]any{
-				"operation": in.Operation,
-				"token":     in.Operation.PendingToken,
+				"operation": operationForResponse(in.Operation),
+				"token":     token,
 				"warning":   "Token rotation is prepared but not committed. Store this token, then call /rotate-token/commit to apply it.",
 			})
 			return
@@ -417,19 +433,31 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 		writeError(w, http.StatusInternalServerError, "internal", "generate access token", err.Error())
 		return
 	}
+	encrypted, err := encryptRotationToken(a.cfg.PlatformSecret, in.ID, token)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "encrypt pending token", err.Error())
+		return
+	}
 
-	in.Operation = &operation{Type: "rotate-token", State: "pending_ack", StartedAt: a.now(), UpdatedAt: a.now(), PendingToken: token}
+	now := a.now()
+	in.Operation = &operation{
+		Type:                  "rotate-token",
+		State:                 "pending_ack",
+		StartedAt:             now,
+		UpdatedAt:             now,
+		PendingTokenEncrypted: encrypted,
+		PendingTokenExpiresAt: now.Add(pendingTokenTTL),
+	}
 	// Rotation is deliberately two-phase. Preparing stores the new plaintext
-	// token inside the authenticated operation but does not change the app or
-	// token hash. Only /rotate-token/commit applies it. If the client gives up
-	// before acknowledgement, the old token still works; if it gives up later,
-	// the new token remains visible on the operation.
+	// token only in the direct response; metadata stores an encrypted, short-
+	// lived copy so a client that times out can retry prepare and recover it.
+	// Only /rotate-token/commit applies the token hash or app secret.
 	if err := a.store.Save(context.Background(), in); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"operation": in.Operation,
+		"operation": operationForResponse(in.Operation),
 		"token":     token,
 		"warning":   "Token rotation is prepared but not committed. Store this token, then call /rotate-token/commit to apply it.",
 	})
@@ -462,11 +490,15 @@ func (a *api) handleRotateTokenCommit(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	in = a.expireStaleOperation(context.Background(), in)
-	if in.Operation == nil || in.Operation.Type != "rotate-token" || in.Operation.State != "pending_ack" || in.Operation.PendingToken == "" {
+	if in.Operation == nil || in.Operation.Type != "rotate-token" || in.Operation.State != "pending_ack" || in.Operation.PendingTokenEncrypted == "" {
 		writeError(w, http.StatusConflict, "invalid_request", "no prepared token rotation to commit", "")
 		return
 	}
-	token := in.Operation.PendingToken
+	token, err := decryptRotationToken(a.cfg.PlatformSecret, in.ID, in.Operation.PendingTokenEncrypted)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "recover pending token", err.Error())
+		return
+	}
 	in.Operation.State = "stopping"
 	in.Operation.UpdatedAt = a.now()
 	if err := a.store.Save(context.Background(), in); err != nil {
@@ -475,9 +507,9 @@ func (a *api) handleRotateTokenCommit(w http.ResponseWriter, r *http.Request, id
 	}
 	go a.runRotateToken(in, token)
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"operation": in.Operation,
+		"operation": operationForResponse(in.Operation),
 		"token":     token,
-		"warning":   "Token rotation is applying asynchronously. The token remains visible on the operation until completion.",
+		"warning":   "Token rotation is applying asynchronously. Store this token; it will be purged from metadata after completion.",
 	})
 }
 
@@ -492,7 +524,7 @@ func (a *api) runRotateToken(in instance, token string) {
 		return
 	}
 	updated.TokenHash = tokenHash(token)
-	updated.Operation = &operation{Type: "rotate-token", State: "done", StartedAt: previousOperationStarted(updated.Operation, a.now()), UpdatedAt: a.now(), PendingToken: token}
+	updated.Operation = &operation{Type: "rotate-token", State: "done", StartedAt: previousOperationStarted(updated.Operation, a.now()), UpdatedAt: a.now()}
 	_ = a.store.Save(context.Background(), updated)
 }
 
@@ -742,7 +774,7 @@ func (a *api) execOnce(ctx context.Context, in instance, token string, body []by
 		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance unreachable", summarizeError(err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readAllLimited(resp.Body, maxUpstreamBodyBytes, "instance exec")
 	if err != nil {
 		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "read instance response", err.Error()
 	}
@@ -828,7 +860,7 @@ func (a *api) fetchStats(ctx context.Context, in instance) statsResponse {
 		return unavailableStats("unavailable")
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readAllLimited(resp.Body, maxUpstreamBodyBytes, "instance stats")
 	if err != nil {
 		return unavailableStats("unavailable")
 	}
@@ -863,7 +895,7 @@ func (a *api) recordStatsReport(ctx context.Context, in instance, data []byte) {
 }
 
 func (a *api) backupInstance(ctx context.Context, in instance) error {
-	reqCtx, cancel := context.WithTimeout(ctx, backupTimeout)
+	reqCtx, cancel := context.WithTimeout(ctx, a.backupTimeout)
 	defer cancel()
 
 	// This deliberately does not use /v1/exec. The control plane stores only a
@@ -884,8 +916,12 @@ func (a *api) backupInstance(ctx context.Context, in instance) error {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("prepare-upgrade returned %s", resp.Status)
 	}
+	data, err := readAllLimited(resp.Body, maxUpstreamBodyBytes, "prepare-upgrade")
+	if err != nil {
+		return err
+	}
 	var out prepareUpgradeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(data, &out); err != nil {
 		return err
 	}
 	if !out.OK {
@@ -962,7 +998,7 @@ func (a *api) responseFor(ctx context.Context, in instance) databaseResponse {
 		Error:            state.Error,
 		StorageFormat:    in.StorageFormat,
 		EngineSource:     engineSourceForInstance(in),
-		Operation:        in.Operation,
+		Operation:        operationForResponse(in.Operation),
 		UpgradeAvailable: a.upgradeAvailable(in),
 		AvailableEngine:  a.availableEngine(),
 		AvailableImage:   a.availableImage(),
@@ -996,14 +1032,64 @@ func (a *api) updateOperationState(ctx context.Context, id, state, detail string
 }
 
 func (a *api) expireStaleOperation(ctx context.Context, in instance) instance {
-	if !operationActive(in.Operation) || a.now().Sub(in.Operation.UpdatedAt) <= operationStaleAfter {
+	if in.Operation == nil {
+		return in
+	}
+	now := a.now()
+	if in.Operation.Type == "rotate-token" && in.Operation.PendingToken != "" {
+		expires := in.Operation.PendingTokenExpiresAt
+		if expires.IsZero() {
+			expires = in.Operation.UpdatedAt.Add(pendingTokenTTL)
+			if in.Operation.UpdatedAt.IsZero() {
+				expires = now.Add(pendingTokenTTL)
+			}
+			in.Operation.PendingTokenExpiresAt = expires
+		}
+		if !now.After(expires) {
+			if encrypted, err := encryptRotationToken(a.cfg.PlatformSecret, in.ID, in.Operation.PendingToken); err == nil {
+				in.Operation.PendingTokenEncrypted = encrypted
+			}
+		}
+		in.Operation.PendingToken = ""
+		in.Operation.UpdatedAt = now
+		_ = a.store.Save(ctx, in)
+	}
+	if in.Operation.Type == "rotate-token" && !in.Operation.PendingTokenExpiresAt.IsZero() && now.After(in.Operation.PendingTokenExpiresAt) && in.Operation.PendingTokenEncrypted != "" {
+		in.Operation.PendingToken = ""
+		in.Operation.PendingTokenEncrypted = ""
+		in.Operation.PendingTokenExpiresAt = time.Time{}
+		if in.Operation.State == "pending_ack" {
+			in.Operation.State = "failed"
+			in.Operation.Error = "pending token rotation expired before commit; prepare a new rotation"
+		}
+		in.Operation.UpdatedAt = now
+		_ = a.store.Save(ctx, in)
+		return in
+	}
+	if !operationActive(in.Operation) || now.Sub(in.Operation.UpdatedAt) <= operationStaleAfter {
 		return in
 	}
 	in.Operation.State = "failed"
-	in.Operation.UpdatedAt = a.now()
+	in.Operation.UpdatedAt = now
 	in.Operation.Error = "operation expired after control-plane restart or timeout; poll state and retry if needed"
+	in.Operation.PendingToken = ""
+	in.Operation.PendingTokenEncrypted = ""
+	in.Operation.PendingTokenExpiresAt = time.Time{}
 	_ = a.store.Save(ctx, in)
 	return in
+}
+
+func operationForResponse(op *operation) *operationResponse {
+	if op == nil {
+		return nil
+	}
+	return &operationResponse{
+		Type:      op.Type,
+		State:     op.State,
+		StartedAt: op.StartedAt,
+		UpdatedAt: op.UpdatedAt,
+		Error:     op.Error,
+	}
 }
 
 func operationActive(op *operation) bool {

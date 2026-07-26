@@ -47,7 +47,11 @@ Hosted instances are reached through the control-plane prefix
 - `POST /v1/prepare-upgrade`
 - `POST /mcp`
 
-`/v1/exec` runs one terminal command under the engine lock. `BENCH`, `BACKUP`, `RESTORE`, `VERIFY`, and `TRUNCATE` get the long command timeout; other commands use the short timeout. If the engine exits, the sidecar restarts it and backs off while waiting for the exclusive file lock.
+`/v1/exec` runs one hosted-terminal command under the engine lock. It is an allowlist, not a denylist: `HELP`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `TRUNCATE`, `COUNT`, `BEGIN`, `COMMIT`, `ROLLBACK`, `TABLES`, `DATABASES`, `SCHEMA`, `VERSION`, `TYPES`, `BENCH`, `FIND`, `RANGE`, `FORMAT`, `PAGE`, `VERIFY`, and `CDCTRIM` are accepted. `BACKUP` and `RESTORE` are not accepted through `/v1/exec` because they require filesystem paths; sidecar-owned flows such as `/v1/prepare-upgrade` choose their own paths instead. `EXIT`, `QUIT`, and unknown commands are rejected before they reach the engine.
+
+Terminal command lines are capped at the engine line limit of 511 bytes, the JSON request body at 4096 bytes, and accumulated engine responses at 1 MiB; exceeding any cap returns an explicit error rather than a truncated response. `PAGE` is accepted only with a limit from 1 through 1000 and a non-negative offset. The sidecar also initializes the engine session with `PAGE 1000 0`, so listing commands cannot default to returning the whole database.
+
+The sidecar treats the engine status line (`[ OK ] ...` or `[ERR] ...`) as the response terminator and drains the following prompt before releasing the engine lock. If a request is cancelled before the status line arrives, the sidecar kills and restarts the engine before returning, so unread bytes from the cancelled command cannot be consumed by a later command. `BENCH`, `VERIFY`, and `TRUNCATE` get the long command timeout; other accepted `/v1/exec` commands use the short timeout. If the engine exits, the sidecar restarts it and backs off while waiting for the exclusive file lock.
 
 `/health` and `/v1/stats` report the engine version and storage format read from the engine's `VERSION` command, not a sidecar constant. `/v1/stats` also reports live rows/capacity, uptime, CPU, cgroup memory, and storage. Storage includes both apparent and allocated byte counts for `.dat`, `.wal`, and `.cdc`; memory includes file, inactive-file, reclaimable, and working-set fields plus cgroup events/pressure when available.
 

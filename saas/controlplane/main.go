@@ -28,10 +28,15 @@ type config struct {
 	EntraClientID  string
 	EntraGroupID   string
 	EntraScope     string
+	BackupTimeout  time.Duration
 }
 
 func loadConfig() (config, error) {
-	entraClientID := getenv("ASMDB_ENTRA_CLIENT_ID", "<console-app-id>")
+	entraClientID := os.Getenv("ASMDB_ENTRA_CLIENT_ID")
+	backupTimeout, err := parseBackupTimeout(os.Getenv("ASMDB_BACKUP_TIMEOUT"))
+	if err != nil {
+		return config{}, err
+	}
 	cfg := config{
 		Port:           getenv("PORT", "8080"),
 		SubscriptionID: os.Getenv("AZURE_SUBSCRIPTION_ID"),
@@ -44,10 +49,11 @@ func loadConfig() (config, error) {
 		PublicBase:     os.Getenv("ASMDB_PUBLIC_BASE"),
 		PlatformSecret: os.Getenv("ASMDB_PLATFORM_SECRET"),
 		SiteDir:        getenv("ASMDB_SITE_DIR", "/app/site"),
-		EntraTenantID:  getenv("ASMDB_ENTRA_TENANT_ID", "<tenant-id>"),
+		EntraTenantID:  os.Getenv("ASMDB_ENTRA_TENANT_ID"),
 		EntraClientID:  entraClientID,
-		EntraGroupID:   getenv("ASMDB_ENTRA_GROUP_ID", "<admin-group-id>"),
+		EntraGroupID:   os.Getenv("ASMDB_ENTRA_GROUP_ID"),
 		EntraScope:     "api://" + entraClientID + "/" + entraScopeName,
+		BackupTimeout:  backupTimeout,
 	}
 
 	var missing []string
@@ -57,10 +63,30 @@ func loadConfig() (config, error) {
 	if cfg.Image == "" {
 		missing = append(missing, "ASMDB_IMAGE")
 	}
+	if cfg.EntraTenantID == "" {
+		missing = append(missing, "ASMDB_ENTRA_TENANT_ID")
+	}
+	if cfg.EntraClientID == "" {
+		missing = append(missing, "ASMDB_ENTRA_CLIENT_ID")
+	}
+	if cfg.EntraGroupID == "" {
+		missing = append(missing, "ASMDB_ENTRA_GROUP_ID")
+	}
 	if len(missing) > 0 {
 		return cfg, fmt.Errorf("missing required environment variable(s): %v", missing)
 	}
 	return cfg, nil
+}
+
+func parseBackupTimeout(value string) (time.Duration, error) {
+	if value == "" {
+		return defaultBackupTimeout, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("ASMDB_BACKUP_TIMEOUT must be a positive Go duration such as 30m: %q", value)
+	}
+	return parsed, nil
 }
 
 func getenv(key, fallback string) string {

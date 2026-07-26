@@ -7,8 +7,8 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). The 1.6.2 PE64 build is 43,749 bytes;
-    the 1.6.2 ELF64 build is 52,221 bytes. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). The 1.7.0 PE64 build is 43,749 bytes;
+    the 1.7.0 ELF64 build is 52,221 bytes. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -464,7 +464,7 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the PE64 binary is 43,749 bytes at 1.6.2 and the 1.6.2
+which is why the PE64 binary is 43,749 bytes at 1.7.0 and the 1.7.0
 ELF64 binary is 52,221 bytes — and why a million-row database needs only a few
 MB of RAM.
 
@@ -862,7 +862,7 @@ touching 1 GiB. Details in [§12 Roadmap](docs/ENGINE.md#12-roadmap).
 ## Changelog
 
 <details>
-<summary><b>Release history</b> — 1.6.2 · 1.6.1 · 1.6.0 · 1.5.3 · 1.5.2 · 1.5.1 · … (click to expand)</summary>
+<summary><b>Release history</b> — 1.7.0 · 1.6.2 · 1.6.1 · 1.6.0 · 1.5.3 · 1.5.2 · 1.5.1 · … (click to expand)</summary>
 
 Versions follow `MAJOR.MINOR.PATCH`. **`MAJOR` changes only when the on-disk
 format does**, so a major bump is the signal that `--upgrade` has work to do.
@@ -873,7 +873,7 @@ Two numbers are tracked separately and should not be confused:
 
 | | What it is | How often it moves | Effect |
 |---|---|---|---|
-| **Engine version** | the software (`1.6.2`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
+| **Engine version** | the software (`1.7.0`) | every release | shown by `VERSION` and in the banner; stamped into each database it writes |
 | **Storage format** | the byte layout of `<db>.dat` (`2`) | rarely | decides whether a file can be opened, and what `--upgrade` migrates |
 
 Run `VERSION` inside the REPL to see both, plus which engine last wrote the open
@@ -881,6 +881,78 @@ database. To move a database written by an incompatible build, see
 [Upgrading a database](#upgrading-a-database).
 
 Newest first — click a version to expand it.
+
+<details>
+  <summary><b>1.7.0</b> — what an external audit found, and what it cost to keep</summary>
+
+  An independent audit of the previous commit scored the hosted service 3/10 and
+  the development process 2/10. It was right on every material point, verified
+  against the code before anything was changed. This release closes the findings
+  that did not require a product decision, and records the decisions taken on
+  those that did.
+
+  **A rotated token was stored and served in clear.** The two-phase rotation
+  exists for a good reason — a client that times out must not lose the only copy
+  of a token that was in fact issued, which locked a user out of their own
+  database once. But the prepared token was written in plaintext to the metadata
+  store, **kept after the rotation committed**, and serialised into the
+  `operation` field of every response returning a database object, including
+  `GET /databases`. Anyone who could list databases could read a live credential.
+
+  It is now encrypted at rest with AES-GCM under a key derived from the platform
+  secret, with the database id as associated data so a record cannot be replayed
+  against another instance. It expires after fifteen minutes, it is purged when
+  the rotation commits, and the wire type no longer has a field for it at all —
+  the leak is structurally impossible rather than merely avoided. Records written
+  by earlier versions are migrated and purged on access. Recovery still works.
+
+  **The engine protocol could be desynchronised by data.** Frame detection used
+  `strings.Contains(line, "asmdb> ")`, so a row containing that string truncated
+  the response and was silently rewritten on the way out. A cancelled HTTP
+  request abandoned the stream without draining it, so the next command read the
+  previous command's answer. Detection is now exact, and a cancelled command
+  restarts the engine before releasing the lock.
+
+  **The browser terminal ran anything but `EXIT` and `QUIT`.** It is now an
+  allowlist. `BACKUP` and `RESTORE` are refused outright: they accepted a
+  caller-supplied path, which was an arbitrary file write and read inside the
+  container — the most serious finding, and one the audit itself missed. Request
+  and response sizes are capped, and pagination is bounded.
+
+  **Unbounded reads.** The control plane read upstream responses and metadata
+  blobs with no limit. Capped at 4 MiB and 1 MiB, with an explicit error rather
+  than a silent truncation.
+
+  **Production identifiers were compiled in.** The three Entra variables are
+  documented as required but were supplied as defaults, so a misconfigured
+  control plane came up validating tokens against this deployment's identities.
+  It now refuses to start.
+
+  **The backup timeout was shorter than an open.** Thirty seconds, when a bare
+  open on Azure Files NFS measures eighteen and long engine operations get
+  thirty minutes. Now thirty minutes, configurable.
+
+  **Contributor on the resource group** is replaced by a custom role whose every
+  permission is derived from a specific line of the provisioner.
+
+  **The certificate was renewed by hand** every ninety days, which is a scheduled
+  outage. Renewal and its scheduling are now scripted.
+
+  **There was no gate at all.** Releases were published from a workstation and
+  the test step could be skipped. A local pre-push hook now builds both engine
+  targets, validates the ELF, runs the smoke suite, builds, vets and tests both
+  Go modules, parses the console, and refuses any staged compiled binary — two
+  Go binaries totalling 22 MB reached a commit this week. `-SkipTests` is gone.
+
+  **Two decisions were taken rather than coded around.** The service is
+  **single-organisation**: no owner is recorded on an instance, quotas are
+  global, and every administrator sees every database. The documentation now says
+  so instead of advertising per-account quotas. And the engine keeps its fixed
+  RWX image without W^X or ASLR: that is a deliberate consequence of a
+  no-linker, `-f bin` build, and the sidecar remains the boundary that hostile
+  input must not cross.
+
+</details>
 
 <details>
   <summary><b>1.6.2</b> — an upgrade no longer inherits the revision it must replace</summary>
@@ -1724,3 +1796,4 @@ roadmap, and [`docs/SAAS.md`](docs/SAAS.md) for the SaaS productization plan.
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+

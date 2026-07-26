@@ -44,6 +44,8 @@ type execInput struct {
 	Command string `json:"command"`
 }
 
+const maxExecRequestBodyBytes = 4096
+
 type prepareUpgradeResponse struct {
 	OK     bool               `json:"ok"`
 	Backup *prepareBackupInfo `json:"backup,omitempty"`
@@ -321,6 +323,7 @@ func (a *api) handleVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) handleExec(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxExecRequestBodyBytes)
 	var in execInput
 	if !decodeJSON(w, r, &in) {
 		return
@@ -484,6 +487,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("request body must not exceed %d bytes", mbe.Limit), "")
+			return false
+		}
 		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body", err.Error())
 		return false
 	}

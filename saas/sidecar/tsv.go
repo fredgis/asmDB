@@ -12,6 +12,7 @@ const (
 	maxTagBytes     = 39
 	maxContentBytes = 175
 	maxLineBytes    = 511
+	maxExecPageRows = 1000
 )
 
 type Row struct {
@@ -162,8 +163,61 @@ func validateExecCommand(line string) error {
 		return err
 	}
 	cmd := strings.TrimSpace(line)
-	if strings.EqualFold(cmd, "EXIT") || strings.EqualFold(cmd, "QUIT") {
-		return codedError{code: "invalid_request", msg: "command is not allowed in the browser terminal"}
+	token := firstCommandToken(cmd)
+	if token == "" {
+		return nil
+	}
+	if token == "BACKUP" || token == "RESTORE" {
+		return codedError{code: "invalid_request", msg: token + " is not allowed in the browser terminal because caller-supplied filesystem paths are forbidden"}
+	}
+	if !execAllowedCommands[token] {
+		return codedError{code: "invalid_request", msg: "command " + token + " is not allowed in the browser terminal"}
+	}
+	if token == "PAGE" {
+		if err := validateExecPage(cmd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var execAllowedCommands = map[string]bool{
+	"HELP":      true,
+	"INSERT":    true,
+	"SELECT":    true,
+	"UPDATE":    true,
+	"DELETE":    true,
+	"TRUNCATE":  true,
+	"COUNT":     true,
+	"BEGIN":     true,
+	"COMMIT":    true,
+	"ROLLBACK":  true,
+	"TABLES":    true,
+	"DATABASES": true,
+	"SCHEMA":    true,
+	"VERSION":   true,
+	"TYPES":     true,
+	"BENCH":     true,
+	"FIND":      true,
+	"RANGE":     true,
+	"FORMAT":    true,
+	"PAGE":      true,
+	"VERIFY":    true,
+	"CDCTRIM":   true,
+}
+
+func validateExecPage(line string) error {
+	fields := strings.Fields(line)
+	if len(fields) != 3 {
+		return codedError{code: "invalid_request", msg: "PAGE must be PAGE <limit> <offset>"}
+	}
+	limit, err := strconv.Atoi(fields[1])
+	if err != nil || limit < 1 || limit > maxExecPageRows {
+		return codedError{code: "invalid_request", msg: "PAGE limit must be an integer from 1 through 1000"}
+	}
+	offset, err := strconv.Atoi(fields[2])
+	if err != nil || offset < 0 {
+		return codedError{code: "invalid_request", msg: "PAGE offset must be a non-negative integer"}
 	}
 	return nil
 }

@@ -308,6 +308,27 @@ function Set-ControlPlaneEnv {
     )
 }
 
+function Remove-LegacyContributorAssignment {
+    $identity = Invoke-AzJson @('identity', 'show', '--name', 'asmdb-mi', '--resource-group', $ResourceGroup)
+    if (-not $identity -or [string]::IsNullOrWhiteSpace($identity.principalId)) {
+        throw 'Cannot inspect asmdb-mi principalId to remove the legacy Contributor assignment.'
+    }
+
+    $scope = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup"
+    $assignments = @(Invoke-AzJson @(
+        'role', 'assignment', 'list',
+        '--assignee-object-id', $identity.principalId,
+        '--role', 'Contributor',
+        '--scope', $scope,
+        '--query', '[].id'
+    ))
+
+    foreach ($assignmentId in $assignments) {
+        Write-Host ">> removing legacy Contributor assignment $assignmentId" -ForegroundColor Yellow
+        Invoke-Az @('role', 'assignment', 'delete', '--ids', $assignmentId)
+    }
+}
+
 $deployment = Invoke-GroupDeployment 'Deploying infrastructure with placeholder control-plane image...' $null
 $outputs = $deployment.properties.outputs
 $registryName = Get-OutputValue $outputs 'registryName'
@@ -383,6 +404,8 @@ do {
 if ($app.properties.latestReadyRevisionName -ne $app.properties.latestRevisionName -or $app.properties.provisioningState -ne 'Succeeded') {
     throw "Container App revision did not become healthy within 10 minutes. Latest='$($app.properties.latestRevisionName)', ready='$($app.properties.latestReadyRevisionName)', state='$($app.properties.provisioningState)'."
 }
+
+Remove-LegacyContributorAssignment
 
 $url = $apimGatewayUrl
 Write-Host ''

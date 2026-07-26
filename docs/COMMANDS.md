@@ -469,12 +469,12 @@ file can be opened.
 
 ```text
 asmdb> VERSION
-  asmdb 1.6.2   (stable: the on-disk format is versioned and migratable)
+  asmdb 1.7.0   (stable: the on-disk format is versioned and migratable)
   storage format : 2
   record size    : 256 bytes
   capacity       : 4194304 slots
   platform       : Windows PE64 (kernel32)
-  written by     : engine 1.6.2
+  written by     : engine 1.7.0
 [ OK ] version shown
 ```
 

@@ -5,7 +5,7 @@ the **asmdb** transactional engine as a **generic CRUD store** over MCP. Any MCP
 client can insert, update, get, delete, search, list and count rows — all backed
 by the WAL-durable x86-64 assembly engine.
 
-Current engine: **1.6.2**, storage format **2**. The binaries are 43,749 bytes
+Current engine: **1.7.0**, storage format **2**. The binaries are 43,749 bytes
 (PE64) and 52,221 bytes (ELF64), and downloads are published at
 <https://www.asmdb.cloud/downloads/> with SHA-256 hashes in the manifest.
 
@@ -38,7 +38,7 @@ flowchart LR
 The server keeps **one long-lived `asmdb` process** for the whole session, and
 the record region is **mapped copy-on-write**, so startup is immediate and only
 the pages actually touched become resident; every tool call is then an in-memory
-hash lookup plus a small durable write. The server relies on the 1.6.2 CLI
+hash lookup plus a small durable write. The server relies on the 1.7.0 CLI
 guarantee that every command terminates with `[ OK ]` or `[ERR]`; older engines
 missed terminators on `HELP`, `SCHEMA`, `VERSION` and empty `SELECT *`, which
 could desynchronise a stdio reader. When the MCP client disconnects, the server
@@ -131,7 +131,7 @@ platforms the default executable name is `build/asmdb`.
 
 | MCP server | Engine | Storage format | CLI protocol |
 |------------|--------|----------------|--------------|
-| 1.2.0 | 1.2.0 – 1.6.2 | 2 (`.dat` + `.wal` + `.cdc`) | REPL with `FORMAT TSV` rows (`R<TAB>…`) and `PAGE <limit> <offset>`; 1.6.2+ always emits a status terminator |
+| 1.2.0 | 1.2.0 – 1.7.0 | 2 (`.dat` + `.wal` + `.cdc`) | REPL with `FORMAT TSV` rows (`R<TAB>…`) and `PAGE <limit> <offset>`; 1.7.0+ always emits a status terminator |
 | 1.1.0 | 1.1.0 | 2 (`.dat` + `.wal` + `.cdc`) | Human table parsing — content silently truncated at 39 bytes; do not use |
 | 1.0.0 | 1.0.0 | 2 (`.dat` + `.wal` + `.cdc`) | Human table parsing — content silently truncated at 39 bytes; do not use |
 
