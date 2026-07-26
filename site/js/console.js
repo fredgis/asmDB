@@ -78,6 +78,7 @@
 
   var databases = [];
   var currentDb = null;
+  var currentSelectionId = "";
   var tokenById = Object.create(null);
   var transcript = [];
   var terminalDbId = "";
@@ -316,6 +317,7 @@
           if (e.name === "AbortError") {
             var t = new Error("the control plane did not answer within 30 seconds");
             t.code = "api_unreachable";
+            t.timedOut = true;
             throw t;
           }
           if (e.status === 403) {
@@ -370,6 +372,7 @@
   }
   function renderVersion(data) {
     var engine = data && data.engine;
+    var source = versionSource(data);
     if (!engine) {
       if (navVersion) { navVersion.hidden = true; navVersion.textContent = ""; }
       if (heroVersion) { heroVersion.innerHTML = '<span class="dot" aria-hidden="true"></span> engine version unavailable'; }
@@ -381,11 +384,15 @@
       navVersion.hidden = false;
     }
     if (heroVersion) {
-      heroVersion.innerHTML = '<span class="dot" aria-hidden="true"></span> engine ' + esc(engine);
+      heroVersion.innerHTML = '<span class="dot" aria-hidden="true"></span> engine ' + esc(engine) + (source ? ' · ' + esc(source) : '');
     }
     if (footVersion) {
-      footVersion.textContent = "Engine " + engine + " · MIT licence";
+      footVersion.textContent = "Engine " + engine + (source ? " · " + source : "") + " · MIT licence";
     }
+  }
+  function versionSource(data) {
+    if (!data) { return ""; }
+    return data.engineSource || data.engineVersionSource || data.versionSource || data.source || "";
   }
   function loadVersion() {
     fetch(API + "/version", { headers: { "accept": "application/json" } })
@@ -444,6 +451,17 @@
     else { rowsMeter.removeAttribute("data-tiny"); }
   }
   function databaseLabel(db) { return db && (db.name || db.id) || "database"; }
+  function databaseEngine(db) {
+    return db && db.engine ? String(db.engine) : "unknown";
+  }
+  function databaseEngineSource(db) {
+    return versionSource(db);
+  }
+  function databaseEngineText(db) {
+    var engine = databaseEngine(db);
+    var source = databaseEngineSource(db);
+    return "engine " + engine + (source ? " · " + source : "");
+  }
   function asleepLabel(reason) {
     if (!reason) { return "unavailable"; }
     if (/^(stopped|scaledtozero|scaled_to_zero|sleeping|sleep|zero replicas)$/i.test(String(reason))) { return "asleep"; }
@@ -541,16 +559,16 @@
       return;
     }
     selectedDbName.textContent = databaseLabel(currentDb);
-    selectedDbId.textContent = currentDb.id + " · " + (currentDb.tier || "tier") + " · " + (currentDb.state || "state");
+    selectedDbId.textContent = currentDb.id + " · " + (currentDb.tier || "tier") + " · " + (currentDb.state || "state") + " · " + databaseEngineText(currentDb);
     databaseViewName.textContent = databaseLabel(currentDb);
     databaseViewMeta.textContent = currentDb.endpoint
-      ? currentDb.id + " · " + (currentDb.state || "state") + " · " + currentDb.endpoint
-      : currentDb.id + " · " + (currentDb.state || "state");
+      ? currentDb.id + " · " + (currentDb.state || "state") + " · " + databaseEngineText(currentDb) + " · " + currentDb.endpoint
+      : currentDb.id + " · " + (currentDb.state || "state") + " · " + databaseEngineText(currentDb);
     if (loadSampleBtn) { loadSampleBtn.disabled = false; }
     if (deleteDbBtn) { deleteDbBtn.disabled = false; }
     if (upgradeDbBtn) {
-      var runningEngine = currentDb.engine || "unknown";
-      var targetEngine = currentDb.availableEngine || runningEngine;
+      var runningEngine = databaseEngine(currentDb);
+      var targetEngine = currentDb.availableEngine || "unknown";
       upgradeDbBtn.hidden = false;
       if (currentDb.upgradeAvailable) {
         upgradeDbBtn.disabled = false;
@@ -577,7 +595,7 @@
         '<span class="db-item__main"><span class="db-item__name">' + esc(databaseLabel(db)) + '</span>' +
         '<span class="db-item__id">' + esc(db.id) + '</span></span>' +
         '<span class="db-item__rows">' + esc(state) + '</span>' +
-        '<span class="db-item__meta">' + esc(db.tier || "tier") + ' · endpoint ' + esc(db.endpoint || "unavailable") + '</span>' +
+        '<span class="db-item__meta">' + esc(db.tier || "tier") + ' · ' + esc(databaseEngineText(db)) + ' · endpoint ' + esc(db.endpoint || "unavailable") + '</span>' +
       '</button>';
     }).join("");
     updateSelectedChrome();
@@ -593,7 +611,9 @@
     var previousId = currentDb && currentDb.id;
     var nextId = db && db.id;
     var refreshOnly = !!options.refresh || (previousId && nextId && previousId === nextId && options.reset !== true);
+    if (previousId !== nextId) { clearDatabaseScopedMessages(nextId); }
     currentDb = db ? Object.assign({}, currentDb && currentDb.id === db.id ? currentDb : {}, db) : null;
+    currentSelectionId = currentDb ? currentDb.id : "";
     if (currentDb) {
       if (currentDb.token) { rememberInstanceTokenFor(currentDb.id, currentDb.token); }
       var remembered = tokenForDatabase(currentDb.id);
@@ -613,6 +633,21 @@
     renderStats(currentDb, null);
     showTerminal(currentDb, { reset: true });
     if (currentDb && options.route) { setHash(options.route); }
+  }
+  function clearDatabaseScopedMessages(nextId) {
+    if (rotatedTokenOutput) {
+      rotatedTokenOutput.hidden = true;
+      rotatedTokenOutput.textContent = "";
+      rotatedTokenOutput.removeAttribute("data-state");
+      rotatedTokenOutput.removeAttribute("data-db-id");
+    }
+    if (benchResult) { benchResult.textContent = "No bench run yet."; }
+    if (previewRows) {
+      previewStatus.textContent = "—";
+      previewRows.innerHTML = '<tr><td colspan="5">' + esc(nextId ? "Open the selected database view to load rows." : "Select a database.") + '</td></tr>';
+    }
+    clearTokenNeeded();
+    say(nextId ? "Ready. Selected database changed." : "Ready. Select a database.", "ok");
   }
   function renderPreviewMessage(message) {
     previewStatus.textContent = "—";
@@ -735,6 +770,7 @@
       '<span class="k">name     </span> ' + esc(d.name),
       '<span class="k">tier     </span> ' + esc(d.tier),
       '<span class="k">state    </span> ' + esc(d.state),
+      '<span class="k">engine   </span> ' + esc(databaseEngineText(d)),
       '<span class="k">endpoint </span> ' + esc(d.endpoint),
       "",
       '<span class="k">token    </span> <span class="danger">' + esc(d.token) + '</span>',
@@ -1059,13 +1095,15 @@
         updateSelectedChrome();
       });
   }
-  function renderRotatedToken(data) {
+  function renderRotatedToken(data, db) {
     var token = data && data.token;
     if (!token) { throw new Error("token rotation did not return a token"); }
-    rememberInstanceToken(token);
-    if (rotatedTokenOutput) {
-      var display = Object.assign({}, currentDb, { token: token });
+    rememberInstanceTokenFor(db.id, token);
+    if (currentDb && currentDb.id === db.id) { updateTokenHeld(); }
+    if (rotatedTokenOutput && currentDb && currentDb.id === db.id) {
+      var display = Object.assign({}, db, currentDb, { token: token });
       rotatedTokenOutput.hidden = false;
+      rotatedTokenOutput.setAttribute("data-db-id", db.id);
       rotatedTokenOutput.innerHTML = [
         oneTimeTokenMarkup(display, "token rotation response received", "Update every client that used the previous token."),
         '<span class="k">warning  </span> ' + esc((data && data.warning) || "Token rotation restarts the instance and briefly interrupts active connections."),
@@ -1074,7 +1112,32 @@
       rotatedTokenOutput.setAttribute("data-state", "ok");
     }
     clearTokenNeeded();
-    say("New token returned for " + esc(databaseLabel(currentDb)) + ". The instance may still be restarting; update every client that used the previous token.", "ok");
+    if (currentDb && currentDb.id === db.id) {
+      say("New token returned for " + esc(databaseLabel(db)) + ". The instance may still be restarting; update every client that used the previous token.", "ok");
+    }
+  }
+  function renderRotationTimeout(db) {
+    clearSessionToken(db.id);
+    delete tokenById[db.id];
+    if (currentDb && currentDb.id === db.id) {
+      delete currentDb.token;
+      termToken.value = "";
+      updateTokenHeld();
+      if (rotatedTokenOutput) {
+        rotatedTokenOutput.hidden = false;
+        rotatedTokenOutput.removeAttribute("data-state");
+        rotatedTokenOutput.setAttribute("data-db-id", db.id);
+        rotatedTokenOutput.innerHTML = [
+          '<span class="k">status   </span> rotation status unknown',
+          '<span class="k">database </span> ' + esc(databaseLabel(db)) + ' (' + esc(db.id) + ')',
+          '<span class="danger">          the request took longer than the console waited; the operation may still be in progress</span>',
+          '<span class="danger">          the old token may already be invalid, and no new token was received by this browser</span>',
+          "",
+          "Wait for the instance to finish restarting, refresh the database state, then rotate again if you still do not have a working token. A 401 from the old token means the first rotation completed server-side."
+        ].join("\n");
+      }
+      say("Token rotation status unknown for " + esc(databaseLabel(db)) + ". It may still be running; do not assume the old token still works.", "ok");
+    }
   }
   function rotateCurrentToken() {
     if (!currentDb) {
@@ -1092,14 +1155,20 @@
       "Type " + expected + " to continue."
     );
     if (typed !== expected) { return; }
+    var db = Object.assign({}, currentDb);
     rotateTokenBtn.disabled = true;
     rotateTokenBtn.textContent = "rotating…";
     if (rotatedTokenOutput) { rotatedTokenOutput.hidden = true; rotatedTokenOutput.textContent = ""; }
-    request("/databases/" + encodeURIComponent(currentDb.id) + "/rotate-token", { method: "POST" })
-      .then(renderRotatedToken)
+    request("/databases/" + encodeURIComponent(db.id) + "/rotate-token", { method: "POST" })
+      .then(function (data) { renderRotatedToken(data, db); })
       .catch(function (e) {
-        if (rotatedTokenOutput) {
+        if (e && e.timedOut) {
+          renderRotationTimeout(db);
+          return;
+        }
+        if (rotatedTokenOutput && currentDb && currentDb.id === db.id) {
           rotatedTokenOutput.hidden = false;
+          rotatedTokenOutput.setAttribute("data-db-id", db.id);
           rotatedTokenOutput.innerHTML = '<span class="err">[ERR]</span> ' + esc(e.code || "error") + "\n      " + esc(e.message || "token rotation failed");
           rotatedTokenOutput.setAttribute("data-state", "error");
         }
