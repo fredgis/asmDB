@@ -484,6 +484,77 @@ is driven by hand here. Create an **OVH API token** with write access to the
 (`-Plugin OVH`), at which point renewal is one scheduled command with nothing to
 type. Until that exists, this page is the procedure.
 
+#### Automating the OVH DNS step
+
+This trades one risk for another. The manual route stores no DNS credential; the
+automated route stores an OVH token with write access to the DNS zone on the
+machine that renews the certificate. Keep that machine patched, and scope the
+token deliberately.
+
+Create the token at <https://api.ovh.com/createToken/>. It returns three values:
+
+- application key;
+- application secret;
+- consumer key.
+
+For a European OVH account, the Posh-ACME region is `ovh-eu`. Grant only the
+rights the plugin needs:
+
+| Method | Path |
+|---|---|
+| `GET` | `/domain/zone/*` |
+| `POST` | `/domain/zone/*` |
+| `DELETE` | `/domain/zone/*` |
+
+Granting `/*` across the whole account is more than this needs. Set the token
+validity deliberately; an unlimited token that nobody remembers creating becomes
+its own maintenance problem.
+
+The installed Posh-ACME OVH plugin takes secure strings for the two secrets.
+Avoid the deprecated insecure parameters (`OVHAppSecretInsecure` and
+`OVHConsumerKeyInsecure`) even though examples using them are easy to find; they
+put secrets in plain text.
+
+Create or replace the order with the plugin arguments:
+
+```powershell
+Import-Module Posh-ACME
+Set-PAServer LE_PROD
+
+$pluginArgs = @{
+    OVHAppKey      = '<application-key>'
+    OVHAppSecret   = ConvertTo-SecureString '<application-secret>' -AsPlainText -Force
+    OVHConsumerKey = ConvertTo-SecureString '<consumer-key>' -AsPlainText -Force
+    OVHRegion      = 'ovh-eu'
+}
+
+New-PACertificate -Domain 'www.asmdb.cloud' `
+    -Plugin OVH `
+    -PluginArgs $pluginArgs `
+    -PfxPass (New-Guid).Guid `
+    -Force
+```
+
+Posh-ACME stores the plugin arguments with the order, so later renewals do not
+need the hashtable again:
+
+```powershell
+Submit-Renewal
+```
+
+That is the whole point: no TXT value to copy, no DNS record to type. It still
+has to run somewhere. Posh-ACME does not renew by itself; use a scheduled task
+on a machine that is on, or renewal will not happen.
+
+After renewal, deploy the certificate as usual:
+
+```powershell
+.\saas\infra\deploy.ps1 -SkipBuild
+```
+
+The deployment script reads the renewed certificate from the ACME store and
+passes it to Azure, the same as in the manual procedure.
+
 ---
 
 ## 8c. Releasing a new engine version
