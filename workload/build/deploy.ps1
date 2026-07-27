@@ -16,6 +16,11 @@ param(
     [string]$SubscriptionId = '<subscription-id>',
     [string]$ResourceGroup = '<analytics-resource-group>',
     [string]$Location = 'swedencentral',
+    # Static Web Apps is not offered in every region: at the time of writing it
+    # is limited to centralus, eastus2, westus2, westeurope and eastasia, so it
+    # cannot follow $Location into swedencentral. A resource may sit in a
+    # different region from its resource group, so the group stays put.
+    [string]$StaticWebAppLocation = 'westeurope',
     [string]$AppServicePlan = 'plan-asmdb-analytical',
     [string]$BackendAppName = 'asmdb-analytical-backend',
     [string]$StaticWebAppName = 'asmdb-analytical-frontend',
@@ -315,9 +320,12 @@ if (Test-Phase 'infrastructure') {
     if ($ResourceGroup -ne '<analytics-resource-group>') { throw 'Isolation violation: this workload must deploy only to <analytics-resource-group>.' }
     $null = Assert-AnalyticsResourceGroup
     Invoke-Az @('appservice','plan','create','--name',$AppServicePlan,'--resource-group',$ResourceGroup,'--location',$Location,'--sku','B1','--is-linux') 'Ensure backend App Service plan' -SkipWhenWhatIf
-    Invoke-Az @('webapp','create','--resource-group',$ResourceGroup,'--plan',$AppServicePlan,'--name',$BackendAppName,'--runtime','NODE:20-lts') 'Ensure backend Web App' -SkipWhenWhatIf
+    # NODE:20-lts was retired from App Service on Linux; 22-lts is the current
+    # LTS the platform accepts. Check with `az webapp list-runtimes --os-type
+    # linux` before changing this — an unsupported string fails at create time.
+    Invoke-Az @('webapp','create','--resource-group',$ResourceGroup,'--plan',$AppServicePlan,'--name',$BackendAppName,'--runtime','NODE:22-lts') 'Ensure backend Web App' -SkipWhenWhatIf
     Invoke-Az @('webapp','identity','assign','--resource-group',$ResourceGroup,'--name',$BackendAppName) 'Enable backend managed identity' -SkipWhenWhatIf
-    Invoke-Az @('staticwebapp','create','--name',$StaticWebAppName,'--resource-group',$ResourceGroup,'--location',$Location,'--sku','Standard') 'Ensure Static Web App' -SkipWhenWhatIf
+    Invoke-Az @('staticwebapp','create','--name',$StaticWebAppName,'--resource-group',$ResourceGroup,'--location',$StaticWebAppLocation,'--sku','Standard') 'Ensure Static Web App' -SkipWhenWhatIf
     $BackendUrl = if ($BackendUrl) { $BackendUrl } else { "https://$BackendAppName.azurewebsites.net" }
     $FrontendUrl = if ($FrontendUrl) { $FrontendUrl } else { "https://$CustomDomain" }
     Write-Ok "Backend URL: $BackendUrl"
