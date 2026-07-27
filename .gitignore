@@ -39,3 +39,6 @@ __pycache__/
 workload/*/dist/
 workload/build/out/
 *.nupkg
+
+workload/build/backend.zip
+workload/build/backend-stage/
