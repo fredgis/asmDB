@@ -308,7 +308,14 @@ if (Test-Phase 'entra') {
             identifierUris = @($AppIdUri)
             requiredResourceAccess = @(@{ resourceAppId = $PowerBiServiceAppId; resourceAccess = $resourceAccess })
         } | ConvertTo-Json -Depth 10
-        Invoke-External 'az' @('rest','--method','PATCH','--uri',"https://graph.microsoft.com/v1.0/applications/$objectId",'--headers','Content-Type=application/json','--body',$body) 'Patch SPA redirects and Power BI delegated permissions'
+        # Pass the body as a file, not inline. On Windows an inline JSON string
+        # reaches az.cmd through cmd.exe, which strips the double quotes, and
+        # Graph rejects it with "Unable to read JSON request payload".
+        $bodyFile = Join-Path ([IO.Path]::GetTempPath()) ("entra-patch-{0}.json" -f [Guid]::NewGuid())
+        [IO.File]::WriteAllText($bodyFile, $body, (New-Object Text.UTF8Encoding $false))
+        try {
+            Invoke-External 'az' @('rest','--method','PATCH','--uri',"https://graph.microsoft.com/v1.0/applications/$objectId",'--headers','Content-Type=application/json','--body',"@$bodyFile") 'Patch SPA redirects and Power BI delegated permissions'
+        } finally { Remove-Item $bodyFile -Force -ErrorAction SilentlyContinue }
         Invoke-External 'az' @('ad','app','permission','admin-consent','--id',$AppId) 'Grant admin consent for Power BI delegated permissions'
     }
     $FrontendUrl = if ($FrontendUrl) { $FrontendUrl } else { "https://$CustomDomain" }
