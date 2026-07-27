@@ -249,55 +249,49 @@ databases: `sales_` + `orders_db` → `sales_orders_db`.
 
 [^onetable]: `saas/contracts/CONTRACTS.md` §1.
 
-### 4.2 Decoding the value — where the workload earns its keep
+### 4.2 Decoding the content field
 
-A record carries **one 64-bit `value`** ("numeric payload / score", `docs/ENGINE.md` §4).
-Applications routinely pack several fields into those 64 bits: a device id and a
-reading and a set of flags, a fixed-point measurement, a packed timestamp. That is
-sensible in a transactional store, where the row is written and read by the same
-application.
+A record carries a 175-byte `content` field. In a transactional store it is free text
+written and read by the same application, so it is frequently *not* text: hex, Base64,
+a JSON document, a CSV line, a MessagePack blob.
 
-It is useless in a lakehouse. An analyst given a column of `7240172205118292613`
-cannot group by sensor, filter by flag, or average a reading.
+That is fine transactionally and unhelpful analytically — a column of
+`7b226964223a3132...` cannot be filtered or grouped.
 
-So a sync link carries a **decoder**: a declaration of how to expand the 64 bits into
-typed Delta columns, applied by the notebook before the merge.
+So a sync link carries an optional **content decoder**, applied by the notebook before
+the merge. **The default is `None`**: content lands as text, unchanged. Anything else is
+an explicit choice the customer makes, because a decoder is an assertion about data we
+did not write.
 
-| Decoder | Produces | Use |
-|---|---|---|
-| `raw` | one `long` | the default; no interpretation |
-| `hex` | `string` | opaque identifiers that read better as hex |
-| `bitfield` | one column per declared range | packed sensor frames, flag sets |
-| `fixed-point` | `decimal(p,s)` | a scaled integer that is really a measurement |
-| `packed-timestamp` | `timestamp` | epoch or custom-epoch integers |
-| `ieee754` | `double` | a float shipped through an integer column |
+| Decoder | Produces |
+|---|---|
+| `None` *(default)* | `content` as text, untouched |
+| `Hex` | decoded bytes, as a string or binary column |
+| `Base64` | decoded bytes |
+| `JSON` | parsed into typed columns |
+| `CSV` | split into declared columns |
+| `MessagePack` | parsed into typed columns |
 
-The `bitfield` decoder is the interesting one, and the mockup shows it: the user
-declares ranges (`sensor_id` bits 0–15, `status_flags` 16–23, `reading` 24–47 as
-`decimal(10,2)`, `checksum` 48–63) and the Delta table gains four real columns.
+Three rules keep it honest:
 
-Three rules keep this honest:
-
-1. **The raw value is always kept**, as `value_raw`. A decoder is an interpretation, and
-   interpretations turn out to be wrong. Discarding the source would make that
+1. **The raw content is always kept**, as `content_raw`. A decoder is an interpretation,
+   and interpretations turn out to be wrong. Discarding the source makes that
    unrecoverable.
-2. **A decoder that fails does not drop the row.** It writes the raw value and marks
+2. **A row that fails to decode is not dropped.** It keeps its raw content and sets
    `_decode_error`. Silently discarding rows that do not fit an assumption is how a
    warehouse ends up quietly incomplete.
-3. **Changing a decoder requires a reseed**, because existing rows were decoded under
-   the old declaration. The UI must say so before it lets the change through.
+3. **Changing a decoder requires a reseed**, because rows already in the table were
+   decoded under the old one. The UI says so before it lets the change through.
 
 ### 4.3 The resulting Delta schema
-
-Fixed columns, plus whatever the decoder adds:
 
 | Delta column | Source | Type |
 |---|---|---|
 | `id` | record `id` | `long` |
-| `value_raw` | record `value` | `long` |
-| *(decoder columns)* | record `value` | declared |
+| `value` | record `value` | `long` |
 | `tag` | record `tag` (39 usable bytes) | `string` |
-| `content` | record `content` (175 usable bytes) | `string` |
+| `content_raw` | record `content` (175 usable bytes) | `string` |
+| *(decoder columns)* | decoded `content` | declared |
 | `created` | record `created` | `timestamp` |
 | `updated` | record `updated` | `timestamp` |
 | `_commit_seq` | frame `commit_seq` | `long` |
@@ -305,11 +299,10 @@ Fixed columns, plus whatever the decoder adds:
 | `_decode_error` | decoder outcome | `string` |
 | `_synced_at` | notebook run time | `timestamp` |
 
-**Decision D4: tombstone by default.** A `DELETE` frame sets `_deleted = true` and
-keeps the row; it does not physically remove it. In analytics, "this order existed and
-was then cancelled" is a fact, not noise, and a physical delete breaks every
-time-travel query over that period. Hard delete stays available per link for customers
-who need it — but it is irreversible, so it is not the default.
+**Decision D4: tombstone by default.** A `DELETE` frame sets `_deleted = true` and keeps
+the row. In analytics, "this order existed and was then cancelled" is a fact, not noise,
+and a physical delete breaks every time-travel query over that period. Hard delete stays
+available per link — but it is irreversible, so it is not the default.
 
 ### 4.4 The notebook, in outline
 
@@ -536,7 +529,7 @@ contract first and let the frontend build against it.
 |---|---|---|
 | **A trimmed log is treated as "no changes"** | A lakehouse silently diverges from the database, indefinitely, and nobody notices until someone reconciles by hand | `cdc_gap` is an explicit error; the notebook reseeds; the UI raises it. This is the single most important correctness rule in the design. |
 | **The gateway reads a log while it is being written and trimmed** | Torn frames read as corruption; a trim under a paging reader looks like a gap that is not one | The format was built for this: per-frame CRC and a trailer distinguish a torn tail from damage. Stop at the last complete frame. Re-check `baseSeq` on every page, and treat a mid-page trim as a gap rather than guessing. Test both explicitly. |
-| **A decoder is wrong** | Typed columns are silently meaningless — worse than no decoding, because they look authoritative | Always keep `value_raw`; never drop a row that fails to decode; require a reseed when a decoder changes |
+| **A decoder is wrong** | Typed columns are silently meaningless — worse than no decoding, because they look authoritative | Default is `None`; always keep `content_raw`; never drop a row that fails to decode; require a reseed when a decoder changes |
 | **Fabric UX compliance forbids our palette** | Restyling a finished application | **D2 is now "publish to the Hub", so this is live.** Resolve at the start of Phase 4. |
 | Lineage cannot be contributed to Fabric | Our edges are ours alone | Already assumed and designed for: stored in `Files/lineage/`, presented as ours |
 | **The gateway's mount is misconfigured read-write** | A bug in analytics could damage a transactional database | Read-only at the mount, asserted at startup and in a test, not merely intended |
@@ -575,5 +568,6 @@ contract first and let the frontend build against it.
 | [`docs/CDC.md`](CDC.md) | Change log format, sequences, RESET, retention |
 | [`saas/contracts/CONTRACTS.md`](../saas/contracts/CONTRACTS.md) | asmDB Cloud API surface, tiers, one-table-per-database |
 | [`docs/SECURITY.md`](SECURITY.md) | Existing credential classes and the narrow-scope precedent |
+
 
 
