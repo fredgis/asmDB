@@ -96,16 +96,24 @@ Microsoft states the domain requirements apply to **all** publishing scenarios, 
 - Application ID URI must match the verified domain.
 - Frontend domain must be a subdomain of the verified Entra domain.
 - No `*.onmicrosoft.com` subdomains.
-- At most one extra segment beyond the verified domain.
+- **Exactly one label beyond the verified domain.** Fabric strips the first label of the frontend host and requires the remainder to be a verified tenant domain.
 
 For asmDB the verified domain is `asmdb.cloud`, so use this shape:
 
 ```text
 verified domain   asmdb.cloud
-frontend          https://fe.workload.asmdb.cloud/
-redirect URI      https://fe.workload.asmdb.cloud/close
+frontend          https://fe.asmdb.cloud/
+redirect URI      https://fe.asmdb.cloud/close
 App ID URI        https://workload.asmdb.cloud/fe/be/Org.AsmdbAnalytical/1
 ```
+
+`fe.workload.asmdb.cloud` looks reasonable and is **rejected**, because two labels sit between the host and the verified domain. The upload fails with:
+
+```text
+Frontend Uri domain workload.asmdb.cloud is not in the tenant domains list
+```
+
+That message names a host nobody configured — `workload.asmdb.cloud` is simply what remains after Fabric removes `fe`. If you see a domain you never typed, this is why. The packaging preflight now enforces the same rule, so the failure happens locally rather than at upload.
 
 A default Azure hostname such as `*.azurestaticapps.net` or `*.azurecontainerapps.io` does **not** satisfy the Fabric publishing requirement. The hosting resource must have a custom domain under `asmdb.cloud` before packaging for upload.
 
@@ -153,7 +161,7 @@ CLI equivalent:
 pwsh .\workload\build\deploy.ps1 `
   -Only entra `
   -TenantId "<tenant-guid>" `
-  -CustomDomain "fe.workload.asmdb.cloud"
+  -CustomDomain "fe.asmdb.cloud"
 ```
 
 How to know it worked: the app registration publisher domain is `asmdb.cloud`, not an `*.onmicrosoft.com` domain.
@@ -196,7 +204,7 @@ Failure looks like: cross-tenant Workload Hub publication is blocked even though
 
 ### 2.5 Deploy hosting under the verified domain
 
-Portal path: **Azure Portal** → the Static Web App or hosting resource in `<analytics-resource-group>` → **Custom domains** → add `fe.workload.asmdb.cloud`.
+Portal path: **Azure Portal** → the Static Web App or hosting resource in `<analytics-resource-group>` → **Custom domains** → add `fe.asmdb.cloud`.
 
 CLI equivalent depends on the hosting resource type. For Azure Static Web Apps, use:
 
@@ -205,10 +213,10 @@ az staticwebapp hostname set `
   --subscription <subscription-id> `
   --resource-group <analytics-resource-group> `
   --name "<static-web-app-name>" `
-  --hostname "fe.workload.asmdb.cloud"
+  --hostname "fe.asmdb.cloud"
 ```
 
-How to know it worked: `https://fe.workload.asmdb.cloud/` resolves and serves the frontend, and `https://fe.workload.asmdb.cloud/close` resolves for the auth close page.
+How to know it worked: `https://fe.asmdb.cloud/` resolves and serves the frontend, and `https://fe.asmdb.cloud/close` resolves for the auth close page.
 
 Failure looks like: the manifest points to `*.azurestaticapps.net`, `*.azurecontainerapps.io`, or `*.onmicrosoft.com`; `pack.ps1` fails the frontend-domain preflight.
 

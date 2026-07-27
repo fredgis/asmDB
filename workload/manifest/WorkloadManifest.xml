@@ -12,7 +12,7 @@
         <Endpoints>
           <ServiceEndpoint>
             <Name>Frontend</Name>
-            <Url>https://fe.workload.asmdb.cloud</Url>
+            <Url>https://fe.asmdb.cloud</Url>
             <IsEndpointResolutionService>false</IsEndpointResolutionService>
           </ServiceEndpoint>
         </Endpoints>

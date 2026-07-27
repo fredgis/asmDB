@@ -125,7 +125,17 @@ function Test-HostIsSubdomainOfVerifiedDomain {
     # to it aborts the run with an error naming nothing to do with URLs.
     $hostName = $uri.Host.ToLowerInvariant()
     $domain = $VerifiedDomain.ToLowerInvariant()
-    return $hostName.EndsWith(".$domain") -and $hostName -ne $domain -and -not $hostName.EndsWith(".onmicrosoft.com")
+    if ($hostName -eq $domain) { return $false }
+    if ($hostName.EndsWith(".onmicrosoft.com")) { return $false }
+    # Exactly one label beyond the verified domain. Fabric strips the first
+    # label of the frontend host and requires the remainder to be a verified
+    # tenant domain, so fe.workload.asmdb.cloud is rejected at upload with
+    # "Frontend Uri domain workload.asmdb.cloud is not in the tenant domains
+    # list" - a message that names a host nobody configured. Checking only the
+    # suffix passed that, and the failure surfaced in the Fabric portal instead
+    # of here.
+    $remainder = $hostName -replace '^[^.]+\.', ''
+    return $remainder -eq $domain
 }
 
 function Get-ManifestUrlFindings {
