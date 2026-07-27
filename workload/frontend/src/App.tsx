@@ -21,6 +21,22 @@ const decoderOptions: { value: DecoderMode; label: string }[] = [
 
 const emptyIssue: LoadIssue = { dependency: "backend", message: "Not checked yet." };
 
+interface CdcFrame {
+  commitSeq?: string;
+  flags?: { reset?: boolean };
+  ops?: CdcOperation[];
+}
+
+interface CdcOperation {
+  op?: "upsert" | "delete" | string;
+  id?: string;
+  record?: Partial<Record<"id" | "tag" | "content" | "value" | "created" | "updated", string>>;
+}
+
+type PreviewEntry =
+  | { kind: "reset"; commitSeq: string }
+  | { kind: "op"; commitSeq: string; op: string; id: string; tag: string; content: string; value: string; created: string; updated: string };
+
 function emptyLoadable<T>(data: T): Loadable<T> {
   return { state: "checking", data, issue: emptyIssue };
 }
@@ -59,6 +75,45 @@ function stateLabel(state: RequestState) {
 
 function formatTime(date?: Date) {
   return date ? date.toLocaleTimeString() : "never";
+}
+
+function formatEpochMilliseconds(value: string) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return value || "—";
+  return new Date(parsed).toLocaleString();
+}
+
+function extractFrames(preview: unknown): CdcFrame[] {
+  if (Array.isArray(preview)) return preview.filter(isRecord) as CdcFrame[];
+  if (!isRecord(preview)) return [];
+  for (const key of ["frames", "items", "data", "rows", "records"]) {
+    const value = preview[key];
+    if (Array.isArray(value)) return value.filter(isRecord) as CdcFrame[];
+  }
+  return [preview as CdcFrame];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object");
+}
+
+function previewEntries(preview: unknown): PreviewEntry[] {
+  return extractFrames(preview).flatMap((frame) => {
+    const commitSeq = String(frame.commitSeq ?? "—");
+    if (frame.flags?.reset) return [{ kind: "reset", commitSeq } satisfies PreviewEntry];
+    const ops = Array.isArray(frame.ops) ? frame.ops : [];
+    return ops.map<PreviewEntry>((operation) => ({
+      kind: "op" as const,
+      commitSeq,
+      op: operation.op ?? "unknown",
+      id: operation.id ?? operation.record?.id ?? "—",
+      tag: operation.record?.tag ?? "—",
+      content: operation.record?.content ?? "—",
+      value: operation.record?.value ?? "—",
+      created: operation.record?.created ?? "—",
+      updated: operation.record?.updated ?? "—",
+    }));
+  });
 }
 
 function firstPreviewSample(preview: unknown): string {
@@ -112,6 +167,7 @@ function App() {
   const [selectedId, setSelectedId] = useState("");
   const [previewState, setPreviewState] = useState<RequestState>("not-configured");
   const [previewText, setPreviewText] = useState("Select a premium asmDB database and request a CDC preview. No sample has been fetched yet.");
+  const [previewRows, setPreviewRows] = useState<PreviewEntry[]>([]);
   const [saveState, setSaveState] = useState<RequestState>("not-configured");
   const [saveMessage, setSaveMessage] = useState("Choose a source database and target lakehouse, then create a link.");
 
@@ -214,8 +270,7 @@ function App() {
     if (data.optionValue) setDecoder(data.optionValue as DecoderMode);
   }
 
-  async function createLink(event: React.FormEvent) {
-    event.preventDefault();
+  async function createLink() {
     setSaveState("checking");
     if (!selectedSource || !selectedTarget) {
       setSaveState("not-configured");
@@ -243,7 +298,9 @@ function App() {
       setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
       setSelectedId(persistedLinks.find((saved) => saved.id === link.id)?.id ?? persistedLinks[0]?.id ?? "");
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      console.error("Create Link failed", error);
+      const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "unknown";
+      const message = `[${code}] ${error instanceof Error ? error.message : String(error)}`;
       setSaveState("failed");
       setSaveMessage(message);
       showToast(message);
@@ -258,6 +315,7 @@ function App() {
     if (!selectedSource) {
       setPreviewState("not-configured");
       setPreviewText("Select a premium asmDB database before requesting a CDC preview.");
+      setPreviewRows([]);
       return;
     }
     setPreviewState("checking");
@@ -270,12 +328,15 @@ function App() {
       const preview = await previewCdc(token, selectedSource.id);
       const text = JSON.stringify(preview, null, 2);
       const content = firstPreviewSample(preview);
+      const rows = previewEntries(preview);
       setSample(content.slice(0, CONTENT_LIMIT_BYTES));
-      setPreviewState(content || text !== "{}" ? "ready" : "no-data");
-      setPreviewText(content ? text : "The request succeeded but no content sample was present in the preview payload.");
+      setPreviewRows(rows);
+      setPreviewState(rows.length || content || text !== "{}" ? "ready" : "no-data");
+      setPreviewText(rows.length ? `${rows.length} CDC preview ${rows.length === 1 ? "entry" : "entries"} returned.` : "The request succeeded but no content sample was present in the preview payload.");
     } catch (error) {
       setPreviewState("failed");
       setPreviewText(issueFrom(error, { dependency: "backend", message: "CDC preview failed." }).message);
+      setPreviewRows([]);
     }
   }
 
@@ -308,7 +369,7 @@ function App() {
           <section className="middleGrid">
             <article className="panel" aria-labelledby="create-heading">
               <div className="panelHead"><h2 id="create-heading"><span aria-hidden="true">ↄ</span>Create Sync Link</h2></div>
-              <form className="formGrid" onSubmit={createLink}>
+              <form className="formGrid" onSubmit={(event) => event.preventDefault()}>
                 <label htmlFor="source">Source Database</label>
                 <Dropdown id="source" value={selectedSource?.name ?? stateLabel(databases.state)} selectedOptions={sourceId ? [sourceId] : []} onOptionSelect={onSelect(setSourceId)} disabled={!databases.data.length}>
                   {databases.data.map((database) => <Option key={database.id} value={database.id}>{database.name}</Option>)}
@@ -331,22 +392,22 @@ function App() {
                 <div className="checkboxRow"><Checkbox id="notebook" checked={createNotebook} onChange={(_, data) => setCreateNotebook(Boolean(data.checked))} label="Create Notebook" /></div>
 
                 <section className="decoderBox" aria-labelledby="decoder-heading">
-                  <div className="decoderTitle"><h3 id="decoder-heading">Content decoding</h3><Badge appearance="tint">{byteLength(sample)} / {CONTENT_LIMIT_BYTES} bytes</Badge></div>
+                  <div className="decoderTitle"><h3 id="decoder-heading">Content decoding</h3><div className="decoderActions"><Button size="small" type="button" onClick={onPreviewCdc} disabled={!selectedSource || previewState === "checking"}>{previewState === "checking" ? "Fetching…" : "Fetch CDC sample"}</Button><span className="surfaceBadge">{byteLength(sample)} / {CONTENT_LIMIT_BYTES} bytes</span></div></div>
                   <div className="decoderGrid">
                     <label htmlFor="decoder">Decoder</label>
                     <Dropdown id="decoder" value={decoderOptions.find((item) => item.value === decoder)?.label} selectedOptions={[decoder]} onOptionSelect={onDecoderSelect}>
                       {decoderOptions.map((item) => <Option key={item.value} value={item.value}>{item.label}</Option>)}
                     </Dropdown>
                     <label htmlFor="sample">Content sample</label>
-                    <Textarea id="sample" value={sample} readOnly placeholder="Fetch CDC preview to load a real content sample." resize="vertical" />
+                    <Textarea id="sample" value={sample} readOnly placeholder="Use Fetch CDC sample to load real content from the selected database." resize="vertical" />
                   </div>
                   <p className="helpText">Decoder defaults to None. Changing a decoder requires a reseed. Raw content is always retained as content_raw.</p>
                   <div className="previewBox">
-                    <div><span>Decoded preview</span><Badge appearance="tint" color={decoded.failed ? "danger" : "brand"}>{decoded.status}</Badge></div>
+                    <div><span>Decoded preview</span><span className={`surfaceBadge ${decoded.failed ? "surfaceBadgeDanger" : ""}`}>{decoded.status}</span></div>
                     <pre aria-live="polite">{decoded.preview}</pre>
                   </div>
                 </section>
-                <div className="actions"><Button type="button" onClick={() => { setCreateNotebook(true); setSaveMessage("Notebook creation will be requested when this link is saved."); showToast("Notebook creation will be requested when this link is saved."); }}>Generate Notebook</Button><Button type="button" onClick={onPreviewCdc} disabled={!selectedSource}>Preview CDC</Button><Button appearance="primary" type="submit" disabled={!canCreate || saveState === "checking"}>{saveState === "checking" ? "Saving…" : "✦ Create Link"}</Button></div>
+                <div className="actions"><Button type="button" onClick={() => { setCreateNotebook(true); setSaveMessage("Notebook creation will be requested when this link is saved."); showToast("Notebook creation will be requested when this link is saved."); }}>Generate Notebook</Button><Button type="button" onClick={onPreviewCdc} disabled={!selectedSource || previewState === "checking"}>{previewState === "checking" ? "Fetching…" : "Preview CDC"}</Button>{/* Fabric sandboxes workload iframes without allow-forms, so this must not be a submit button: native form submission is blocked before React receives onSubmit. */}<Button appearance="primary" type="button" onClick={() => void createLink()} disabled={!canCreate || saveState === "checking"}>{saveState === "checking" ? "Saving…" : "✦ Create Link"}</Button></div>
                 <div className="saveStatus"><StateMessage state={saveState} text={saveMessage} /></div>
               </form>
             </article>
@@ -354,11 +415,7 @@ function App() {
             <article className="panel" aria-labelledby="lineage-heading">
               <div className="panelHead"><h2 id="lineage-heading"><span aria-hidden="true">⌘</span>Current Lineage</h2></div>
               <div className="lineageList">
-                {lineage.edges.length ? lineage.edges.map((edge) => {
-                  const sourceNode = lineage.nodes.find((node) => node.id === edge.source);
-                  const targetNode = lineage.nodes.find((node) => node.id === edge.target);
-                  return <button className="lineageRow" type="button" key={edge.id} onClick={() => setSelectedId(edge.id)} aria-label={`${sourceNode?.label} to ${targetNode?.label}, ${edge.status}`}><span className="node src">▤ {sourceNode?.label}</span><span className={`edge ${statusClass(edge.status)}`}><span>{statusIcon(edge.status)} {edge.status}</span></span><span className="node target">⌂ {targetNode?.label}</span></button>;
-                }) : <StateMessage state={links.state === "failed" ? "failed" : "no-data"} text={links.state === "failed" ? issueText(links.issue) : "No sync links are stored in this workload item yet. Create a link to write links.json and lineage/graph.json item definition parts."} />}
+                {lineage.edges.length ? <LineageDiagram graph={lineage} selectedId={selectedId} onSelect={setSelectedId} /> : <LineageEmpty state={links.state} text={links.state === "failed" ? issueText(links.issue) : "Create a sync link to draw asmDB databases on the left, Fabric lakehouses on the right, and status-labelled edges between them. The graph is stored in lineage/graph.json."} />}
                 <div className="legend" aria-label="Lineage states"><span>✓ Active</span><span>○ Planned</span><span>! Warning</span></div>
               </div>
             </article>
@@ -381,7 +438,7 @@ function App() {
             </article>
           </section>
 
-          <section className="panel cdcPanel" aria-labelledby="cdc-heading"><div className="panelHead"><h2 id="cdc-heading"><span aria-hidden="true">▤</span>CDC Preview</h2></div><div className="panelBody"><StateMessage state={previewState} text={previewText} /></div></section>
+          <section className="panel cdcPanel" aria-labelledby="cdc-heading"><div className="panelHead"><h2 id="cdc-heading"><span aria-hidden="true">▤</span>CDC Preview</h2></div><div className="panelBody"><StateMessage state={previewState} text={previewText} />{previewRows.length ? <CdcPreview entries={previewRows} /> : null}</div></section>
 
           <footer className="footer"><span>{connection.updatedAt ? `✓ Data checked: ${formatTime(connection.updatedAt)}` : "○ Data not checked yet"}</span></footer>
         </section>
@@ -405,10 +462,42 @@ function StateMessage({ state, text }: { state: RequestState; text: string }) {
   return <div className={`stateMessage ${state}`}><strong>{stateLabel(state)}</strong><pre>{text}</pre></div>;
 }
 
+function LineageEmpty({ state, text }: { state: RequestState; text: string }) {
+  return <div className="lineageEmpty"><svg viewBox="0 0 720 220" role="img" aria-label="Empty lineage diagram placeholder"><defs><linearGradient id="emptyEdge" x1="0" x2="1"><stop offset="0%" stopColor="var(--asmdb-accent)" /><stop offset="100%" stopColor="var(--asmdb-accent-2)" /></linearGradient></defs><rect className="lineageGhostNode" x="34" y="54" width="190" height="52" rx="14" /><rect className="lineageGhostNode" x="496" y="54" width="190" height="52" rx="14" /><path className="lineageGhostEdge" d="M232 80 C330 28 390 28 488 80" /><rect className="lineageGhostNode" x="34" y="130" width="190" height="52" rx="14" /><rect className="lineageGhostNode" x="496" y="130" width="190" height="52" rx="14" /><path className="lineageGhostEdge dashed" d="M232 156 C330 204 390 204 488 156" /><text className="lineageGhostLabel" x="129" y="85" textAnchor="middle">asmDB database</text><text className="lineageGhostLabel" x="591" y="85" textAnchor="middle">Fabric lakehouse</text><text className="lineageGhostLabel" x="360" y="116" textAnchor="middle">Active · Planned · Warning</text></svg><StateMessage state={state === "failed" ? "failed" : "no-data"} text={text} /></div>;
+}
+
+function LineageDiagram({ graph, selectedId, onSelect }: { graph: ReturnType<typeof graphFromLinks>; selectedId: string; onSelect: (id: string) => void }) {
+  const databases = graph.nodes.filter((node) => node.kind === "database");
+  const lakehouses = graph.nodes.filter((node) => node.kind === "lakehouse");
+  const height = Math.max(240, Math.max(databases.length, lakehouses.length, graph.edges.length) * 86 + 54);
+  const yFor = (nodes: typeof graph.nodes, id: string) => {
+    const index = Math.max(0, nodes.findIndex((node) => node.id === id));
+    return 48 + index * 86;
+  };
+  return <svg className="lineageSvg" viewBox={`0 0 820 ${height}`} role="img" aria-label="Current lineage graph">
+    <defs><marker id="lineageArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" /></marker></defs>
+    <text className="lineageColumnTitle" x="120" y="24" textAnchor="middle">asmDB databases</text>
+    <text className="lineageColumnTitle" x="700" y="24" textAnchor="middle">Fabric lakehouses</text>
+    {databases.map((node) => <g key={node.id}><rect className="lineageNode lineageSource" x="24" y={yFor(databases, node.id)} width="220" height="54" rx="14" /><text className="lineageNodeText" x="46" y={yFor(databases, node.id) + 33}>▤ {node.label}</text></g>)}
+    {lakehouses.map((node) => <g key={node.id}><rect className="lineageNode lineageTarget" x="576" y={yFor(lakehouses, node.id)} width="220" height="54" rx="14" /><text className="lineageNodeText" x="598" y={yFor(lakehouses, node.id) + 33}>⌂ {node.label}</text></g>)}
+    {graph.edges.map((edge, index) => {
+      const sourceY = yFor(databases, edge.source) + 27;
+      const targetY = yFor(lakehouses, edge.target) + 27;
+      const labelY = (sourceY + targetY) / 2 - 7 + (index % 2 ? 14 : 0);
+      return <g className={`lineageEdgeGroup ${statusClass(edge.status)} ${selectedId === edge.id ? "selected" : ""}`} key={edge.id} role="button" tabIndex={0} onClick={() => onSelect(edge.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") onSelect(edge.id); }} aria-label={`${edge.status} lineage edge`}>
+        <path className="lineageEdgePath" d={`M 244 ${sourceY} C 360 ${sourceY}, 460 ${targetY}, 576 ${targetY}`} markerEnd="url(#lineageArrow)" />
+        <rect className="lineageEdgeLabelBg" x="344" y={labelY - 16} width="132" height="30" rx="15" />
+        <text className="lineageEdgeLabel" x="410" y={labelY + 4} textAnchor="middle">{statusIcon(edge.status)} {edge.status}</text>
+      </g>;
+    })}
+  </svg>;
+}
+
+function CdcPreview({ entries }: { entries: PreviewEntry[] }) {
+  return <div className="cdcPreview"><div className="cdcTableWrap"><table className="cdcTable"><thead><tr><th>Commit</th><th>Op</th><th>ID</th><th>Tag</th><th>Content</th><th>Value</th><th>Created</th><th>Updated</th></tr></thead><tbody>{entries.map((entry, index) => entry.kind === "reset" ? <tr key={`${entry.commitSeq}-${index}`}><td>{entry.commitSeq}</td><td colSpan={7}><span className="surfaceBadge">Reset marker</span> Log was seeded; no row operation in this frame.</td></tr> : <tr key={`${entry.commitSeq}-${entry.id}-${index}`}><td>{entry.commitSeq}</td><td>{entry.op}</td><td>{entry.id}</td><td>{entry.tag}</td><td><span className="truncateCell" title={entry.content}>{entry.content}</span></td><td>{entry.value}</td><td title={entry.created}>{formatEpochMilliseconds(entry.created)}</td><td title={entry.updated}>{formatEpochMilliseconds(entry.updated)}</td></tr>)}</tbody></table></div><div className="cdcCards">{entries.map((entry, index) => entry.kind === "reset" ? <article key={`${entry.commitSeq}-${index}`} className="cdcCard"><strong>Commit {entry.commitSeq}</strong><span className="surfaceBadge">Reset marker</span><p>Log was seeded; no row operation in this frame.</p></article> : <article key={`${entry.commitSeq}-${entry.id}-${index}`} className="cdcCard"><strong>Commit {entry.commitSeq} · {entry.op}</strong><dl><div><dt>ID</dt><dd>{entry.id}</dd></div><div><dt>Tag</dt><dd>{entry.tag}</dd></div><div><dt>Content</dt><dd title={entry.content}>{entry.content}</dd></div><div><dt>Value</dt><dd>{entry.value}</dd></div><div><dt>Created</dt><dd title={entry.created}>{formatEpochMilliseconds(entry.created)}</dd></div><div><dt>Updated</dt><dd title={entry.updated}>{formatEpochMilliseconds(entry.updated)}</dd></div></dl></article>)}</div></div>;
+}
+
 export default App;
-
-
-
 
 
 
