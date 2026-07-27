@@ -106,7 +106,10 @@ function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   };
 }
 
-async function signToken(claims: Record<string, unknown> = {}): Promise<string> {
+async function signToken(
+  claims: Record<string, unknown> = {},
+  audience: string = clientId
+): Promise<string> {
   return new SignJWT({
     oid: "user-1",
     fabric_workspace_id: "workspace-1",
@@ -114,7 +117,7 @@ async function signToken(claims: Record<string, unknown> = {}): Promise<string> 
   })
     .setProtectedHeader({ alg: "RS256", kid: "test-key" })
     .setIssuer(`https://login.microsoftonline.com/${tenantId}/v2.0`)
-    .setAudience(clientId)
+    .setAudience(audience)
     .setIssuedAt()
     .setExpirationTime("5m")
     .sign(privateKey);
@@ -189,8 +192,7 @@ describe("configuration", () => {
   });
 });
 
-describe("CORS", () => {
-  // The frontend is served from its own domain and calls this API from inside
+describe("CORS", () => {  // The frontend is served from its own domain and calls this API from inside
   // the Fabric iframe, so the Origin is that domain, not a Fabric one.
   const frontend = "https://fe.asmdb.cloud";
 
@@ -250,6 +252,34 @@ describe("Fabric JWT validation", () => {
       .set("authorization", `Bearer ${token}`);
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe("unauthorized");
+    // Name the failing check. A bare "unauthorized" forces the next person to
+    // guess between signature, issuer, audience and expiry.
+    expect(res.body.error.message).toMatch(/Fabric token rejected/i);
+  });
+
+  // Entra sets the audience to whichever identifier the token was requested
+  // for. Our Application ID URI is a custom https:// URI, so a real Fabric
+  // token does not carry the client id GUID, and requiring it rejected every
+  // genuine call with a 401 that explained nothing.
+  it("accepts a token whose audience is the Application ID URI", async () => {
+    const appIdUri = "https://workload.asmdb.cloud/fe/be/Org.AsmdbAnalytical/1";
+    const token = await signToken({}, appIdUri);
+    const app = createApp({ config: testConfig({ appIdUri }) });
+    const res = await request(app)
+      .get("/api/databases")
+      .set("authorization", `Bearer ${token}`);
+    expect(res.status).not.toBe(401);
+  });
+
+  // Listing the databases a user may access has nothing to do with a
+  // workspace, and Entra does not necessarily issue a workspace claim.
+  it("accepts a token that carries no workspace claim", async () => {
+    const token = await signToken({ fabric_workspace_id: undefined });
+    const app = createApp({ config: testConfig() });
+    const res = await request(app)
+      .get("/api/databases")
+      .set("authorization", `Bearer ${token}`);
+    expect(res.status).not.toBe(401);
   });
 
   it("rejects a JWT with the wrong issuer", async () => {
