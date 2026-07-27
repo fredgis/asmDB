@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+  <metadata>
+    <id>Org.AsmdbAnalytical</id>
+    <version>1.0.0</version>
+    <authors>FredGis</authors>
+    <description>asmDB Analytical Capabilities — Microsoft Fabric workload for synchronising premium asmDB databases into lakehouses through generated notebooks and CDC lineage monitoring.</description>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <license type="expression">MIT</license>
+    <projectUrl>https://github.com/fredgis/repo-asmdb</projectUrl>
+  </metadata>
+</package>

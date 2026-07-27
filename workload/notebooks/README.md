@@ -28,14 +28,26 @@ Gateway acknowledgement happens after the local data and watermark are committed
 
 ## Key Vault credential path
 
-The rendered notebook contains no gateway secret. It uses `azure-identity` and `azure-keyvault-secrets` with the Fabric workspace managed identity:
+The rendered notebook contains no gateway secret. Fabric notebooks do not support `DefaultAzureCredential` directly, so the notebook uses Fabric's built-in `notebookutils` namespace:
 
 ```python
-DefaultAzureCredential(exclude_interactive_browser_credential=True)
-SecretClient(vault_url=KEY_VAULT_URL, credential=credential).get_secret(KEY_VAULT_SECRET_NAME)
+notebookutils.credentials.getSecret(KEY_VAULT_URL, KEY_VAULT_SECRET_NAME)
 ```
 
-Operator grant required: assign the Fabric workspace managed identity the Azure RBAC role **Key Vault Secrets User** on the vault (or narrower scope containing the secret). The Fabric environment must include `azure-identity`, `azure-keyvault-secrets` and `requests`.
+No `azure-identity` or `azure-keyvault-secrets` package is required or useful for this path.
+
+## Scheduled identity requirement
+
+`notebookutils.credentials.getSecret` authenticates as the identity that is running the notebook. That identity depends on how the notebook is triggered:
+
+| Trigger | Runs as | Usable unattended? |
+|---|---|---|
+| Interactive run | The person clicking | No |
+| Direct Fabric schedule | The user who created or last updated the schedule | No |
+| Pipeline activity (default) | The pipeline's last-modified user | No |
+| Pipeline activity with Workspace Identity | The workspace service principal | Yes |
+
+Only **pipeline activity with Workspace Identity** is supported for scheduled syncs. Direct notebook schedules run as a named human account; they can pass tests and then fail later when that person's access changes. For production, grant the workspace service principal **Key Vault Secrets User** on the vault or the narrower secret scope.
 
 ## Rendering
 
@@ -56,10 +68,10 @@ python workload\notebooks\render.py `
 
 1. Render the notebook for the sync link.
 2. Upload/convert it to a Fabric notebook attached to the target lakehouse.
-3. Ensure the workspace managed identity has **Key Vault Secrets User** on the vault.
-4. Ensure the Fabric environment has the Python packages above.
+3. For scheduled syncs, invoke it from a Fabric pipeline activity configured to use Workspace Identity.
+4. Ensure the workspace service principal has **Key Vault Secrets User** on the vault or secret.
 5. Uncomment `run_sync()` in the last cell, or call `run_sync()` manually.
 
 ## What could not be verified locally
 
-This repository environment has no Spark/Fabric runtime, no Delta table and no live Key Vault. The pure CDC semantics are tested locally; managed-identity authentication, Fabric Delta `MERGE INTO` execution, and the gateway acknowledge endpoint must be verified in an actual Fabric workspace with the gateway deployed.
+This repository environment has no Spark/Fabric runtime, no Delta table and no live Key Vault. The pure CDC semantics are tested locally; `notebookutils` Key Vault access, Fabric Delta `MERGE INTO` execution, and the gateway acknowledge endpoint must be verified in an actual Fabric workspace with the gateway deployed.

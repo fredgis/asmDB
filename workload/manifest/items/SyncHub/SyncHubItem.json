@@ -1,0 +1,39 @@
+{
+  "name": "SyncHub",
+  "version": "1.100",
+  "displayName": "asmDB Sync Hub",
+  "displayNamePlural": "asmDB Sync Hubs",
+  "editor": {
+    "path": "/sync-hub"
+  },
+  "icon": {
+    "name": "assets/logo.png"
+  },
+  "activeIcon": {
+    "name": "assets/logo.png"
+  },
+  "compatibleItemTypes": [
+    "Lakehouse"
+  ],
+  "contextMenuItems": [],
+  "quickActionItems": [],
+  "supportedInMonitoringHub": true,
+  "supportedInDatahubL1": true,
+  "itemJobActionConfig": {},
+  "itemSettings": {
+    "getItemSettings": {
+      "action": "getItemSettings"
+    }
+  },
+  "editorTab": {
+    "onDeactivate": "item.tab.onDeactivate",
+    "canDeactivate": "item.tab.canDeactivate",
+    "canDestroy": "item.tab.canDestroy",
+    "onDestroy": "item.tab.onDestroy",
+    "onDelete": "item.tab.onDelete"
+  },
+  "createItemDialogConfig": {
+    "onCreationFailure": { "action": "item.onCreationFailure" },
+    "onCreationSuccess": { "action": "item.onCreationSuccess" }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "workloadId": "Org.AsmdbAnalytical",
+  "itemName": "SyncHub",
+  "frontendDevPort": 60006,
+  "verifiedDomain": "asmdb.cloud",
+  "frontendUrlPlaceholder": "https://REPLACE-ME.fe.workload.asmdb.cloud",
+  "appIdUriTemplate": "https://workload.asmdb.cloud/fe/be/{WorkloadId}/1"
+}

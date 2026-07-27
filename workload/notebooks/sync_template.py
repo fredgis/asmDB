@@ -325,17 +325,12 @@ def incremental_write_plan(has_data_changes: bool) -> Tuple[str, ...]:
 # %%
 def get_gateway_token(vault_url: str, secret_name: str) -> str:
     try:
-        from azure.identity import DefaultAzureCredential
-        from azure.keyvault.secrets import SecretClient
-    except ImportError as exc:
+        return notebookutils.credentials.getSecret(vault_url, secret_name)  # type: ignore[name-defined]
+    except NameError as exc:
         raise SyncError(
-            "Install azure-identity and azure-keyvault-secrets in the Fabric environment "
-            "or attach an environment that contains them."
+            "notebookutils is unavailable. This notebook must run inside a "
+            "Microsoft Fabric Spark session."
         ) from exc
-
-    credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
-    client = SecretClient(vault_url=vault_url, credential=credential)
-    return client.get_secret(secret_name).value
 
 
 def fetch_cdc_page(

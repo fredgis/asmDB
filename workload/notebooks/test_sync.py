@@ -15,6 +15,7 @@ from sync_template import (
     collapse_frames,
     decode_content,
     fetch_cdc_page,
+    get_gateway_token,
     incremental_write_plan,
     parse_ndjson,
 )
@@ -160,6 +161,26 @@ def test_acknowledge_failure_logs_and_does_not_fail(monkeypatch, capsys):
 
     assert acknowledge_watermark("https://gateway.example", "instance", "secret", 42) is False
     assert "WARNING: watermark 42 was committed locally" in capsys.readouterr().out
+
+
+def test_get_gateway_token_uses_notebookutils(monkeypatch):
+    fake_credentials = types.SimpleNamespace(getSecret=lambda vault, name: f"{vault}|{name}")
+    fake_notebookutils = types.SimpleNamespace(credentials=fake_credentials)
+    monkeypatch.setattr("sync_template.notebookutils", fake_notebookutils, raising=False)
+
+    assert get_gateway_token("https://vault.vault.azure.net/", "asmdb-token") == (
+        "https://vault.vault.azure.net/|asmdb-token"
+    )
+
+
+def test_get_gateway_token_outside_fabric_has_clear_error(monkeypatch):
+    monkeypatch.delattr("sync_template.notebookutils", raising=False)
+
+    with pytest.raises(Exception) as exc:
+        get_gateway_token("https://vault.vault.azure.net/", "asmdb-token")
+
+    assert "notebookutils is unavailable" in str(exc.value)
+    assert "Microsoft Fabric Spark session" in str(exc.value)
 
 
 def test_fetch_cdc_page_retries_503_with_backoff(monkeypatch):

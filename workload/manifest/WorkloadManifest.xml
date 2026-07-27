@@ -1,0 +1,22 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<WorkloadManifestConfiguration SchemaVersion="2.0.0">
+  <Workload WorkloadName="Org.AsmdbAnalytical" HostingType="FERemote">
+    <Version>1.0.0</Version>
+    <RemoteServiceConfiguration>
+      <CloudServiceConfiguration>
+        <Cloud>Public</Cloud>
+        <AADFEApp>
+          <AppId>00000000-0000-0000-0000-000000000000</AppId>
+        </AADFEApp>
+        <EnableSandboxRelaxation>false</EnableSandboxRelaxation>
+        <Endpoints>
+          <ServiceEndpoint>
+            <Name>Frontend</Name>
+            <Url>https://REPLACE-ME.fe.workload.asmdb.cloud</Url>
+            <IsEndpointResolutionService>false</IsEndpointResolutionService>
+          </ServiceEndpoint>
+        </Endpoints>
+      </CloudServiceConfiguration>
+    </RemoteServiceConfiguration>
+  </Workload>
+</WorkloadManifestConfiguration>

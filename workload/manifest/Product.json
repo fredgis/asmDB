@@ -1,0 +1,75 @@
+{
+  "name": "Product",
+  "version": "1.100",
+  "displayName": "asmDB Analytical Capabilities",
+  "fullDisplayName": "asmDB Analytical Capabilities",
+  "description": "Synchronise premium asmDB databases into Microsoft Fabric lakehouses, generate readable notebooks, and monitor CDC lineage, lag, and coverage from a dedicated Fabric workload.",
+  "favicon": "assets/logo.png",
+  "icon": {
+    "name": "assets/logo.png"
+  },
+  "homePage": {
+    "learningMaterials": [
+      {
+        "title": "Install asmDB Analytical Capabilities",
+        "introduction": "Follow the workload packaging, upload, and enablement procedure.",
+        "description": "Prepare the dedicated Entra app, isolated Azure resource group, custom domain, package, and Fabric Admin Portal steps.",
+        "image": "assets/logo.png",
+        "link": "https://github.com/fredgis/repo-asmdb/blob/main/workload/docs/INSTALL.md"
+      }
+    ],
+    "newSection": {
+      "customActions": []
+    },
+    "recommendedItemTypes": [
+      "SyncHub"
+    ]
+  },
+  "createExperience": {
+    "description": "Create a Sync Hub to connect premium asmDB databases to a Fabric lakehouse.",
+    "cards": [
+      {
+        "title": "asmDB Sync Hub",
+        "description": "Configure premium asmDB CDC ingestion, notebook generation, and lakehouse lineage tracking.",
+        "icon": {
+          "name": "assets/logo.png"
+        },
+        "icon_small": {
+          "name": "assets/logo.png"
+        },
+        "availableIn": [
+          "home",
+          "create-hub",
+          "workspace-plus-new",
+          "workspace-plus-new-teams"
+        ],
+        "itemType": "SyncHub",
+        "createItemDialogConfig": {
+          "onCreationFailure": { "action": "item.onCreationFailure" },
+          "onCreationSuccess": { "action": "item.onCreationSuccess" }
+        }
+      }
+    ]
+  },
+  "productDetail": {
+    "publisher": "asmDB",
+    "slogan": "Premium asmDB databases, analytical in Fabric",
+    "description": "asmDB Analytical Capabilities lets Fabric users synchronise premium asmDB change logs into lakehouse Delta tables through generated notebooks, with workload-level visibility into configured lineage and CDC lag.",
+    "image": {
+      "mediaType": 0,
+      "source": "assets/logo.png"
+    },
+    "slideMedia": [
+      { "mediaType": 0, "source": "assets/logo.png" }
+    ],
+    "supportLink": {
+      "documentation": { "url": "https://github.com/fredgis/repo-asmdb/blob/main/workload/docs/INSTALL.md" },
+      "certification": { "url": "https://REPLACE-ME.example.com/certification" },
+      "help": { "url": "https://github.com/fredgis/repo-asmdb/issues" },
+      "privacy": { "url": "https://REPLACE-ME.example.com/privacy" },
+      "terms": { "url": "https://REPLACE-ME.example.com/terms" },
+      "license": { "url": "https://github.com/fredgis/repo-asmdb/blob/main/LICENSE" }
+    }
+  }
+}
+

@@ -58,7 +58,7 @@ flowchart LR
     UI["Workload frontend<br/>React + Fluent v9<br/>runs in an iframe"]
     NB["Generated notebook<br/>PySpark"]
     LH[("Lakehouse<br/>Tables/")]
-    SCH["Fabric notebook<br/>schedule"]
+    SCH["Data Factory pipeline<br/>Notebook activity<br/>auth: Workspace Identity"]
   end
 
   subgraph Ours["asmDB Cloud (ours)"]
@@ -71,9 +71,9 @@ flowchart LR
 
   UI -->|"Entra OBO"| BE
   BE -->|"list databases"| CP
-  UI -->|"create notebook / schedule"| NB
+  UI -->|"create notebook + pipeline"| NB
   SCH --> NB
-  NB -->|"secret via managed identity"| KV[["Azure Key Vault"]]
+  NB -->|"notebookutils.credentials.getSecret<br/>as workspace identity"| KV[["Azure Key Vault"]]
   NB -->|"GET /cdc/{id}?from=seq"| GW
   GW -.->|"read-only"| ENG
   SC --- ENG
@@ -224,11 +224,17 @@ From [`docs/CDC.md`](CDC.md), and the reason this is tractable at all:
 
 ### 3.4 Credentials — resolved
 
-**Decision D1: tokens live in Azure Key Vault and are fetched by the workspace's
-managed identity.** So no long-lived secret is stored in a notebook, and no credential
+**Decision D1: tokens live in Azure Key Vault and are fetched by the workspace
+identity.** So no long-lived secret is stored in a notebook, and no credential
 is written into an artefact the customer can print or share. The notebook's first cell
-resolves the secret through the managed identity it already runs under; the gateway
-validates it and nothing else can call the gateway.
+resolves the secret through `notebookutils.credentials.getSecret`; the gateway
+validates the token and nothing else can call the gateway.
+
+Two mechanical details decide whether this works at all, and both were wrong in the
+first implementation — see §7.6. The notebook must use `notebookutils`, not
+`DefaultAzureCredential`, which Fabric does not support. And it must be triggered by a
+pipeline whose connection is set to **Workspace Identity**, because every other trigger
+runs the notebook under a *human* account and D1 then quietly does not hold.
 
 That also removes the option of putting a *database* token anywhere near a notebook,
 which would have been indefensible: an instance token can write and truncate, and a
@@ -356,7 +362,7 @@ listed as uncertainties**; they should be resolved before the phase that depends
 | Write `Files/` from the frontend | Supported | Link definitions live there. |
 | Write `Tables/` (Delta) from the workload | **Not supported by the toolkit** | Confirms §1 — Spark writes. |
 | **Custom workloads contributing lineage edges** | **Not documented** | ⚠️ See below. |
-| Fabric scheduler support *in the toolkit* | **Marked "under development"** | ⚠️ Use the notebook's own schedule; do not build on the toolkit's job type until it lands. |
+| Fabric scheduler support *in the toolkit* | **Marked "under development"** | ⚠️ Schedule a pipeline with Workspace Identity auth; do not build on the toolkit's job type until it lands. |
 | Custom brand colours | Architecturally supported via `createDarkTheme` | ⚠️ Publishing to the Workload Hub requires Fabric UX compliance; the exact limits are not published. |
 
 **On lineage — resolved by decision, not by API.** The documentation says workload items
@@ -369,11 +375,28 @@ imply otherwise: the panel is titled "Current Lineage" and describes asmDB→lak
 links we know about. If Microsoft later exposes a contribution API, publishing to it
 becomes an addition, not a redesign, because the data is already modelled and stored.
 
-**On scheduling — resolved.** The toolkit's own Fabric-scheduler support is marked
-*under development*, so we do not build on it. A generated notebook is a first-class
-Fabric item and carries its own schedule; that is what drives cadence. It is also what
-the customer already knows how to change, which is worth more than an integration we
-would have to explain.
+**On scheduling — resolved, then corrected.** The toolkit's own Fabric-scheduler support
+is marked *under development*, so we do not build on it. Cadence comes from Fabric's own
+scheduling, which the customer already knows how to change — but **not from the
+notebook's own schedule**, which was the original plan and is wrong.
+
+A Fabric notebook's security context is determined by how it was triggered. An
+interactive run is the person who clicked. A **direct notebook schedule runs as the user
+who created or last updated that schedule** — a named human account. A pipeline activity
+runs as the pipeline's last-modified user, unless its connection is explicitly set to
+**Workspace Identity**, which is the only trigger that runs as the workspace service
+principal.
+
+This matters because D1 requires the workspace identity. A directly scheduled notebook
+would satisfy every test we could write and then fail months later, when the person whose
+account it borrowed changes role or leaves, with a Key Vault denial that names no cause.
+The failure is silent, delayed, and points nowhere.
+
+So cadence comes from a **Data Factory pipeline** containing a Notebook activity whose
+connection is Workspace Identity, and the *pipeline* carries the schedule. This also
+depends on a tenant setting — *Service principals can call Fabric public APIs* — which is
+disabled by default and needs a Fabric administrator, so it belongs early in the install
+rather than at the point of first run.
 
 **On branding — see the D2 warning in Phase 0.** Fluent UI v9 takes a 16-shade brand
 ramp; our cyan and violet can drive it, and `theme.onChange` lets us follow the host
@@ -405,7 +428,7 @@ dropped without argument.
 | Create notebook · Generate notebook · Preview CDC | §1 · Phase 2 | `Preview CDC` reads a bounded page through the gateway (§3.2) and respects the same caps. |
 | Current lineage, with `Active / Planned / Warning` | §2.2 | Edges are ours, stored in `Files/lineage/`. **`Planned` means configured but never run** — worth showing, because a link created and never scheduled is the most common silent failure. |
 | Recent sync activity — status, last run, lag | Phase 4 | Lag in minutes; see below. |
-| Selected link details, incl. **decoder** and **next run** | Phase 4 | Next run comes from the notebook's Fabric schedule, not from us. |
+| Selected link details, incl. **decoder** and **next run** | Phase 4 | Next run comes from the pipeline's schedule, not from us. |
 | Coverage & readiness | Phase 4 | "Not configured" is a database with no link at all — the number that sells the product, and the only one requiring us to list databases the user has never touched. |
 | `Data updated · Auto-refresh` | Phase 4 | Obeys the rule already paid for once in asmdb Cloud: a failed poll shows the last good sample marked stale, never a blank panel. |
 
@@ -414,7 +437,7 @@ dropped without argument.
 **Not "real-time".** Decision D3 is analytics cadence. The lag figures are minutes and
 the copy reads "analytical sync", not "real-time analytical sync". A screenshot promising
 seconds becomes a commitment the moment someone shows it to a customer — and the sync is
-driven by a Fabric notebook schedule, which gives minutes.
+driven by a Fabric pipeline schedule, which gives minutes.
 
 **Not Fabric's lineage.** The panel shows edges we hold. It must never imply that opening
 Fabric's own lineage view will show the same graph (§5).
@@ -470,7 +493,7 @@ work, where four agents worked simultaneously without a single collision.
 
 | # | Decision | Answer | Consequence |
 |---|---|---|---|
-| D1 | How the notebook gets a credential | **Azure Key Vault, fetched by the workspace's managed identity** | No secret is stored in a notebook or in OneLake. The gateway trusts the managed identity, not a copied string. |
+| D1 | How the notebook gets a credential | **Azure Key Vault, read by the workspace identity via `notebookutils`** | No secret is stored in a notebook or in OneLake. Requires a pipeline with Workspace Identity authentication — see §7.6. |
 | D2 | Distribution | **Workload Hub publication**, with a custom domain and a manifest upload | Fabric UX compliance now genuinely applies — see the warning below. |
 | D3 | Cadence | **Analytics, not real time.** Minutes, not seconds | The mockup's lag figures are minutes. Do not promise seconds; §7 explains why the number in a screenshot becomes a commitment. |
 | D4 | Deleted rows | **Tombstone by default**, hard delete per link | `_deleted` is carried; history and time travel survive. |
@@ -708,16 +731,31 @@ using the workspace's managed identity** (D1). Neither SkyNav nor FabricPRA uses
 Vault at all — both avoid secrets entirely via managed identity on an App Service, which
 is a *different* identity from the one a notebook runs under.
 
-So this step is ours to prove:
+So this step is ours to prove, and researching it changed the design twice:
 
-- the **workspace's managed identity** must be granted **Key Vault Secrets User** on the
+- **`DefaultAzureCredential` does not work in a Fabric notebook.** Microsoft documents
+  this outright. The credential chain probes IMDS at `169.254.169.254`, which does not
+  exist in a Spark session; the workspace identity is a *service principal*, not an Azure
+  VM managed identity, so it is not reachable that way at all. The call exhausts every
+  credential and raises. The supported API is `notebookutils.credentials.getSecret`,
+  which needs no package and no import — so the two Azure SDK dependencies we were
+  originally going to ask the installer to provision were never needed;
+- **only a pipeline activity with Workspace Identity actually runs as that identity.**
+  See §6. A direct notebook schedule borrows a human account;
+- the vault must be created with **RBAC authorisation enabled**. In legacy access-policy
+  mode the role assignment is silently ignored and the notebook gets a 403 that says
+  nothing about why;
+- the **workspace identity** must then be granted **Key Vault Secrets User** on the
   vault. That is a Fabric administration action against an Azure resource, automated
-  nowhere, and it is exactly the kind of step that gets forgotten and produces a 403 the
-  notebook cannot explain;
+  nowhere, and exactly the kind of step that gets forgotten;
+- a tenant setting — *Service principals can call Fabric public APIs* — gates the whole
+  path and is off by default;
 - it must be verified end to end before Phase 2 is called done, not assumed.
 
 Treat this as the highest-risk item in the whole installation, because it is the only one
-with no working precedent.
+with no working precedent. Two of the five points above were wrong in our first
+implementation and were caught by reading Microsoft's documentation rather than by any
+test we could have written.
 
 ---
 

@@ -204,7 +204,11 @@ function Get-GateScope {
             '^scripts/'                { $scope.Engine = $true; $scope.Go = $true; continue }
             '^saas/(controlplane|sidecar)/' { $scope.Go = $true; continue }
             '^site/'                   { $scope.Site = $true; continue }
-            '^workload/'               { $scope.Site = $true; continue }
+            # The Fabric workload is a separate stack with its own toolchain and
+            # its own tests. It does not touch the engine or the cloud service,
+            # so it must not drag their suites into every push. It will get its
+            # own checks here once it has something worth checking.
+            '^workload/'               { continue }
             '^(docs|mcp|clients|examples|poc)/' { continue }
             '\.(md|png|jpg|jpeg|svg|txt|json)$' { continue }
             '^\.git'                   { continue }
@@ -315,4 +319,3 @@ try {
     Write-Host $_.Exception.Message -ForegroundColor Red
     exit 1
 }
-
