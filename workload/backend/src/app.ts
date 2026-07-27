@@ -18,6 +18,7 @@ const VERSION = "0.1.0";
 
 export interface RateLimitOverrides {
   databases?: number;
+  notebooks?: number;
   cdcPreview?: number;
   cdcToken?: number;
 }
@@ -85,6 +86,7 @@ export function createApp(options: CreateAppOptions = {}) {
   const auth = fabricAuthMiddleware(config);
   const limits = {
     databases: options.rateLimits?.databases ?? 60,
+    notebooks: options.rateLimits?.notebooks ?? 20,
     cdcPreview: options.rateLimits?.cdcPreview ?? 30,
     cdcToken: options.rateLimits?.cdcToken ?? 20,
   };
@@ -92,6 +94,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use("/health", healthRouter(VERSION));
   app.use("/api/databases", rateLimiter(limits.databases), auth);
   app.use("/api/lakehouses", rateLimiter(limits.databases), auth);
+  app.use("/api/notebooks", rateLimiter(limits.notebooks), auth);
   app.use("/api/cdc", rateLimiter(limits.cdcPreview), auth);
   app.use("/api/cdc-token", rateLimiter(limits.cdcToken), auth);
   app.use("/api", apiRouter(services));
@@ -99,5 +102,4 @@ export function createApp(options: CreateAppOptions = {}) {
 
   return app;
 }
-
 

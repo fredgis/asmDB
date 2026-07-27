@@ -11,6 +11,10 @@ export type ErrorCode =
   | "cdc_gap"
   | "cdc_corrupt"
   | "fabric_forbidden"
+  | "fabric_notebook_forbidden"
+  | "fabric_item_not_found"
+  | "fabric_item_name_conflict"
+  | "fabric_operation_timeout"
   | "fabric_unavailable"
   | "rate_limited";
 

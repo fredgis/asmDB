@@ -14,6 +14,17 @@ const previewQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 const cdcTokenBodySchema = z.object({ instanceId: instanceIdSchema });
+const notebookBodySchema = z.object({
+  workspaceId: workspaceIdSchema,
+  displayName: z.string().trim().min(1).max(256),
+  sourceDatabaseId: instanceIdSchema,
+  sourceDatabaseName: z.string().trim().min(1).max(128),
+  lakehouseId: z.string().uuid(),
+  lakehouseName: z.string().trim().min(1).max(128),
+  tablePrefix: z.string().trim().max(64).optional(),
+  decoder: z.enum(["None", "Hex", "Base64", "JSON", "CSV", "MessagePack"]).optional(),
+  syncMode: z.enum(["cdc_incremental", "full_reload"]),
+});
 
 function requireFabricContext(req: Express.Request) {
   if (!req.fabricContext) {
@@ -49,6 +60,20 @@ export function apiRouter(services: {
       }
       const lakehouses = await services.fabric.listLakehouses(context.token, workspaceId.data);
       res.json({ lakehouses });
+    })
+  );
+
+  router.post(
+    "/notebooks",
+    asyncHandler(async (req, res) => {
+      const context = requireFabricContext(req);
+      const body = notebookBodySchema.safeParse(req.body);
+      if (!body.success) {
+        throw new HttpError(400, "bad_request", "Invalid notebook request body");
+      }
+
+      const notebook = await services.fabric.createNotebook(context.token, body.data);
+      res.status(201).json(notebook);
     })
   );
 

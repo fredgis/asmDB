@@ -19,6 +19,11 @@ interface MockState {
   gatewayBody: string;
   gatewayHeaders: Record<string, string>;
   databaseCalls: number;
+  fabricStatus: number;
+  fabricBody: unknown;
+  fabricOperationStates: unknown[];
+  fabricOperationResult: unknown;
+  fabricRequests: unknown[];
 }
 
 let publicJwk: JWK;
@@ -65,6 +70,18 @@ function resetState(): void {
       "x-asmdb-has-more": "false",
     },
     databaseCalls: 0,
+    fabricStatus: 201,
+    fabricBody: {
+      id: "notebook-1",
+      displayName: "asmDB sync",
+      webUrl: "https://app.fabric.microsoft.com/notebooks/notebook-1",
+    },
+    fabricOperationStates: [{ status: "Succeeded", percentComplete: 100 }],
+    fabricOperationResult: {
+      id: "notebook-lro",
+      displayName: "asmDB sync",
+    },
+    fabricRequests: [],
   };
 }
 
@@ -92,14 +109,19 @@ function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     managedIdentityClientId: undefined,
     cloudApi: baseUrl,
     cloudScope: "api://asmdb-cloud/.default",
+    fabricApi: baseUrl,
     gatewayUrl: baseUrl,
     gatewayToken: "gateway-secret",
+    keyVaultUrl: "https://asmdb-test.vault.azure.net/",
+    keyVaultSecretName: "asmdb-gateway-token",
     jwksUri: `${baseUrl}/jwks`,
     tokenEndpoint: `${baseUrl}/token`,
     requestBodyLimit: "16kb",
     upstreamJsonBytes: 1024 * 1024,
     upstreamCdcBytes: 256 * 1024,
     upstreamTimeoutMs: 1000,
+    fabricOperationTimeoutMs: 100,
+    fabricOperationPollMs: 1,
     cdcTokenTtlSeconds: 900,
     allowedOrigins: [],
     ...overrides,
@@ -158,6 +180,42 @@ beforeAll(async () => {
         res.end(state.gatewayBody);
         return;
       }
+      if (req.method === "GET" && req.url?.match(/^\/v1\/workspaces\/[^/]+\/items\?type=Lakehouse$/)) {
+        writeJson(res, 200, {
+          value: [
+            {
+              id: "44444444-4444-4444-8444-444444444444",
+              displayName: "Lakehouse",
+              type: "Lakehouse",
+            },
+          ],
+        });
+        return;
+      }
+      if (req.method === "POST" && req.url?.match(/^\/v1\/workspaces\/[^/]+\/notebooks$/)) {
+        const body = JSON.parse(await readBody(req)) as unknown;
+        state.fabricRequests.push(body);
+        if (state.fabricStatus === 202) {
+          res.writeHead(202, {
+            location: `${baseUrl}/v1/operations/op-1`,
+            "x-ms-operation-id": "op-1",
+            "retry-after": "0",
+          });
+          res.end();
+          return;
+        }
+        writeJson(res, state.fabricStatus, state.fabricBody);
+        return;
+      }
+      if (req.method === "GET" && req.url === "/v1/operations/op-1") {
+        const body = state.fabricOperationStates.shift() ?? { status: "Succeeded" };
+        writeJson(res, 200, body);
+        return;
+      }
+      if (req.method === "GET" && req.url === "/v1/operations/op-1/result") {
+        writeJson(res, 200, state.fabricOperationResult);
+        return;
+      }
       writeJson(res, 404, { error: { code: "not_found" } });
     })();
   });
@@ -187,6 +245,7 @@ describe("configuration", () => {
         ASMDB_CLOUD_API: "https://www.asmdb.cloud/api/v1",
         ASMDB_GATEWAY_URL: "https://gateway.example",
         ASMDB_GATEWAY_TOKEN: "gateway-secret",
+        ASMDB_KEY_VAULT_URL: "https://vault.example/",
       })
     ).toThrow(/ASMDB_WL_USE_MANAGED_IDENTITY=true.*ASMDB_WL_ENTRA_CLIENT_SECRET/s);
   });
@@ -511,5 +570,110 @@ describe("asmDB workload API", () => {
     expect(second.status).toBe(429);
     expect(second.body.error.code).toBe("rate_limited");
   });
-});
 
+  const notebookBody = {
+    workspaceId: "33333333-3333-4333-8333-333333333333",
+    displayName: "asmDB sync",
+    sourceDatabaseId: "db_premium",
+    sourceDatabaseName: "orders",
+    lakehouseId: "44444444-4444-4444-8444-444444444444",
+    lakehouseName: "Lakehouse",
+    tablePrefix: "asmdb_",
+    decoder: "JSON",
+    syncMode: "cdc_incremental",
+  } as const;
+
+  async function postNotebook(app: ReturnType<typeof createApp>) {
+    const token = await signToken();
+    return request(app)
+      .post("/api/notebooks")
+      .set("authorization", `Bearer ${token}`)
+      .send(notebookBody);
+  }
+
+  it("creates a notebook and sends substituted base64 notebook content", async () => {
+    const app = createApp({ config: testConfig() });
+    const res = await postNotebook(app);
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({
+      notebookId: "notebook-1",
+      displayName: "asmDB sync",
+      webUrl: "https://app.fabric.microsoft.com/notebooks/notebook-1",
+    });
+    expect(state.tokenRequests[0]?.get("scope")).toBe("https://api.fabric.microsoft.com/.default");
+
+    const fabricRequest = state.fabricRequests[0] as {
+      definition: { format: string; parts: Array<{ path: string; payload: string; payloadType: string }> };
+    };
+    expect(fabricRequest.definition.format).toBe("ipynb");
+    const contentPart = fabricRequest.definition.parts.find((part) => part.path === "artifact.content.ipynb");
+    expect(contentPart?.payloadType).toBe("InlineBase64");
+    const decoded = Buffer.from(contentPart?.payload ?? "", "base64").toString("utf8");
+    expect(() => JSON.parse(decoded)).not.toThrow();
+    expect(decoded).toContain(baseUrl);
+    expect(decoded).toContain("db_premium");
+    expect(decoded).toContain("asmdb_orders");
+    expect(decoded).toContain("https://asmdb-test.vault.azure.net/");
+    expect(decoded).toContain("asmdb-gateway-token");
+    expect(decoded).toContain('DECODER = \\"JSON\\"');
+    expect(decoded).toContain("run_sync()");
+    expect(decoded).not.toContain("__ASMDB_GATEWAY_URL__");
+    expect(decoded).not.toContain("__ASMDB_KEY_VAULT_URL__");
+  });
+
+  it("polls long-running notebook creation and returns the operation result", async () => {
+    state.fabricStatus = 202;
+    state.fabricOperationStates = [{ status: "Running" }, { status: "Succeeded" }];
+    const app = createApp({ config: testConfig() });
+
+    const res = await postNotebook(app);
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ notebookId: "notebook-lro", displayName: "asmDB sync" });
+  });
+
+  it.each([
+    [403, { errorCode: "InsufficientPrivileges" }, 403, "fabric_notebook_forbidden"],
+    [404, { errorCode: "ItemNotFound" }, 404, "fabric_item_not_found"],
+    [409, { errorCode: "ItemDisplayNameAlreadyInUse" }, 409, "fabric_item_name_conflict"],
+    [500, { errorCode: "InternalError" }, 502, "fabric_unavailable"],
+  ])(
+    "maps Fabric notebook creation status %i to %s",
+    async (fabricStatus, fabricBody, expectedStatus, expectedCode) => {
+      state.fabricStatus = fabricStatus;
+      state.fabricBody = fabricBody;
+      const app = createApp({ config: testConfig() });
+
+      const res = await postNotebook(app);
+
+      expect(res.status).toBe(expectedStatus);
+      expect(res.body.error.code).toBe(expectedCode);
+    }
+  );
+
+  it("times out when Fabric accepts notebook creation but never completes it", async () => {
+    state.fabricStatus = 202;
+    state.fabricOperationStates = Array.from({ length: 200 }, () => ({ status: "Running" }));
+    const app = createApp({ config: testConfig({ fabricOperationTimeoutMs: 5, fabricOperationPollMs: 1 }) });
+
+    const res = await postNotebook(app);
+
+    expect(res.status).toBe(504);
+    expect(res.body.error.code).toBe("fabric_operation_timeout");
+  });
+
+  it("does not pretend full_reload exists in the current template", async () => {
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .post("/api/notebooks")
+      .set("authorization", `Bearer ${token}`)
+      .send({ ...notebookBody, syncMode: "full_reload" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("bad_request");
+    expect(state.fabricRequests).toHaveLength(0);
+  });
+});
