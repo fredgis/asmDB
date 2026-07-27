@@ -352,10 +352,30 @@ if (Test-Phase 'build') {
 if (Test-Phase 'backend') {
     Write-Phase '5' 'Deploy backend'
     $zipPath = Join-Path $BuildRoot 'backend.zip'
+    $stageDir = Join-Path $BuildRoot 'backend-stage'
     if ($PSCmdlet.ShouldProcess($zipPath, 'Create backend deployment zip')) {
         if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-        Compress-Archive -Path (Join-Path $BackendRoot '*') -DestinationPath $zipPath -Force
+        if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+        # Ship a self-contained payload and keep the platform's build out of it.
+        # Server-side build fails here because the build script is `tsc` and
+        # typescript is a devDependency, which Oryx does not install; and
+        # zipping the working tree swept in ~96 MB of development node_modules.
+        # So: the already-built dist, plus production dependencies only.
+        foreach ($item in @('dist', 'package.json', 'package-lock.json')) {
+            $source = Join-Path $BackendRoot $item
+            if (-not (Test-Path $source)) { throw "Backend payload is missing $item; run the build first." }
+            Copy-Item $source (Join-Path $stageDir $item) -Recurse -Force
+        }
+        Push-Location $stageDir
+        try { Invoke-External 'npm' @('ci','--omit=dev','--no-audit','--no-fund') 'Install backend production dependencies' -SkipWhenWhatIf }
+        finally { Pop-Location }
+
+        Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -Force
     }
+    Invoke-Az @('webapp','config','appsettings','set','--resource-group',$ResourceGroup,'--name',$BackendAppName,'--settings','SCM_DO_BUILD_DURING_DEPLOYMENT=false','WEBSITE_RUN_FROM_PACKAGE=0') 'Disable server-side build' -SkipWhenWhatIf
+    Invoke-Az @('webapp','config','set','--resource-group',$ResourceGroup,'--name',$BackendAppName,'--startup-file','node dist/index.js') 'Set backend startup command' -SkipWhenWhatIf
     Invoke-Az @('webapp','deploy','--resource-group',$ResourceGroup,'--name',$BackendAppName,'--src-path',$zipPath,'--type','zip') 'Deploy backend zip' -SkipWhenWhatIf
 }
 
