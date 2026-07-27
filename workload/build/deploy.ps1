@@ -367,7 +367,11 @@ if (Test-Phase 'frontend') {
     $token = if ($WhatIfPreference) { '<dry-run-token>' } else { az staticwebapp secrets list --subscription $SubscriptionId --name $StaticWebAppName --resource-group $ResourceGroup --query 'properties.apiKey' -o tsv }
     if (-not $token) { throw 'Could not retrieve Static Web App deployment token.' }
     Push-Location $FrontendRoot
-    try { Invoke-External 'npx' @('swa','deploy','dist','--deployment-token',$token,'--env','production') 'Deploy frontend with SWA CLI' -SkipWhenWhatIf }
+    # The package must be fully qualified. `npx swa` resolves to an unrelated
+    # third-party package of that name on the public registry, which fails with
+    # "unknown arguments" - and is a supply-chain hazard, since a short generic
+    # name is exactly what gets squatted.
+    try { Invoke-External 'npx' @('--yes','@azure/static-web-apps-cli','deploy','dist','--deployment-token',$token,'--env','production') 'Deploy frontend with SWA CLI' -SkipWhenWhatIf }
     finally { Pop-Location }
 }
 
