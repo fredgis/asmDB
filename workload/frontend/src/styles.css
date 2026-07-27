@@ -202,6 +202,7 @@ dd { margin: 0; font-weight: 700; }
 .appShell { grid-template-columns: minmax(0, 1fr); }
 .workloadContent { width: min(100%, 1520px); margin: 0 auto; }
 .fieldCaption { grid-column: 2; margin: -4px 0 6px; color: var(--colorNeutralForeground3); font-size: 12px; }
+.inlineCaption { grid-column: auto; margin: 2px 0 0; }
 .honestCoverage .coverageList strong { font-family: var(--asmdb-font-mono); }
 .unknownDonut { background: var(--colorNeutralBackground2); border: 1px solid var(--colorNeutralStroke2); }
 .unknownDonut::before { display: none; }
@@ -233,11 +234,11 @@ dd { margin: 0; font-weight: 700; }
 .lineageGhostEdge { fill: none; stroke: url(#emptyEdge); stroke-width: 4; opacity: .72; }
 .lineageGhostEdge.dashed { stroke-dasharray: 10 10; }
 .lineageGhostLabel { fill: var(--colorNeutralForeground2); font: 700 15px var(--asmdb-font-body); }
-.lineageSvg { min-height: 230px; border: 1px solid var(--colorNeutralStroke2); border-radius: 14px; background: color-mix(in oklch, var(--colorNeutralBackground2) 90%, var(--asmdb-accent-2) 10%); }
+.lineageSvg { min-height: 260px; border: 1px solid var(--colorNeutralStroke2); border-radius: 18px; background: radial-gradient(circle at 18% 20%, color-mix(in oklch, var(--asmdb-accent-2) 16%, transparent), transparent 28%), radial-gradient(circle at 82% 70%, color-mix(in oklch, var(--asmdb-accent) 14%, transparent), transparent 30%), var(--colorNeutralBackground2); }
 .lineageColumnTitle { fill: var(--colorNeutralForeground2); font: 700 14px var(--asmdb-font-body); }
-.lineageNode { fill: var(--colorNeutralBackground1); stroke: var(--colorNeutralStroke2); stroke-width: 1.5; }
-.lineageSource { stroke: color-mix(in oklch, var(--asmdb-accent-2) 54%, var(--colorNeutralStroke2)); }
-.lineageTarget { stroke: color-mix(in oklch, var(--asmdb-accent) 54%, var(--colorNeutralStroke2)); }
+.lineageNode { stroke-width: 1.5; filter: drop-shadow(0 12px 18px color-mix(in oklch, var(--asmdb-paper) 16%, transparent)); }
+.lineageSource { fill: color-mix(in oklch, var(--asmdb-accent-2) 14%, var(--colorNeutralBackground1)); stroke: color-mix(in oklch, var(--asmdb-accent-2) 58%, var(--colorNeutralStroke2)); }
+.lineageTarget { fill: color-mix(in oklch, var(--asmdb-accent) 14%, var(--colorNeutralBackground1)); stroke: color-mix(in oklch, var(--asmdb-accent) 58%, var(--colorNeutralStroke2)); }
 .lineageNodeText { fill: var(--colorNeutralForeground1); font: 700 14px var(--asmdb-font-body); }
 .lineageEdgeGroup { cursor: pointer; outline: none; }
 .lineageEdgeGroup:focus-visible .lineageEdgeLabelBg, .lineageEdgeGroup.selected .lineageEdgeLabelBg { stroke: var(--asmdb-focus); stroke-width: 3; }
@@ -245,6 +246,41 @@ dd { margin: 0; font-weight: 700; }
 .lineageEdgeGroup.statePlanned .lineageEdgePath { stroke-dasharray: 9 8; }
 .lineageEdgeLabelBg { fill: var(--asmdb-accent-2); stroke: transparent; }
 .lineageEdgeLabel { fill: var(--asmdb-on-violet); font: 800 12px var(--asmdb-font-body); pointer-events: none; }
+
+.bottomGrid.simplified { grid-template-columns: minmax(0, .82fr) minmax(0, 1.26fr) minmax(0, .92fr); }
+.quietPanel, .readinessSummary, .linkSummary { margin: 0 16px 16px; min-width: 0; }
+.quietPanel { padding: 14px; border-radius: 14px; background: var(--colorNeutralBackground2); border: 1px dashed var(--colorNeutralStroke2); }
+.quietPanel p, .readinessSummary p { margin: 10px 0 0; color: var(--colorNeutralForeground2); line-height: 1.5; }
+.activityList { margin: 0 16px 16px; display: grid; gap: 8px; }
+.activityItem { width: 100%; border: 1px solid var(--colorNeutralStroke2); border-radius: 12px; background: var(--colorNeutralBackground2); color: var(--colorNeutralForeground1); padding: 10px 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; text-align: left; cursor: pointer; }
+.activityItem small { color: var(--colorNeutralForeground3); }
+.linkSummary { display: grid; gap: 12px; }
+.linkPair { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 10px; }
+.linkEndpoint { min-width: 0; padding: 12px; border-radius: 14px; font-weight: 750; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--colorNeutralForeground1); }
+.sourceEndpoint { background: color-mix(in oklch, var(--asmdb-accent-2) 14%, var(--colorNeutralBackground1)); border: 1px solid color-mix(in oklch, var(--asmdb-accent-2) 58%, var(--colorNeutralStroke2)); }
+.targetEndpoint { background: color-mix(in oklch, var(--asmdb-accent) 14%, var(--colorNeutralBackground1)); border: 1px solid color-mix(in oklch, var(--asmdb-accent) 58%, var(--colorNeutralStroke2)); }
+.linkArrow { color: var(--asmdb-accent-2); font-weight: 900; }
+.compactStatus { display: inline-flex; width: fit-content; border-radius: 999px; padding: 5px 10px; background: currentColor; font-weight: 800; font-size: 12px; }
+.compactStatus::first-letter { color: inherit; }
+.compactStatus.stateActive, .compactStatus.statePlanned, .compactStatus.stateWarning { color: var(--asmdb-on-accent); }
+.compactStatus.stateActive { background: var(--asmdb-ok); }
+.compactStatus.statePlanned { background: var(--asmdb-accent-2); }
+.compactStatus.stateWarning { background: var(--asmdb-warn); }
+.linkSummary p { margin: 0; color: var(--colorNeutralForeground2); }
+.linkMore { border-top: 1px solid var(--colorNeutralStroke2); padding-top: 10px; color: var(--colorNeutralForeground2); }
+.linkMore summary { cursor: pointer; font-weight: 700; color: var(--colorNeutralForeground1); }
+.linkMore dl { margin: 10px 0 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; }
+.linkMore div { min-width: 0; display: grid; gap: 2px; }
+.deleteZone { display: flex; justify-content: flex-end; }
+.deleteConfirm { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; color: var(--colorNeutralForeground2); }
+.readinessSummary { display: grid; gap: 10px; }
+.readinessSummary p { margin-top: 0; font-weight: 650; }
+.readinessSummary small { color: var(--colorNeutralForeground3); }
+.readinessBar { min-height: 12px; overflow: hidden; display: flex; border-radius: 999px; background: var(--colorNeutralBackground3); border: 1px solid var(--colorNeutralStroke2); }
+.readinessBar span { min-width: 0; }
+.barActive { background: var(--asmdb-ok); }
+.barPlanned { background: var(--asmdb-accent-2); }
+.barWarning { background: var(--asmdb-warn); }
 
 .cdcPreview { margin: 0 16px 16px; min-width: 0; }
 .cdcTableWrap { overflow-x: auto; }
@@ -263,4 +299,7 @@ dd { margin: 0; font-weight: 700; }
   .lineageSvg { max-height: none; }
   .cdcTableWrap { display: none; }
   .cdcCards { display: grid; }
+  .linkPair { grid-template-columns: minmax(0, 1fr); }
+  .linkArrow { text-align: center; }
+  .linkMore dl { grid-template-columns: minmax(0, 1fr); }
 }

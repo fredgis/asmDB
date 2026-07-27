@@ -160,7 +160,7 @@ function App() {
   const [targetId, setTargetId] = useState("");
   const [mode, setMode] = useState("CDC Incremental");
   const [prefix, setPrefix] = useState("");
-  const [createNotebook, setCreateNotebook] = useState(true);
+  const [createNotebook] = useState(false);
   const [decoder, setDecoder] = useState<DecoderMode>("none");
   const [sample, setSample] = useState("");
   const [toast, setToast] = useState<string | null>(null);
@@ -170,6 +170,7 @@ function App() {
   const [previewRows, setPreviewRows] = useState<PreviewEntry[]>([]);
   const [saveState, setSaveState] = useState<RequestState>("not-configured");
   const [saveMessage, setSaveMessage] = useState("Choose a source database and target lakehouse, then create a link.");
+  const [deleteConfirmId, setDeleteConfirmId] = useState("");
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -253,7 +254,9 @@ function App() {
     }
   }, [decoder, sample]);
 
-  const activityRows: RunRecord[] = links.data.map((link) => ({ id: link.id, source: link.source, target: link.target, status: link.status, lastRun: link.lastRun, lag: link.lag }));
+  const activityRows: RunRecord[] = links.data
+    .filter((link) => link.lastRun && link.lastRun !== "Never run")
+    .map((link) => ({ id: link.id, source: link.source, target: link.target, status: link.status, lastRun: link.lastRun, lag: link.lag }));
   const canCreate = Boolean(selectedSource && selectedTarget && links.state !== "failed");
   const connectionBadge = "tint";
   const headerIssue = connection.state === "failed" ? connection.issue : databases.state === "failed" ? databases.issue : lakehouses.state === "failed" ? lakehouses.issue : links.state === "failed" ? links.issue : undefined;
@@ -286,11 +289,8 @@ function App() {
       mode,
       prefix,
       decoder,
-      createNotebook,
+      createNotebook: false,
       status: "Planned",
-      lastRun: "Never run",
-      nextRun: createNotebook ? "Awaiting notebook schedule" : "Notebook not generated",
-      lag: "No data",
     };
     const nextLinks = [link, ...links.data];
     try {
@@ -309,6 +309,28 @@ function App() {
     setSaveState("ready");
     setSaveMessage(`Saved to links.json and lineage/graph.json: ${selectedSource.name} -> ${selectedTarget.name}.`);
     showToast(`Sync link saved: ${selectedSource.name} to ${selectedTarget.name}.`);
+  }
+
+  async function deleteLink(linkId: string) {
+    const link = links.data.find((candidate) => candidate.id === linkId);
+    if (!link) return;
+    setSaveState("checking");
+    try {
+      const persistedLinks = await saveLinkState(workloadClient, links.data.filter((candidate) => candidate.id !== linkId));
+      setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
+      setSelectedId(persistedLinks[0]?.id ?? "");
+      setDeleteConfirmId("");
+      setSaveState("ready");
+      setSaveMessage(`Deleted ${link.source} -> ${link.target} from links.json and lineage/graph.json.`);
+      showToast("Sync link deleted.");
+    } catch (error) {
+      console.error("Delete Link failed", error);
+      const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "unknown";
+      const message = `[${code}] ${error instanceof Error ? error.message : String(error)}`;
+      setSaveState("failed");
+      setSaveMessage(message);
+      showToast(message);
+    }
   }
 
   async function onPreviewCdc() {
@@ -389,7 +411,7 @@ function App() {
                 </Dropdown>
                 <label htmlFor="prefix">Target Table Prefix</label>
                 <Input id="prefix" value={prefix} onChange={(_, data) => setPrefix(data.value)} placeholder="Optional prefix" />
-                <div className="checkboxRow"><Checkbox id="notebook" checked={createNotebook} onChange={(_, data) => setCreateNotebook(Boolean(data.checked))} label="Create Notebook" /></div>
+                <div className="checkboxRow"><Checkbox id="notebook" checked={false} disabled label="Create Notebook" /><p className="fieldCaption inlineCaption">Notebook generation is not available yet; the link will be saved without creating one.</p></div>
 
                 <section className="decoderBox" aria-labelledby="decoder-heading">
                   <div className="decoderTitle"><h3 id="decoder-heading">Content decoding</h3><div className="decoderActions"><Button size="small" type="button" onClick={onPreviewCdc} disabled={!selectedSource || previewState === "checking"}>{previewState === "checking" ? "Fetching…" : "Fetch CDC sample"}</Button><span className="surfaceBadge">{byteLength(sample)} / {CONTENT_LIMIT_BYTES} bytes</span></div></div>
@@ -407,7 +429,7 @@ function App() {
                     <pre aria-live="polite">{decoded.preview}</pre>
                   </div>
                 </section>
-                <div className="actions"><Button type="button" onClick={() => { setCreateNotebook(true); setSaveMessage("Notebook creation will be requested when this link is saved."); showToast("Notebook creation will be requested when this link is saved."); }}>Generate Notebook</Button><Button type="button" onClick={onPreviewCdc} disabled={!selectedSource || previewState === "checking"}>{previewState === "checking" ? "Fetching…" : "Preview CDC"}</Button>{/* Fabric sandboxes workload iframes without allow-forms, so this must not be a submit button: native form submission is blocked before React receives onSubmit. */}<Button appearance="primary" type="button" onClick={() => void createLink()} disabled={!canCreate || saveState === "checking"}>{saveState === "checking" ? "Saving…" : "✦ Create Link"}</Button></div>
+                <div className="actions"><Button type="button" disabled>Generate Notebook</Button><Button type="button" onClick={onPreviewCdc} disabled={!selectedSource || previewState === "checking"}>{previewState === "checking" ? "Fetching…" : "Preview CDC"}</Button>{/* Fabric sandboxes workload iframes without allow-forms, so this must not be a submit button: native form submission is blocked before React receives onSubmit. */}<Button appearance="primary" type="button" onClick={() => void createLink()} disabled={!canCreate || saveState === "checking"}>{saveState === "checking" ? "Saving…" : "✦ Create Link"}</Button></div>
                 <div className="saveStatus"><StateMessage state={saveState} text={saveMessage} /></div>
               </form>
             </article>
@@ -421,20 +443,20 @@ function App() {
             </article>
           </section>
 
-          <section className="bottomGrid">
+          <section className="bottomGrid simplified">
             <article className="panel tablePanel" aria-labelledby="activity-heading">
               <div className="panelHead"><h2 id="activity-heading"><span aria-hidden="true">◴</span>Recent Sync Activity</h2></div>
-              {activityRows.length ? <div className="tableWrap"><table><thead><tr><th>Source → Target</th><th>Status</th><th>Last Run</th><th>Lag</th></tr></thead><tbody>{activityRows.map((row) => <tr key={row.id}><td>{row.source} → {row.target}</td><td><span className={statusClass(row.status)}>{statusIcon(row.status)} {row.status}</span></td><td>{row.lastRun ?? "Unknown"}</td><td>{row.lag ?? "Unknown"}</td></tr>)}</tbody></table></div> : <StateMessage state="no-data" text="No run records exist yet. Activity will appear after a saved link has a notebook run." />}
+              {activityRows.length ? <div className="activityList">{activityRows.map((row) => <button type="button" className="activityItem" key={row.id} onClick={() => setSelectedId(row.id)}><span>{row.source} → {row.target}</span><span className={`compactStatus ${statusClass(row.status)}`}>{statusIcon(row.status)} {row.status}</span><small>{row.lastRun ?? "Unknown"}</small></button>)}</div> : <div className="quietPanel"><span className="surfaceBadge">No runs yet</span><p>Saved links stay planned until a notebook run writes real activity.</p></div>}
             </article>
 
             <article className="panel" aria-labelledby="detail-heading">
               <div className="panelHead"><h2 id="detail-heading"><span aria-hidden="true">ↄ</span>Selected Link Details</h2></div>
-              {selectedLink ? <div className="detailsBody"><div className="detailTitle"><span>▤ {selectedLink.source}</span><span>→</span><span>⌂ {selectedLink.target}</span></div><dl className="detailsGrid"><div><dt>Status</dt><dd className={statusClass(selectedLink.status)}>{statusIcon(selectedLink.status)} {selectedLink.status}</dd></div><div><dt>Current Lag</dt><dd>{selectedLink.lag ?? "Unknown"}</dd></div><div><dt>Notebook</dt><dd>{selectedLink.createNotebook ? "Requested" : "Not requested"}</dd></div><div><dt>Decoder</dt><dd>{decoderOptions.find((item) => item.value === selectedLink.decoder)?.label ?? "None"}</dd></div><div><dt>Last Run</dt><dd>{selectedLink.lastRun ?? "Unknown"}</dd></div><div><dt>Next Run</dt><dd>{selectedLink.nextRun ?? "Unknown"}</dd></div><div><dt>Sync Mode</dt><dd>{selectedLink.mode}</dd></div><div><dt>Table Prefix</dt><dd>{selectedLink.prefix || "None"}</dd></div></dl></div> : <StateMessage state="not-configured" text="No link is selected because no link is stored in this workload item." />}
+              {selectedLink ? <LinkSummary link={selectedLink} confirmDelete={deleteConfirmId === selectedLink.id} onAskDelete={() => setDeleteConfirmId(selectedLink.id)} onCancelDelete={() => setDeleteConfirmId("")} onDelete={() => void deleteLink(selectedLink.id)} /> : <StateMessage state="not-configured" text="No link is selected because no link is stored in this workload item." />}
             </article>
 
             <article className="panel" aria-labelledby="coverage-heading">
               <div className="panelHead"><h2 id="coverage-heading"><span aria-hidden="true">◇</span>Coverage & Readiness</h2></div>
-              <div className="coverage honestCoverage"><div className="donut unknownDonut" aria-label="Coverage unknown"><strong>—</strong><span>Coverage</span></div><div className="coverageList"><span><i className="stateActive" />Active links <strong>{links.state === "ready" ? activeLinks : "—"}</strong></span><span><i className="statePlanned" />Planned links <strong>{links.state === "ready" ? plannedLinks : "—"}</strong></span><span><i className="stateWarning" />Warnings <strong>{links.state === "ready" ? warningLinks : "—"}</strong></span><span><i />Not configured <strong>—</strong></span></div></div>
+              <div className="readinessSummary"><p>{links.data.length ? `${links.data.length} saved ${links.data.length === 1 ? "link" : "links"}: ${activeLinks} active, ${plannedLinks} planned, ${warningLinks} warning.` : "No coverage to report until a link is saved."}</p><div className="readinessBar" aria-hidden="true"><span className="barActive" style={{ flexGrow: activeLinks }} /><span className="barPlanned" style={{ flexGrow: plannedLinks }} /><span className="barWarning" style={{ flexGrow: warningLinks }} /></div><small>Coverage percentages appear only after real run records exist.</small></div>
             </article>
           </section>
 
@@ -462,6 +484,30 @@ function StateMessage({ state, text }: { state: RequestState; text: string }) {
   return <div className={`stateMessage ${state}`}><strong>{stateLabel(state)}</strong><pre>{text}</pre></div>;
 }
 
+function LinkSummary({ link, confirmDelete, onAskDelete, onCancelDelete, onDelete }: { link: SyncLink; confirmDelete: boolean; onAskDelete: () => void; onCancelDelete: () => void; onDelete: () => void }) {
+  return <div className="linkSummary">
+    <div className="linkPair">
+      <span className="linkEndpoint sourceEndpoint">▤ {link.source}</span>
+      <span className="linkArrow">→</span>
+      <span className="linkEndpoint targetEndpoint">⌂ {link.target}</span>
+    </div>
+    <span className={`compactStatus ${statusClass(link.status)}`}>{statusIcon(link.status)} {link.status}</span>
+    <p>{link.status === "Planned" ? "This link is configured and waiting for its first real run." : "This link is selected in the lineage graph."}</p>
+    <details className="linkMore">
+      <summary>Show technical details</summary>
+      <dl>
+        <div><dt>Mode</dt><dd>{link.mode}</dd></div>
+        <div><dt>Decoder</dt><dd>{decoderOptions.find((item) => item.value === link.decoder)?.label ?? "None"}</dd></div>
+        <div><dt>Prefix</dt><dd>{link.prefix || "None"}</dd></div>
+        <div><dt>Notebook</dt><dd>Not available yet</dd></div>
+      </dl>
+    </details>
+    <div className="deleteZone">
+      {confirmDelete ? <div className="deleteConfirm"><span>Delete this link?</span><Button size="small" type="button" onClick={onCancelDelete}>Cancel</Button><Button size="small" appearance="primary" type="button" onClick={onDelete}>Delete</Button></div> : <Button type="button" onClick={onAskDelete}>Delete link</Button>}
+    </div>
+  </div>;
+}
+
 function LineageEmpty({ state, text }: { state: RequestState; text: string }) {
   return <div className="lineageEmpty"><svg viewBox="0 0 720 220" role="img" aria-label="Empty lineage diagram placeholder"><defs><linearGradient id="emptyEdge" x1="0" x2="1"><stop offset="0%" stopColor="var(--asmdb-accent)" /><stop offset="100%" stopColor="var(--asmdb-accent-2)" /></linearGradient></defs><rect className="lineageGhostNode" x="34" y="54" width="190" height="52" rx="14" /><rect className="lineageGhostNode" x="496" y="54" width="190" height="52" rx="14" /><path className="lineageGhostEdge" d="M232 80 C330 28 390 28 488 80" /><rect className="lineageGhostNode" x="34" y="130" width="190" height="52" rx="14" /><rect className="lineageGhostNode" x="496" y="130" width="190" height="52" rx="14" /><path className="lineageGhostEdge dashed" d="M232 156 C330 204 390 204 488 156" /><text className="lineageGhostLabel" x="129" y="85" textAnchor="middle">asmDB database</text><text className="lineageGhostLabel" x="591" y="85" textAnchor="middle">Fabric lakehouse</text><text className="lineageGhostLabel" x="360" y="116" textAnchor="middle">Active · Planned · Warning</text></svg><StateMessage state={state === "failed" ? "failed" : "no-data"} text={text} /></div>;
 }
@@ -469,25 +515,25 @@ function LineageEmpty({ state, text }: { state: RequestState; text: string }) {
 function LineageDiagram({ graph, selectedId, onSelect }: { graph: ReturnType<typeof graphFromLinks>; selectedId: string; onSelect: (id: string) => void }) {
   const databases = graph.nodes.filter((node) => node.kind === "database");
   const lakehouses = graph.nodes.filter((node) => node.kind === "lakehouse");
-  const height = Math.max(240, Math.max(databases.length, lakehouses.length, graph.edges.length) * 86 + 54);
+  const height = Math.max(260, Math.max(databases.length, lakehouses.length, graph.edges.length) * 96 + 70);
   const yFor = (nodes: typeof graph.nodes, id: string) => {
     const index = Math.max(0, nodes.findIndex((node) => node.id === id));
-    return 48 + index * 86;
+    return 58 + index * 96;
   };
-  return <svg className="lineageSvg" viewBox={`0 0 820 ${height}`} role="img" aria-label="Current lineage graph">
-    <defs><marker id="lineageArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" /></marker></defs>
-    <text className="lineageColumnTitle" x="120" y="24" textAnchor="middle">asmDB databases</text>
-    <text className="lineageColumnTitle" x="700" y="24" textAnchor="middle">Fabric lakehouses</text>
-    {databases.map((node) => <g key={node.id}><rect className="lineageNode lineageSource" x="24" y={yFor(databases, node.id)} width="220" height="54" rx="14" /><text className="lineageNodeText" x="46" y={yFor(databases, node.id) + 33}>▤ {node.label}</text></g>)}
-    {lakehouses.map((node) => <g key={node.id}><rect className="lineageNode lineageTarget" x="576" y={yFor(lakehouses, node.id)} width="220" height="54" rx="14" /><text className="lineageNodeText" x="598" y={yFor(lakehouses, node.id) + 33}>⌂ {node.label}</text></g>)}
+  return <svg className="lineageSvg" viewBox={`0 0 900 ${height}`} role="img" aria-label="Current lineage graph">
+    <defs><marker id="lineageArrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" /></marker></defs>
+    <text className="lineageColumnTitle" x="170" y="30" textAnchor="middle">asmDB databases</text>
+    <text className="lineageColumnTitle" x="730" y="30" textAnchor="middle">Fabric lakehouses</text>
+    {databases.map((node) => <g key={node.id}><rect className="lineageNode lineageSource" x="40" y={yFor(databases, node.id)} width="260" height="60" rx="16" /><text className="lineageNodeText" x="64" y={yFor(databases, node.id) + 37}>▤ {node.label}</text></g>)}
+    {lakehouses.map((node) => <g key={node.id}><rect className="lineageNode lineageTarget" x="600" y={yFor(lakehouses, node.id)} width="260" height="60" rx="16" /><text className="lineageNodeText" x="624" y={yFor(lakehouses, node.id) + 37}>⌂ {node.label}</text></g>)}
     {graph.edges.map((edge, index) => {
-      const sourceY = yFor(databases, edge.source) + 27;
-      const targetY = yFor(lakehouses, edge.target) + 27;
-      const labelY = (sourceY + targetY) / 2 - 7 + (index % 2 ? 14 : 0);
+      const sourceY = yFor(databases, edge.source) + 30;
+      const targetY = yFor(lakehouses, edge.target) + 30;
+      const labelY = Math.min(sourceY, targetY) - 20 + (index % 2 ? 12 : 0);
       return <g className={`lineageEdgeGroup ${statusClass(edge.status)} ${selectedId === edge.id ? "selected" : ""}`} key={edge.id} role="button" tabIndex={0} onClick={() => onSelect(edge.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") onSelect(edge.id); }} aria-label={`${edge.status} lineage edge`}>
-        <path className="lineageEdgePath" d={`M 244 ${sourceY} C 360 ${sourceY}, 460 ${targetY}, 576 ${targetY}`} markerEnd="url(#lineageArrow)" />
-        <rect className="lineageEdgeLabelBg" x="344" y={labelY - 16} width="132" height="30" rx="15" />
-        <text className="lineageEdgeLabel" x="410" y={labelY + 4} textAnchor="middle">{statusIcon(edge.status)} {edge.status}</text>
+        <path className="lineageEdgePath" d={`M 310 ${sourceY} C 420 ${sourceY}, 480 ${targetY}, 590 ${targetY}`} markerEnd="url(#lineageArrow)" />
+        <rect className="lineageEdgeLabelBg" x="392" y={labelY - 14} width="116" height="28" rx="14" />
+        <text className="lineageEdgeLabel" x="450" y={labelY + 4} textAnchor="middle">{statusIcon(edge.status)} {edge.status}</text>
       </g>;
     })}
   </svg>;
@@ -498,6 +544,3 @@ function CdcPreview({ entries }: { entries: PreviewEntry[] }) {
 }
 
 export default App;
-
-
-
