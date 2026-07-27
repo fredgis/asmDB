@@ -15,7 +15,7 @@
         "introduction": "Follow the workload packaging, upload, and enablement procedure.",
         "description": "Prepare the dedicated Entra app, isolated Azure resource group, custom domain, package, and Fabric Admin Portal steps.",
         "image": "assets/logo.png",
-        "link": "https://github.com/fredgis/repo-asmdb/blob/main/workload/docs/INSTALL.md"
+        "link": "https://github.com/fredgis/asmDB/blob/main/workload/docs/INSTALL.md"
       }
     ],
     "newSection": {
@@ -63,12 +63,12 @@
       { "mediaType": 0, "source": "assets/logo.png" }
     ],
     "supportLink": {
-      "documentation": { "url": "https://github.com/fredgis/repo-asmdb/blob/main/workload/docs/INSTALL.md" },
+      "documentation": { "url": "https://github.com/fredgis/asmDB/blob/main/workload/docs/INSTALL.md" },
       "certification": { "url": "https://REPLACE-ME.example.com/certification" },
-      "help": { "url": "https://github.com/fredgis/repo-asmdb/issues" },
+      "help": { "url": "https://github.com/fredgis/asmDB/issues" },
       "privacy": { "url": "https://REPLACE-ME.example.com/privacy" },
       "terms": { "url": "https://REPLACE-ME.example.com/terms" },
-      "license": { "url": "https://github.com/fredgis/repo-asmdb/blob/main/LICENSE" }
+      "license": { "url": "https://github.com/fredgis/asmDB/blob/main/LICENSE" }
     }
   }
 }

@@ -41,6 +41,17 @@ The current `REPLACE-ME` support links are therefore gated prerequisites, not la
 | Privacy | `https://REPLACE-ME.example.com/privacy` | Legal/product owner |
 | Terms | `https://REPLACE-ME.example.com/terms` | Legal/product owner |
 
+### The GitHub support links do not resolve today, because the repository is private
+
+Three support links point at `github.com/fredgis/asmDB` — documentation, help, and license. All three return **404 to anonymous callers**, because GitHub answers 404 rather than 403 for a private repository so as not to disclose that it exists.
+
+They resolve for you, signed in, which is exactly what makes this easy to miss. They will not resolve for a Microsoft reviewer. The packaging preflight checks them over the network for this reason.
+
+Two ways out, and the choice is a product decision rather than a technical one:
+
+- make the repository public, which is the simplest option if it is intended to be an open project;
+- or host the pages under `asmdb.cloud`, which you already own and have to verify in Entra anyway.
+
 Sources to verify: Microsoft Learn `fabric/extensibility-toolkit/publishing-requirements-general` and Fabric Workload Hub publishing documentation.
 
 ---

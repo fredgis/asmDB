@@ -34,7 +34,7 @@ $WorkloadManifestPath = Join-Path $ManifestRoot "WorkloadManifest.xml"
 $ProductPath = Join-Path $ManifestRoot "Product.json"
 $ItemXmlPath = Join-Path $ManifestRoot "items\$ItemName\$($ItemName)Item.xml"
 $ItemJsonPath = Join-Path $ManifestRoot "items\$ItemName\$($ItemName)Item.json"
-$FrontendRoutesPath = Join-Path $FrontendRoot "src\routes.ts"
+$FrontendRoutesPath = Join-Path $FrontendRoot "src\workload-constants.ts"
 $FrontendDist = Join-Path $FrontendRoot "dist"
 $AllowedAssetExtensions = @(".png", ".jpg", ".jpeg")
 $MaxAssetBytes = 1572864
@@ -121,9 +121,11 @@ function Test-HostIsSubdomainOfVerifiedDomain {
     param([string]$Url)
     $uri = $null
     if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$uri)) { return $false }
-    $host = $uri.Host.ToLowerInvariant()
+    # Not $host: that is a read-only PowerShell automatic variable and assigning
+    # to it aborts the run with an error naming nothing to do with URLs.
+    $hostName = $uri.Host.ToLowerInvariant()
     $domain = $VerifiedDomain.ToLowerInvariant()
-    return $host.EndsWith(".$domain") -and $host -ne $domain -and -not $host.EndsWith(".onmicrosoft.com")
+    return $hostName.EndsWith(".$domain") -and $hostName -ne $domain -and -not $hostName.EndsWith(".onmicrosoft.com")
 }
 
 function Get-ManifestUrlFindings {
@@ -134,45 +136,51 @@ function Get-ManifestUrlFindings {
             if (-not (Test-HttpsUrl -Url $field.Value)) {
                 $findings += "$ProductPath $($field.Path) = '$($field.Value)' is not a syntactically valid https URL"
             }
-
-            function Get-SupportLinkHttpFindings {
-                $findings = @()
-                $json = Get-Content $ProductPath -Raw | ConvertFrom-Json
-                if (-not ($json.productDetail -and $json.productDetail.supportLink)) { return @("$ProductPath is missing productDetail.supportLink entries.") }
-                foreach ($prop in $json.productDetail.supportLink.PSObject.Properties) {
-                    $url = [string]$prop.Value.url
-                    if ($url -match 'REPLACE-ME') {
-                        $findings += "$ProductPath $.productDetail.supportLink.$($prop.Name).url still contains REPLACE-ME, so HTTP status cannot be verified."
-                        continue
-                    }
-                    if (-not (Test-HttpsUrl -Url $url)) {
-                        $findings += "$ProductPath $.productDetail.supportLink.$($prop.Name).url is not a valid HTTPS URL: $url"
-                        continue
-                    }
-                    try {
-                        $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 5 -TimeoutSec 15 -ErrorAction Stop
-                        if ([int]$response.StatusCode -lt 200 -or [int]$response.StatusCode -gt 399) {
-                            $findings += "$ProductPath $.productDetail.supportLink.$($prop.Name).url returned HTTP $($response.StatusCode); Workload Hub requires 200-399."
-                        }
-                    } catch {
-                        try {
-                            $response = Invoke-WebRequest -Uri $url -Method Get -MaximumRedirection 5 -TimeoutSec 15 -ErrorAction Stop
-                            if ([int]$response.StatusCode -lt 200 -or [int]$response.StatusCode -gt 399) {
-                                $findings += "$ProductPath $.productDetail.supportLink.$($prop.Name).url returned HTTP $($response.StatusCode); Workload Hub requires 200-399."
-                            }
-                        } catch {
-                            $findings += "$ProductPath $.productDetail.supportLink.$($prop.Name).url did not return HTTP 200-399 over HTTPS: $url ($($_.Exception.Message))"
-                        }
-                    }
-                }
-                return $findings
-            }
         }
     }
     [xml]$xml = Get-Content $WorkloadManifestPath -Raw
     $frontendUrl = [string]$xml.WorkloadManifestConfiguration.Workload.RemoteServiceConfiguration.CloudServiceConfiguration.Endpoints.ServiceEndpoint.Url
     if (-not (Test-HttpsUrl -Url $frontendUrl)) {
         $findings += "$WorkloadManifestPath /WorkloadManifestConfiguration/Workload/.../ServiceEndpoint/Url = '$frontendUrl' is not a syntactically valid https URL"
+    }
+    return $findings
+}
+
+# Workload Hub requires every supportLink to answer 200-399 over HTTPS. Checking
+# it here means a submission fails on this machine in seconds rather than in
+# Microsoft's review days later.
+function Get-SupportLinkHttpFindings {
+    $findings = @()
+    $json = Get-Content $ProductPath -Raw | ConvertFrom-Json
+    if (-not ($json.productDetail -and $json.productDetail.supportLink)) {
+        return @("$ProductPath is missing productDetail.supportLink entries.")
+    }
+    foreach ($prop in $json.productDetail.supportLink.PSObject.Properties) {
+        $url = [string]$prop.Value.url
+        $label = "$ProductPath `$.productDetail.supportLink.$($prop.Name).url"
+        if ($url -match 'REPLACE-ME') {
+            $findings += "$label still contains REPLACE-ME, so its HTTP status cannot be verified."
+            continue
+        }
+        if (-not (Test-HttpsUrl -Url $url)) {
+            $findings += "$label is not a valid HTTPS URL: $url"
+            continue
+        }
+        $status = $null
+        foreach ($method in @('Head', 'Get')) {
+            try {
+                $response = Invoke-WebRequest -Uri $url -Method $method -MaximumRedirection 5 -TimeoutSec 15 -ErrorAction Stop
+                $status = [int]$response.StatusCode
+                break
+            } catch {
+                $lastError = $_.Exception.Message
+            }
+        }
+        if ($null -eq $status) {
+            $findings += "$label did not respond over HTTPS: $url ($lastError)"
+        } elseif ($status -lt 200 -or $status -gt 399) {
+            $findings += "$label returned HTTP $status; Workload Hub requires 200-399."
+        }
     }
     return $findings
 }
@@ -282,7 +290,17 @@ function Add-PostBuildChecks {
 
     $manifestEditorPath = [string]$item.editor.path
     $frontendEditorPath = Get-FrontendEditorPath
-    Add-Check "Item editor path matches frontend route" ($frontendEditorPath -and $manifestEditorPath -eq $frontendEditorPath) @("Manifest editor.path = '$manifestEditorPath'; frontend SYNC_HUB_EDITOR_PATH = '$frontendEditorPath'.") "Update workload\manifest\items\SyncHub\SyncHubItem.json or workload\frontend\src\routes.ts so both are identical."
+    # Distinguish "the constants file moved" from "the two values differ": the
+    # first check ever written here read a file the frontend had renamed, so it
+    # compared against an empty string and blamed the wrong side.
+    $editorDetail = if (-not (Test-Path $FrontendRoutesPath)) {
+        @("Expected the frontend constants at $FrontendRoutesPath; the file is not there.")
+    } elseif (-not $frontendEditorPath) {
+        @("$FrontendRoutesPath exists but declares no SYNC_HUB_EDITOR_PATH.")
+    } else {
+        @("Manifest editor.path = '$manifestEditorPath'; frontend SYNC_HUB_EDITOR_PATH = '$frontendEditorPath'.")
+    }
+    Add-Check "Item editor path matches frontend route" ($frontendEditorPath -and $manifestEditorPath -eq $frontendEditorPath) $editorDetail "Update workload\manifest\items\$ItemName\$($ItemName)Item.json or $FrontendRoutesPath so both are identical. Fabric navigates the iframe to this path; a mismatch renders a blank panel with nothing in the console."
 
     $distFiles = if (Test-Path $FrontendDist) { @(Get-ChildItem $FrontendDist -Recurse -File) } else { @() }
     Add-Check "Frontend production build output exists and is non-empty" ($distFiles.Count -gt 0) @("Expected files under $FrontendDist; found $($distFiles.Count).") "Run npm install and npm run build in workload\frontend, or rerun this pack script after fixing frontend build errors."
@@ -296,8 +314,16 @@ function Add-PostBuildChecks {
     $urlFindings = @(Get-ManifestUrlFindings)
     Add-Check "Manifest URLs are syntactically valid https URLs" ($urlFindings.Count -eq 0) $urlFindings "Use absolute https:// URLs in Product.json and WorkloadManifest.xml."
 
+    # Support links are a Workload Hub submission requirement, not a build
+    # requirement. Under -AllowPlaceholders the run is a development build, so
+    # report them but let the package be produced; a release build must not.
     $supportLinkFindings = @(Get-SupportLinkHttpFindings)
-    Add-Check "Marketplace support links return HTTP 200-399 over HTTPS" ($supportLinkFindings.Count -eq 0) $supportLinkFindings "Publish the required documentation, certification/attestation, help, privacy, terms, and license pages, then update Product.json supportLink URLs."
+    if ($supportLinkFindings.Count -gt 0 -and $AllowPlaceholders) {
+        $script:Warnings.Add("Support links are not publishable yet; this package is for development only.")
+        foreach ($finding in $supportLinkFindings) { $script:Warnings.Add("  $finding") }
+    } else {
+        Add-Check "Marketplace support links return HTTP 200-399 over HTTPS" ($supportLinkFindings.Count -eq 0) $supportLinkFindings "Publish the documentation, certification/attestation, help, privacy, terms and license pages, then update Product.json supportLink URLs. Note that github.com URLs in a PRIVATE repository return 404 to anonymous callers, including Microsoft's reviewers - the repository must be public or the pages must be hosted elsewhere."
+    }
 
     $frontendUrl = [string]$workloadManifest.WorkloadManifestConfiguration.Workload.RemoteServiceConfiguration.CloudServiceConfiguration.Endpoints.ServiceEndpoint.Url
     Add-Check "Frontend URL is a subdomain of the verified Entra domain" (Test-HostIsSubdomainOfVerifiedDomain -Url $frontendUrl) @("Frontend URL = '$frontendUrl'; verified domain = '$VerifiedDomain'. Default Azure hostnames and *.onmicrosoft.com do not satisfy Fabric publishing requirements.") "Set WorkloadManifest.xml ServiceEndpoint/Url to a custom HTTPS subdomain of '$VerifiedDomain', for example https://fe.workload.$VerifiedDomain/."
@@ -344,6 +370,9 @@ function Set-PackageVersion {
 }
 
 function New-ContentTypesFile {
+    # -LiteralPath is required, not stylistic: the NuGet-mandated filename
+    # [Content_Types].xml is read as a wildcard by -Path, and PowerShell then
+    # reports a missing -Encoding parameter, which is nothing to do with it.
     $path = Join-Path $StageDir "[Content_Types].xml"
     @'
 <?xml version="1.0" encoding="utf-8"?>
@@ -355,7 +384,7 @@ function New-ContentTypesFile {
   <Default Extension="jpeg" ContentType="image/jpeg" />
   <Default Extension="nuspec" ContentType="application/octet" />
 </Types>
-'@ | Set-Content -Encoding UTF8 $path
+'@ | Set-Content -Encoding UTF8 -LiteralPath $path
 }
 
 function New-RelationshipFile {
@@ -366,7 +395,7 @@ function New-RelationshipFile {
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Type="http://schemas.microsoft.com/packaging/2010/07/manifest" Target="/$WorkloadId.nuspec" Id="R1" />
 </Relationships>
-"@ | Set-Content -Encoding UTF8 (Join-Path $relsDir ".rels")
+"@ | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $relsDir ".rels")
 }
 
 function New-Package {
