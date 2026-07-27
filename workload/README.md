@@ -21,6 +21,7 @@ Per the plan, and created only when its phase begins:
 
 | Path | Workstream |
 |---|---|
+| `cdc-gateway/` | A — reads `<db>.cdc` from a read-only mount and serves change frames. Deliberately **not** part of the asmdb.cloud public API. |
 | `frontend/` | C — React + Fluent UI v9 surface, running in a Fabric iframe |
 | `backend/` | D — token broker; Fabric JWT in, scoped asmDB credentials out |
 | `notebooks/` | E — the PySpark template that reads change frames and merges into Delta |
@@ -30,10 +31,11 @@ Per the plan, and created only when its phase begins:
 
 ## The one thing to understand before reading the plan
 
-**Fabric Spark writes the Delta tables; we do not.** The workload generates a notebook
+**Fabric Spark writes the Delta tables; we do not — and we do not touch the SaaS core.** The workload generates a notebook
 in the customer's workspace and lets Fabric schedule and run it. No customer row passes
 through anything we operate, the customer's own capacity pays for the compute, and the
 sync is a notebook they can read rather than a connector they must trust.
 
 The reasoning, and what it costs us, is in
 [`docs/WORKLOAD.md` §1](../docs/WORKLOAD.md).
+

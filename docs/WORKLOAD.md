@@ -64,7 +64,8 @@ flowchart LR
   subgraph Ours["asmDB Cloud (ours)"]
     BE["Workload backend<br/>token broker"]
     CP["Control plane<br/>/api/v1/*"]
-    SC["Instance sidecar<br/>/v1/cdc"]
+    GW["CDC gateway<br/>read-only mount<br/>not in the public API"]
+    SC["Instance sidecar<br/>unchanged"]
     ENG(["asmdb engine<br/>.dat / .wal / .cdc"])
   end
 
@@ -72,7 +73,9 @@ flowchart LR
   BE -->|"list databases"| CP
   UI -->|"create notebook / schedule"| NB
   SCH --> NB
-  NB -->|"GET /v1/cdc?from=seq<br/>scoped read token"| SC
+  NB -->|"secret via managed identity"| KV[["Azure Key Vault"]]
+  NB -->|"GET /cdc/{id}?from=seq"| GW
+  GW -.->|"read-only"| ENG
   SC --- ENG
   NB -->|"MERGE"| LH
   NB -->|"report watermark"| BE
@@ -80,7 +83,7 @@ flowchart LR
 
   classDef ours fill:#0e1726,stroke:#3ABB9F,color:#dfe7f5
   classDef fab fill:#141024,stroke:#8b5cf6,color:#dfe7f5
-  class BE,CP,SC,ENG ours
+  class BE,CP,SC,ENG,GW,KV ours
   class UI,NB,LH,SCH fab
 ```
 
@@ -92,97 +95,146 @@ flowchart LR
 | **Workload backend** | new | `workload/backend/` | Token broker only. Exchanges the Fabric user's token for an asmDB Cloud call, and mints short-lived read-only CDC tokens for notebooks. |
 | **Notebook templates** | new | `workload/notebooks/` | The PySpark that reads CDC and merges into Delta. Generated per link, owned by the customer once created. |
 | **Manifest + packaging** | new | `workload/manifest/`, `workload/build/` | `WorkloadManifest.xml`, `Product.json`, item manifests, `.nuspec`. |
-| **CDC feed** | **new, in asmDB** | `saas/sidecar/` | `GET /v1/cdc` — does not exist today. See §3. |
-| **CDC scope tokens** | **new, in asmDB** | `saas/controlplane/` | A read-only credential that can read change frames and nothing else. |
+| **CDC gateway** | **new** | `workload/cdc-gateway/` | Reads `<db>.cdc` from a read-only mount and serves frames. Not exposed in the public API. See §3. |
+| **Watermark registry** | **new** | `saas/controlplane/` | Records the acknowledged watermark per link and advances `CDCTRIM` only on it. |
 | Engine | unchanged | `src/` | Already writes the change log we need. |
 
 ### 2.2 Where state lives
 
-Sync-link definitions live in the **workload item's own OneLake folder** (`Files/links.json`),
-not in a database of ours. The toolkit supports this natively and it means:
+Sync-link definitions and **lineage** live in the **workload item's own OneLake folder**
+(`Files/`), not in a database of ours. The toolkit supports this natively and it means:
 
 - the customer's configuration lives in the customer's tenant, which is where it belongs;
 - deleting the item deletes the configuration, with no orphaned rows on our side;
 - we do not operate a second datastore.
 
-The **watermark** — how far a lakehouse has consumed — lives in the Delta table's own
-properties, written by the notebook in the same transaction as the data. That is the
-only way it can be correct: a watermark stored anywhere else can disagree with the data
-after a failure. See §4.3.
+**Lineage is applicational and we store it ourselves.** Fabric does not document a way
+for a custom workload to contribute lineage edges (§5), so the edges shown in the
+mockup — *this asmDB database feeds that lakehouse table* — are facts we know and
+nobody else does. They are written to `Files/lineage/` as the links are created and
+read back when the item is opened, so the graph is there immediately rather than
+rebuilt by probing every database on every load. Practically:
+
+```
+{workspaceId}/{itemId}/Files/
+├── links.json            one entry per sync link: source, target, decoder, schedule
+├── lineage/
+│   ├── graph.json        nodes and edges, with the run that last proved each edge
+│   └── history/          append-only snapshots, so a lineage change is auditable
+└── runs/                 recent run outcomes, for the activity panel
+```
+
+Writing lineage down rather than deriving it also survives the case that matters: an
+asmDB database that has been deleted, or a lakehouse the caller can no longer see. The
+edge still existed, and a lineage view that forgets deleted things is not a lineage
+view.
+
+The **watermark** — how far a lakehouse has consumed — is the exception. It lives in the
+Delta table's own properties, written by the notebook in the same transaction as the
+data. That is the only place it can be correct; see §4.5.
 
 ---
 
-## 3. The gap in asmDB, and what has to be built
+## 3. Reading the change log without touching the SaaS
 
 **There is no way to read the change log over HTTP today.** The sidecar exposes
 `/v1/rows`, `/v1/stats`, `/v1/exec` and the rest, and `CDCTRIM` is on the exec
-allowlist — but nothing serves change frames.[^routes] The entire premise of this
-workload depends on that endpoint, so it is the first thing to build and everything
-else is blocked on it.
+allowlist — but nothing serves change frames.[^routes]
 
-[^routes]: `saas/sidecar/http.go` route table as of 1.7.0.
+The obvious move would be to add `GET /v1/cdc` to the sidecar. **We are not doing
+that.** The sidecar is the customer-facing data plane of a transactional database; it
+holds an exclusive lock, it is the thing a paying customer's writes go through, and it
+was the source of three separate correctness defects in the last release. Adding a new
+route to it to serve a *different product* would put analytics traffic on the path of
+transactional writes, and would widen the surface of a component whose job is to be
+small.
 
-### 3.1 What the engine already gives us
+Instead: **a separate CDC gateway that reads the log from the share, read-only.**
 
-The format is genuinely well suited to this, which is why the design is simple.
-From [`docs/CDC.md`](CDC.md):
+```mermaid
+flowchart LR
+  subgraph vol["Azure Files NFS (one share)"]
+    F[("db.dat · db.wal · db.cdc")]
+  end
+  SC["instance sidecar<br/>read-write<br/>unchanged"] --- F
+  GW["CDC gateway<br/>read-only mount<br/>new, workload-only"] -.-> F
+  GW --> BE["workload backend"]
+  BE --> NB["notebook"]
+  classDef n fill:#0e1726,stroke:#3ABB9F,color:#dfe7f5
+  class SC,GW,BE,NB n
+```
 
-- One durable frame per committed transaction, `commit_seq` **strictly increasing and dense**.
-- Each operation is a fixed 272 bytes: `op_type` (1 = UPSERT, 2 = DELETE), `id`, and
-  **the full 256-byte record image**. A consumer never has to query back to resolve an
-  event — which means the notebook needs no read path into the transactional database
-  at all. That is a real security property, not just a convenience.
-- A `RESET` flag marks a global operation (`TRUNCATE`, `RESTORE`, format change).
-- CRC-32 per frame plus a trailer, so a **torn** frame (crash mid-append) is
-  distinguishable from a **corrupt** one.
-- `CDCTRIM <seq>` gives the log a retention policy once a consumer has acknowledged a
-  watermark.
+### 3.1 Why this works, and why it is safe
 
-### 3.2 `GET /v1/cdc` — proposed contract
+- **The format was designed to be followed by another process.** `docs/CDC.md` says so
+  in as many words, and `tests/cdc_dump.py` is a dependency-free reference reader that
+  already does it. We are not inventing a capability; we are deploying the one that
+  exists.
+- **Read-only at the filesystem level, not by policy.** The gateway mounts the share
+  read-only. It is not trusted to behave; it is unable to misbehave.
+- **The engine is untouched.** No new assembly, no new sidecar route, no new lock
+  holder. A bug in the gateway cannot corrupt a database or block a write.
+- **Torn frames are already distinguishable.** Every frame carries a CRC-32 and a
+  trailer, precisely so a reader can tell a crash-truncated tail from real damage. The
+  gateway stops at the last complete frame and comes back later.
+- **It is not in `asmdb.cloud`.** The gateway is deployed with the workload, not with
+  the public API surface. A customer who does not use Fabric never has it in their path.
+
+### 3.2 What the gateway serves
 
 ```
-GET /v1/cdc?from=<seq>&limit=<n>
-Authorization: Bearer <cdc-read token>
+GET /cdc/{instanceId}?from=<seq>&limit=<n>
+Authorization: Bearer <workload backend credential>
 Accept: application/x-ndjson
 ```
 
 ```json
 {"commitSeq":"4211","flags":{"reset":false},"ops":[
-  {"op":"upsert","id":"17850795121213","record":{"id":"...","value":"4","tag":"cdc","content":"...","created":"...","updated":"..."}},
+  {"op":"upsert","id":"17850795121213","record":{"id":"...","value":"7240172205118292613","tag":"cdc","content":"...","created":"...","updated":"..."}},
   {"op":"delete","id":"17850795121200"}
 ]}
 ```
 
-Design points that are **not** negotiable, because getting them wrong corrupts a
-customer's warehouse silently:
+Rules that are **not** negotiable, because getting them wrong corrupts a customer's
+warehouse silently:
 
-1. **`from` below the log's base sequence must be an explicit, named error**, not an
-   empty result. If the log has been trimmed past what the consumer asked for, the
-   consumer has a hole. It must be told `cdc_gap`, with the current `baseSeq`, so the
-   notebook can fall back to a full reseed. An empty 200 here would look like "nothing
-   changed" and the lakehouse would quietly diverge from the database forever.
-2. **A frame is either complete or absent.** Never serve a partial frame at the tail.
-3. **`RESET` must be visible to the consumer**, because it means "everything you know is
-   wrong, start again".
-4. **Bounded response.** `limit` is capped server-side; the consumer pages by watermark.
-5. **Read-only.** This endpoint must not accept the instance token — see §3.3.
+1. **`from` below the log's base sequence is a named error, never an empty page.**
+   `CDCTRIM` is a retention policy; once it has run, a consumer asking for a trimmed
+   sequence has a hole. It must be told `cdc_gap` with the current `baseSeq` so the
+   notebook can reseed. An empty `200` here would read as "nothing changed" and the
+   lakehouse would diverge from the database quietly and permanently. **This is the
+   single most important line in the design.**
+2. **Never serve a partial frame.** Stop at the last valid trailer.
+3. **`RESET` must reach the consumer.** It means "everything you knew is void".
+4. **Bounded responses.** `limit` capped server-side; consumers page by watermark.
+5. **The gateway never writes.** Not to the share, not to the database, not ever.
 
-### 3.3 A credential that can only read changes
+### 3.3 What asmDB already gives us
 
-Putting a full instance token into a customer's notebook would be indefensible: a
-notebook is a shared, editable, printable artefact, and the instance token can write
-and truncate. The workload needs a **CDC-read scope**: a credential that can call
-`/v1/cdc` and `/v1/stats` and nothing else, is bound to one database, and expires.
+From [`docs/CDC.md`](CDC.md), and the reason this is tractable at all:
 
-This is the same principle already established for `/v1/prepare-upgrade`, where the
-platform token can express exactly one operation and no caller value reaches the
-engine. Extend the pattern rather than invent a second one.
+- One durable frame per committed transaction, `commit_seq` **strictly increasing and
+  dense**.
+- Each operation is a fixed 272 bytes carrying **the full 256-byte record image**, so a
+  consumer never queries back. The notebook needs no read path into the transactional
+  database at all — a real security property, not a convenience.
+- A `RESET` flag for global operations (`TRUNCATE`, `RESTORE`).
+- CRC-32 per frame plus a trailer.
+- `CDCTRIM <seq>` for retention, once a watermark is acknowledged.
 
-Open question for design review: **who holds it?** Options are (a) the notebook fetches
-it at run time from our backend using the workspace's managed identity, (b) it is
-written into a Fabric-managed secret at link creation. (a) is better — nothing
-long-lived is stored anywhere — but it costs a round trip per run and requires the
-managed identity to be known to us. Decide before Phase 3.
+### 3.4 Credentials — resolved
+
+**Decision D1: tokens live in Azure Key Vault and are fetched by the workspace's
+managed identity.** So no long-lived secret is stored in a notebook, and no credential
+is written into an artefact the customer can print or share. The notebook's first cell
+resolves the secret through the managed identity it already runs under; the gateway
+validates it and nothing else can call the gateway.
+
+That also removes the option of putting a *database* token anywhere near a notebook,
+which would have been indefensible: an instance token can write and truncate, and a
+notebook is a shared, editable, printable object.
+
+[^routes]: `saas/sidecar/http.go` route table as of 1.7.0.
 
 ---
 
@@ -195,35 +247,78 @@ database.[^onetable] So a sync link is always *one asmDB database → one Delta 
 The "Target Table Prefix" in the mockup exists because a lakehouse gathers many
 databases: `sales_` + `orders_db` → `sales_orders_db`.
 
-The record layout is fixed, so the Delta schema is known in advance and never has to be
-inferred:
+[^onetable]: `saas/contracts/CONTRACTS.md` §1.
+
+### 4.2 Decoding the value — where the workload earns its keep
+
+A record carries **one 64-bit `value`** ("numeric payload / score", `docs/ENGINE.md` §4).
+Applications routinely pack several fields into those 64 bits: a device id and a
+reading and a set of flags, a fixed-point measurement, a packed timestamp. That is
+sensible in a transactional store, where the row is written and read by the same
+application.
+
+It is useless in a lakehouse. An analyst given a column of `7240172205118292613`
+cannot group by sensor, filter by flag, or average a reading.
+
+So a sync link carries a **decoder**: a declaration of how to expand the 64 bits into
+typed Delta columns, applied by the notebook before the merge.
+
+| Decoder | Produces | Use |
+|---|---|---|
+| `raw` | one `long` | the default; no interpretation |
+| `hex` | `string` | opaque identifiers that read better as hex |
+| `bitfield` | one column per declared range | packed sensor frames, flag sets |
+| `fixed-point` | `decimal(p,s)` | a scaled integer that is really a measurement |
+| `packed-timestamp` | `timestamp` | epoch or custom-epoch integers |
+| `ieee754` | `double` | a float shipped through an integer column |
+
+The `bitfield` decoder is the interesting one, and the mockup shows it: the user
+declares ranges (`sensor_id` bits 0–15, `status_flags` 16–23, `reading` 24–47 as
+`decimal(10,2)`, `checksum` 48–63) and the Delta table gains four real columns.
+
+Three rules keep this honest:
+
+1. **The raw value is always kept**, as `value_raw`. A decoder is an interpretation, and
+   interpretations turn out to be wrong. Discarding the source would make that
+   unrecoverable.
+2. **A decoder that fails does not drop the row.** It writes the raw value and marks
+   `_decode_error`. Silently discarding rows that do not fit an assumption is how a
+   warehouse ends up quietly incomplete.
+3. **Changing a decoder requires a reseed**, because existing rows were decoded under
+   the old declaration. The UI must say so before it lets the change through.
+
+### 4.3 The resulting Delta schema
+
+Fixed columns, plus whatever the decoder adds:
 
 | Delta column | Source | Type |
 |---|---|---|
 | `id` | record `id` | `long` |
-| `value` | record `value` | `long` |
+| `value_raw` | record `value` | `long` |
+| *(decoder columns)* | record `value` | declared |
 | `tag` | record `tag` (39 usable bytes) | `string` |
 | `content` | record `content` (175 usable bytes) | `string` |
 | `created` | record `created` | `timestamp` |
 | `updated` | record `updated` | `timestamp` |
 | `_commit_seq` | frame `commit_seq` | `long` |
-| `_deleted` | derived from op type | `boolean` |
+| `_deleted` | frame op type | `boolean` |
+| `_decode_error` | decoder outcome | `string` |
 | `_synced_at` | notebook run time | `timestamp` |
 
-`_deleted` is carried rather than applied as a physical delete by default, so the
-lakehouse keeps history and a late-arriving reader is not surprised by a vanished row.
-Hard-delete is a per-link option.
+**Decision D4: tombstone by default.** A `DELETE` frame sets `_deleted = true` and
+keeps the row; it does not physically remove it. In analytics, "this order existed and
+was then cancelled" is a fact, not noise, and a physical delete breaks every
+time-travel query over that period. Hard delete stays available per link for customers
+who need it — but it is irreversible, so it is not the default.
 
-[^onetable]: `saas/contracts/CONTRACTS.md` §1.
-
-### 4.2 The notebook, in outline
+### 4.4 The notebook, in outline
 
 ```python
 # 1. resolve the watermark from the Delta table itself
 last_seq = spark.sql(f"DESCRIBE DETAIL {table}").select("properties").first() ... or 0
 
 # 2. pull frames
-resp = GET f"{endpoint}/v1/cdc?from={last_seq + 1}&limit=5000"
+resp = GET f"{gateway}/cdc/{instance_id}?from={last_seq + 1}&limit=5000"
 
 #    a gap means the log was trimmed past us: reseed, do not limp on
 if resp.error == "cdc_gap":
@@ -239,7 +334,7 @@ if any(f.flags.reset for f in frames):
 # 6. acknowledge the watermark so asmDB can CDCTRIM
 ```
 
-### 4.3 Correctness, stated plainly
+### 4.5 Correctness, stated plainly
 
 - **Exactly once is achieved by idempotence, not by delivery guarantees.** The notebook
   may run twice on the same range; `MERGE` on `id` with the full record image makes that
@@ -271,22 +366,27 @@ listed as uncertainties**; they should be resolved before the phase that depends
 | Fabric scheduler support *in the toolkit* | **Marked "under development"** | ⚠️ Use the notebook's own schedule; do not build on the toolkit's job type until it lands. |
 | Custom brand colours | Architecturally supported via `createDarkTheme` | ⚠️ Publishing to the Workload Hub requires Fabric UX compliance; the exact limits are not published. |
 
-**On lineage — read this before building the panel.** The documentation says workload
-items "participate in lineage", but no API, manifest field or SDK method for a custom
-workload to *report* an edge (`this database → that table`) could be found. Until that
-is confirmed with Microsoft, **the "Current Lineage" panel in the mockup is our own
-view of our own links, drawn from our own state** — not an injection into Fabric's
-lineage graph. The mockup is honest about this only if we are: the panel is titled
-"Current Lineage" and shows asmDB→lakehouse edges we know about. It must not imply
-that opening Fabric's lineage view will show the same edges. If it turns out we *can*
-contribute, that is an enhancement, not a redesign.
+**On lineage — resolved by decision, not by API.** The documentation says workload items
+"participate in lineage", but no API, manifest field or SDK method lets a custom
+workload *report* an edge (`this database → that table`). So we store our own:
+`Files/lineage/` in the item's OneLake folder, written when a link is created and read
+when the item opens (§2.2). These edges are **applicational** — they are true, they are
+ours, and Fabric's own lineage view will not show them. The UI must therefore never
+imply otherwise: the panel is titled "Current Lineage" and describes asmDB→lakehouse
+links we know about. If Microsoft later exposes a contribution API, publishing to it
+becomes an addition, not a redesign, because the data is already modelled and stored.
 
-**On branding.** Fluent UI v9 takes a 16-shade brand ramp and builds a theme from it.
-Our cyan (`oklch(82% 0.145 205)`) and violet (`oklch(70% 0.19 292)`) can drive that ramp,
-and `theme.onChange` lets us follow the host between light and dark. For a
-tenant-internal workload this is unconstrained. For Workload Hub publication, Fabric UX
-compliance applies and we do not know how strictly — **resolve before Phase 6, not
-after**, because it is much cheaper to constrain a palette than to restyle an app.
+**On scheduling — resolved.** The toolkit's own Fabric-scheduler support is marked
+*under development*, so we do not build on it. A generated notebook is a first-class
+Fabric item and carries its own schedule; that is what drives cadence. It is also what
+the customer already knows how to change, which is worth more than an integration we
+would have to explain.
+
+**On branding — see the D2 warning in Phase 0.** Fluent UI v9 takes a 16-shade brand
+ramp; our cyan and violet can drive it, and `theme.onChange` lets us follow the host
+between light and dark. But we are publishing to the Workload Hub, so Fabric UX
+compliance applies and its limits are unpublished. This is now a scheduling risk, not a
+footnote.
 
 **SkyNav is the working reference for everything mechanical** — manifest shapes, the
 `bootstrap({ initializeWorker, initializeUI })` entry point, token acquisition, JWT
@@ -302,31 +402,48 @@ Seven workstreams. **Scopes are disjoint by directory** so they can run in paral
 without agents overwriting each other — the same discipline used for the 1.7.0 security
 work, where four agents worked simultaneously without a single collision.
 
-### Phase 0 — decisions (blocking, no code)
+### Phase 0 — decisions
 
-| # | Decision | Why it blocks |
-|---|---|---|
-| D1 | CDC token delivery: notebook fetches at run time, or stored secret? | Changes the backend's shape and the notebook's first cell. |
-| D2 | Tenant-internal only, or Workload Hub publication? | Decides whether Fabric UX compliance constrains the palette. |
-| D3 | Default sync cadence and the lag we are willing to promise | The mockup shows ~1.2 s lag; that is a claim, and claims get measured. |
-| D4 | Hard-delete or tombstone by default | Affects schema and every downstream query. |
+**All four are answered.** Recorded here because the rest of the plan depends on them.
 
-### Phase 1 — the CDC feed *(blocks everything else)*
+| # | Decision | Answer | Consequence |
+|---|---|---|---|
+| D1 | How the notebook gets a credential | **Azure Key Vault, fetched by the workspace's managed identity** | No secret is stored in a notebook or in OneLake. The gateway trusts the managed identity, not a copied string. |
+| D2 | Distribution | **Workload Hub publication**, with a custom domain and a manifest upload | Fabric UX compliance now genuinely applies — see the warning below. |
+| D3 | Cadence | **Analytics, not real time.** Minutes, not seconds | The mockup's lag figures are minutes. Do not promise seconds; §7 explains why the number in a screenshot becomes a commitment. |
+| D4 | Deleted rows | **Tombstone by default**, hard delete per link | `_deleted` is carried; history and time travel survive. |
 
-**Workstream A — engine and sidecar.** Scope: `saas/sidecar/`, `tests/`, `docs/CDC.md`.
+> ⚠️ **D2 makes the palette a real risk, not a theoretical one.** Publishing to the
+> Workload Hub requires compliance with the [Fabric UX system](https://aka.ms/fabricux),
+> and the published rules do not say how far a workload may depart from Fabric's own
+> palette. Our brand is a dark navy with a cyan-to-violet accent, and the mockup commits
+> to it. **Get this answered before Phase 4 begins**, not after the surface is built:
+> constraining a palette costs an afternoon, restyling a finished application costs a
+> week. If compliance turns out to be strict, the fallback is a Fabric-native palette
+> with our accent used only for our own marks and states — which is a smaller loss than
+> it sounds, and is a decision better made deliberately than discovered late.
 
-- `GET /v1/cdc?from=&limit=` serving NDJSON frames, bounded, with the `cdc_gap` error.
-- Refuse the instance token; accept only the CDC-read scope.
-- Never serve a torn frame.
-- Tests: gap detection, RESET propagation, torn-tail handling, pagination, cap enforcement, wrong-credential refusal.
+### Phase 1 — the CDC gateway *(blocks everything else)*
 
-**Workstream B — control plane.** Scope: `saas/controlplane/`.
+**Workstream A — gateway.** Scope: `workload/cdc-gateway/`. **Does not touch `src/` or
+`saas/sidecar/`.**
 
-- Mint CDC-read scope tokens: bound to one database, short-lived, revocable.
-- Record which lakehouse consumes which database, and the acknowledged watermark.
-- Advance `CDCTRIM` only on acknowledged watermarks.
+- Mount the instance share **read-only**; parse `<db>.cdc` per [`docs/CDC.md`](CDC.md).
+- `GET /cdc/{instanceId}?from=&limit=` serving NDJSON, bounded.
+- `cdc_gap` when `from` precedes the log's base sequence — never an empty page.
+- Stop at the last complete frame; a torn tail is normal, not an error.
+- Authenticate the workload backend only; refuse everything else.
+- Tests: gap detection, `RESET` propagation, torn-tail handling, pagination, cap
+  enforcement, a log being appended to while it is read, and a log trimmed underneath
+  a reader mid-page.
 
-*Exit criterion: a plain `curl` with a CDC token can page through a live database's change log, and a trimmed log produces `cdc_gap` rather than an empty page.*
+**Workstream B — control plane.** Scope: `saas/controlplane/`. Minimal by design.
+
+- Resolve an instance id to its share path and confirm the caller may read it.
+- Record the acknowledged watermark per link and advance `CDCTRIM` only on it.
+- Nothing else. The public API surface does not grow a CDC route.
+
+*Exit criterion: a plain `curl` against the gateway pages through a live database's change log while that database is being written to, and a trimmed log produces `cdc_gap` rather than an empty page.*
 
 ### Phase 2 — the notebook *(depends on Phase 1)*
 
@@ -384,17 +501,17 @@ paid for once:
 - Cost model, in the manner of [`COST.md`](COST.md): whose capacity pays for what, measured rather than estimated.
 - Update `README.md`, `CONTRACTS.md` (new endpoint, new scope), `SECURITY.md` (new credential class).
 
-### Phase 6 — publication *(gated on D2)*
+### Phase 6 — publication
 
-- Fabric UX compliance review if publishing to the Workload Hub.
+- Fabric UX compliance review. **Do this at the start of Phase 4, not here** — by this point the surface is built and a compliance failure is expensive.
 - Tenant settings, capacity enablement, `.nupkg` upload.
 
 ### Dependency graph
 
 ```mermaid
 flowchart TD
-  P0["Phase 0 · decisions"] --> A["A · CDC feed"]
-  P0 --> B["B · scope tokens"]
+  P0["Phase 0 · decisions"] --> A["A · CDC gateway"]
+  P0 --> B["B · watermarks"]
   A --> E["E · notebook"]
   B --> E
   A --> D["D · backend"]
@@ -418,10 +535,11 @@ contract first and let the frontend build against it.
 | Risk | Consequence | Mitigation |
 |---|---|---|
 | **A trimmed log is treated as "no changes"** | A lakehouse silently diverges from the database, indefinitely, and nobody notices until someone reconciles by hand | `cdc_gap` is an explicit error; the notebook reseeds; the UI raises it. This is the single most important correctness rule in the design. |
-| **The CDC token leaks through a shared notebook** | Read access to a customer's transactional data | Scope it to reads, bind it to one database, expire it, prefer run-time fetch over storage |
-| Lineage cannot be contributed to Fabric | The panel is ours alone, less valuable than it looks | Already assumed. Anything better is upside. |
-| Fabric UX compliance forbids our palette | Restyling late | Resolve D2 before Phase 4 |
-| Toolkit scheduler is "under development" | Building on a moving API | Use the notebook's own schedule |
+| **The gateway reads a log while it is being written and trimmed** | Torn frames read as corruption; a trim under a paging reader looks like a gap that is not one | The format was built for this: per-frame CRC and a trailer distinguish a torn tail from damage. Stop at the last complete frame. Re-check `baseSeq` on every page, and treat a mid-page trim as a gap rather than guessing. Test both explicitly. |
+| **A decoder is wrong** | Typed columns are silently meaningless — worse than no decoding, because they look authoritative | Always keep `value_raw`; never drop a row that fails to decode; require a reseed when a decoder changes |
+| **Fabric UX compliance forbids our palette** | Restyling a finished application | **D2 is now "publish to the Hub", so this is live.** Resolve at the start of Phase 4. |
+| Lineage cannot be contributed to Fabric | Our edges are ours alone | Already assumed and designed for: stored in `Files/lineage/`, presented as ours |
+| **The gateway's mount is misconfigured read-write** | A bug in analytics could damage a transactional database | Read-only at the mount, asserted at startup and in a test, not merely intended |
 | A large database's first sync is slow | Bad first impression | Seed from a `BACKUP` snapshot, then tail the log from that watermark |
 | asmDB free tier is 393,216 rows | Analytics on a free-tier database is not interesting | Position for `premium`; the mockup already says "premium databases" |
 
@@ -457,3 +575,5 @@ contract first and let the frontend build against it.
 | [`docs/CDC.md`](CDC.md) | Change log format, sequences, RESET, retention |
 | [`saas/contracts/CONTRACTS.md`](../saas/contracts/CONTRACTS.md) | asmDB Cloud API surface, tiers, one-table-per-database |
 | [`docs/SECURITY.md`](SECURITY.md) | Existing credential classes and the narrow-scope precedent |
+
+

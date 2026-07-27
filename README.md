@@ -30,7 +30,7 @@
 x86-64 assembly — and it is a *real* database, not a demo.
 
 <p align="center">
-  <img src="docs/assets/asmdb-repository-banner.png" alt="asmdb" width="100%">
+  <img src="docs/assets/asmdb-repository-banner.png" alt="asmdb — a tiny transactional engine and a complete data platform: one x86-64 assembly source producing native Windows and Linux binaries, a 256-byte record store with write-ahead logging and change data capture, CLI, MCP server, REST API and clients, asmdb Cloud, and analytical sync into Microsoft Fabric" width="100%">
 </p>
 
 |  | |
