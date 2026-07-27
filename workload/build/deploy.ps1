@@ -41,6 +41,10 @@ $AllowedManifestAssetExtensions = @('.png', '.jpg', '.jpeg')
 $MaxManifestAssetBytes = 1572864
 $PowerBiServiceAppId = '00000009-0000-0000-c000-000000000000'
 $RequiredPowerBiScopes = @('Workspace.Read.All', 'Item.Read.All', 'Item.ReadWrite.All')
+# The Power BI *client* app, which must be preauthorised on the scope this
+# workload exposes. Distinct from the Power BI Service resource app above.
+$PowerBiClientAppId = '871c010f-5e61-4fb1-83ac-98610a7e9110'
+$WorkloadScopeValue = 'FabricWorkloadControl'
 
 $ManifestRoot = Join-Path $RepoRoot 'workload\manifest'
 $ItemsRoot = Join-Path $ManifestRoot 'items'
@@ -99,6 +103,23 @@ function Invoke-Az {
         [switch]$SkipWhenWhatIf
     )
     Invoke-External 'az' ($ArgumentList + @('--subscription', $SubscriptionId)) $Description -SkipWhenWhatIf:$SkipWhenWhatIf
+}
+
+# Graph bodies always go through a file. Passed inline on Windows they reach
+# az.cmd via cmd.exe, which strips the double quotes, and Graph then reports
+# "Unable to read JSON request payload. Please ensure Content-Type header is
+# set" - blaming a header that was correct all along.
+function Invoke-GraphPatch {
+    param(
+        [string]$ObjectId,
+        [string]$Body,
+        [string]$Description
+    )
+    $file = Join-Path ([IO.Path]::GetTempPath()) ("graph-{0}.json" -f [Guid]::NewGuid())
+    [IO.File]::WriteAllText($file, $Body, (New-Object Text.UTF8Encoding $false))
+    try {
+        Invoke-External 'az' @('rest','--method','PATCH','--uri',"https://graph.microsoft.com/v1.0/applications/$ObjectId",'--headers','Content-Type=application/json','--body',"@$file") $Description
+    } finally { Remove-Item $file -Force -ErrorAction SilentlyContinue }
 }
 
 function Get-ManifestJsonStrings {
@@ -311,12 +332,61 @@ if (Test-Phase 'entra') {
         # Pass the body as a file, not inline. On Windows an inline JSON string
         # reaches az.cmd through cmd.exe, which strips the double quotes, and
         # Graph rejects it with "Unable to read JSON request payload".
-        $bodyFile = Join-Path ([IO.Path]::GetTempPath()) ("entra-patch-{0}.json" -f [Guid]::NewGuid())
-        [IO.File]::WriteAllText($bodyFile, $body, (New-Object Text.UTF8Encoding $false))
-        try {
-            Invoke-External 'az' @('rest','--method','PATCH','--uri',"https://graph.microsoft.com/v1.0/applications/$objectId",'--headers','Content-Type=application/json','--body',"@$bodyFile") 'Patch SPA redirects and Power BI delegated permissions'
-        } finally { Remove-Item $bodyFile -Force -ErrorAction SilentlyContinue }
+        Invoke-GraphPatch -ObjectId $objectId -Body $body -Description 'Patch SPA redirects and Power BI delegated permissions'
         Invoke-External 'az' @('ad','app','permission','admin-consent','--id',$AppId) 'Grant admin consent for Power BI delegated permissions'
+
+        # Fabric cannot call the workload unless the app exposes a scope and
+        # preauthorises Power BI. These have to be two separate PATCH calls:
+        # a scope cannot be preauthorised in the same request that creates it,
+        # and Graph rejects the combined body with "has a Permission Id that
+        # cannot be found in the AppPermissions sets".
+        $existingScope = az ad app show --id $AppId --query "api.oauth2PermissionScopes[?value=='$WorkloadScopeValue'].id | [0]" -o tsv
+        $scopeId = if ($existingScope) { $existingScope } else { [Guid]::NewGuid().ToString() }
+        if (-not $existingScope) {
+            $scopeBody = @{ api = @{ oauth2PermissionScopes = @(@{
+                id = $scopeId; value = $WorkloadScopeValue; type = 'User'; isEnabled = $true
+                adminConsentDisplayName = 'asmDB Analytical workload control'
+                adminConsentDescription = 'Allows Fabric to call the asmDB Analytical workload on behalf of the signed-in user.'
+                userConsentDisplayName  = 'asmDB Analytical workload control'
+                userConsentDescription  = 'Allows Fabric to call the asmDB Analytical workload on your behalf.'
+            }) } } | ConvertTo-Json -Depth 10
+            Invoke-GraphPatch -ObjectId $objectId -Body $scopeBody -Description 'Expose the workload OAuth2 scope'
+        }
+        $preAuthBody = @{ api = @{ preAuthorizedApplications = @(@{
+            appId = $PowerBiClientAppId; delegatedPermissionIds = @($scopeId)
+        }) } } | ConvertTo-Json -Depth 10
+        Invoke-GraphPatch -ObjectId $objectId -Body $preAuthBody -Description 'Preauthorise Microsoft Power BI on the exposed scope'
+
+        # The app registration alone is not enough: without a service principal
+        # the tenant has no object to consent to or assign roles on.
+        $sp = az ad sp show --id $AppId --query id -o tsv 2>$null
+        if (-not $sp) { Invoke-External 'az' @('ad','sp','create','--id',$AppId) 'Create the service principal' }
+        else { Write-Ok "Service principal already exists ($sp)" }
+
+        # Federated credential so the backend authenticates to Entra as a
+        # confidential client using its managed identity, with no stored secret.
+        # Skipped when the backend is not yet provisioned; rerun this phase after
+        # the infrastructure phase to add it.
+        $backendPrincipal = az webapp identity show --resource-group $ResourceGroup --name $BackendAppName --subscription $SubscriptionId --query principalId -o tsv 2>$null
+        if ($backendPrincipal) {
+            $existingFic = az rest --method GET --uri "https://graph.microsoft.com/v1.0/applications/$objectId/federatedIdentityCredentials" --query "value[?subject=='$backendPrincipal'] | [0].id" -o tsv 2>$null
+            if ($existingFic) { Write-Ok 'Federated credential for the backend managed identity already exists' }
+            else {
+                $ficBody = @{
+                    name = 'asmdb-backend-mi'
+                    issuer = "https://login.microsoftonline.com/$resolvedTenant/v2.0"
+                    subject = $backendPrincipal
+                    audiences = @('api://AzureADTokenExchange')
+                    description = 'asmDB Analytical backend App Service managed identity'
+                } | ConvertTo-Json -Depth 5
+                $ficFile = Join-Path ([IO.Path]::GetTempPath()) ("entra-fic-{0}.json" -f [Guid]::NewGuid())
+                [IO.File]::WriteAllText($ficFile, $ficBody, (New-Object Text.UTF8Encoding $false))
+                try { Invoke-External 'az' @('rest','--method','POST','--uri',"https://graph.microsoft.com/v1.0/applications/$objectId/federatedIdentityCredentials",'--headers','Content-Type=application/json','--body',"@$ficFile") 'Add federated credential for the backend managed identity' }
+                finally { Remove-Item $ficFile -Force -ErrorAction SilentlyContinue }
+            }
+        } else {
+            Write-Warn "Backend managed identity not found; run -Only infrastructure first, then rerun -Only entra to add the federated credential."
+        }
     }
     $FrontendUrl = if ($FrontendUrl) { $FrontendUrl } else { "https://$CustomDomain" }
     Set-WorkloadManifestValues -ResolvedAppId $AppId -ResolvedFrontendUrl $FrontendUrl

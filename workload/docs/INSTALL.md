@@ -12,10 +12,31 @@ The goal is one uploadable file and no guesswork: `workload\build\pack.ps1` buil
 | Value | Current value | Where it must match | Failure if wrong |
 |---|---|---|---|
 | Workload name | `Org.AsmdbAnalytical` | workload manifest, item manifest, Entra redirect URIs, frontend workload constants | Authentication or navigation silently targets the wrong workload. |
-| Item editor path | `/sync-hub` | `workload/manifest/items/SyncHub/SyncHubItem.json` and `workload/frontend/src/routes.ts` `SYNC_HUB_EDITOR_PATH` | Fabric opens a blank editor panel. |
+| Item editor path | `/sync-hub` | `workload/manifest/items/SyncHub/SyncHubItem.json` and `workload/frontend/src/workload-constants.ts` `SYNC_HUB_EDITOR_PATH` | Fabric opens a blank editor panel. |
 | Frontend dev port | `60006` | Vite dev server and localhost redirect URI `http://localhost:60006/close` | Local sign-in callback never closes. |
 | Azure subscription | `<subscription-id>` | `deploy.ps1 -SubscriptionId` and verification commands | Resources are checked or created in the wrong subscription. |
 | Analytics resource group | `<analytics-resource-group>` in `swedencentral` | `deploy.ps1 -ResourceGroup`; never `<service-resource-group>` | The workload is no longer isolated from asmDB Cloud. |
+
+## What is already deployed
+
+The reference environment is provisioned. These are the real values; substitute your own when installing into a different tenant.
+
+| Component | Value | Verified by |
+|---|---|---|
+| Verified Entra domain | `asmdb.cloud` | `az rest --url https://graph.microsoft.com/v1.0/domains` |
+| Entra app (multitenant) | `<workload-app-id>` | `az ad app show --id …` |
+| Application ID URI | `https://workload.asmdb.cloud/fe/be/Org.AsmdbAnalytical/1` | same |
+| Exposed scope | `FabricWorkloadControl`, Power BI `871c010f-5e61-4fb1-83ac-98610a7e9110` preauthorised | same |
+| Federated credential | subject `<backend-mi-principal-id>` (backend managed identity), audience `api://AzureADTokenExchange` | `…/federatedIdentityCredentials` |
+| Key Vault | `<key-vault-name>`, **RBAC authorisation enabled** | `az keyvault show` |
+| Key Vault grant | workspace identity `<fabric-workspace-name>` / `<workspace-identity-object-id>` → **Key Vault Secrets User** | `az role assignment list --scope <vault>` |
+| Backend | `https://asmdb-analytical-backend.azurewebsites.net` | `/health` returns `{"status":"ok","version":"0.1.0"}` |
+| Frontend | `https://fe.asmdb.cloud` | `/`, `/sync-hub` and `/close` all return 200 over HTTPS |
+
+Two things are deliberately **not** deployed:
+
+- **The CDC gateway.** It reads a read-only mount of the Azure Files share that asmDB Cloud instances write to, so it belongs in `<service-resource-group>` alongside the service, not in the analytics group.
+- **Real support links.** Three still read `REPLACE-ME`, and the three GitHub links resolve only while the repository is private. Neither blocks a tenant-internal install; both block Workload Hub submission.
 
 ## Decisions to make before first upload
 
@@ -202,23 +223,75 @@ How to know it worked: the app registration shows the verified publisher badge.
 
 Failure looks like: cross-tenant Workload Hub publication is blocked even though internal tenant testing works.
 
-### 2.5 Deploy hosting under the verified domain
+### 2.5 Point DNS at the frontend, then attach the custom domain
 
-Portal path: **Azure Portal** → the Static Web App or hosting resource in `<analytics-resource-group>` → **Custom domains** → add `fe.asmdb.cloud`.
+Two steps in a fixed order: the DNS record must exist and resolve *before* Azure will accept the hostname, because attaching it triggers a validation that reads DNS.
 
-CLI equivalent depends on the hosting resource type. For Azure Static Web Apps, use:
+#### 2.5.1 Create the CNAME at the DNS provider
+
+`asmdb.cloud` is hosted at **OVH**, not Azure DNS, so this record cannot be created with `az`. In the OVH control panel, under the `asmdb.cloud` zone:
+
+| Field | Value |
+|---|---|
+| Type | `CNAME` |
+| Sub-domain | `fe` |
+| Target | `<static-web-app>.azurestaticapps.net` (for this deployment, `<static-web-app>.7.azurestaticapps.net`) |
+| TTL | 3600 |
+
+Find the target with:
+
+```powershell
+az staticwebapp show `
+  --subscription <subscription-id> `
+  --resource-group <analytics-resource-group> `
+  --name asmdb-analytical-frontend `
+  --query defaultHostname -o tsv
+```
+
+Confirm it has propagated before continuing, querying a public resolver rather than your own cache:
+
+```powershell
+Resolve-DnsName -Name fe.asmdb.cloud -Type CNAME -Server 8.8.8.8
+```
+
+The answer must show `NameHost` equal to the Static Web App hostname. **Only one label may precede `asmdb.cloud`** — see the domain rule above; `fe.workload` is two and Fabric rejects it at upload.
+
+#### 2.5.2 Attach the hostname to the Static Web App
 
 ```powershell
 az staticwebapp hostname set `
   --subscription <subscription-id> `
   --resource-group <analytics-resource-group> `
-  --name "<static-web-app-name>" `
+  --name asmdb-analytical-frontend `
   --hostname "fe.asmdb.cloud"
 ```
 
-How to know it worked: `https://fe.asmdb.cloud/` resolves and serves the frontend, and `https://fe.asmdb.cloud/close` resolves for the auth close page.
+This is not instant. The hostname moves through `RetrievingValidationToken` → `Validating` → `Adding` → `Ready`, taking roughly five minutes in practice, and Azure issues a managed TLS certificate along the way. Poll it rather than assuming:
 
-Failure looks like: the manifest points to `*.azurestaticapps.net`, `*.azurecontainerapps.io`, or `*.onmicrosoft.com`; `pack.ps1` fails the frontend-domain preflight.
+```powershell
+az staticwebapp hostname list `
+  --subscription <subscription-id> `
+  --resource-group <analytics-resource-group> `
+  --name asmdb-analytical-frontend `
+  --query "[].{name:name,status:status}" -o table
+```
+
+**How to know it worked:** the status reads `Ready`, and all three routes answer 200 over HTTPS:
+
+```powershell
+foreach ($p in '/','/sync-hub','/close') {
+  (Invoke-WebRequest "https://fe.asmdb.cloud$p" -TimeoutSec 30).StatusCode
+}
+```
+
+`/sync-hub` matters as much as `/`. It exercises the static-host fallback: without it Fabric navigates the editor iframe to a path the host does not serve and the panel renders blank with nothing in the console.
+
+**Failure looks like:**
+
+- the hostname sticks at `Validating` — the CNAME is missing, wrong, or not yet propagated. Re-run the `Resolve-DnsName` check against an external resolver;
+- HTTPS fails while HTTP works — the managed certificate has not finished issuing. Wait for `Ready`;
+- `/` returns 200 but `/sync-hub` returns 404 — the fallback configuration did not ship. Confirm `staticwebapp.config.json` is present in the deployed output;
+- the manifest still points at `*.azurestaticapps.net`, `*.azurecontainerapps.io` or `*.onmicrosoft.com` — `pack.ps1` fails the frontend-domain preflight before producing a package.
 
 ## 3. Verify the isolated Azure resource group
 
