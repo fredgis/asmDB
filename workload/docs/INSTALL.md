@@ -25,7 +25,7 @@ The reference environment is provisioned. These are the real values; substitute 
 |---|---|---|
 | Verified Entra domain | `asmdb.cloud` | `az rest --url https://graph.microsoft.com/v1.0/domains` |
 | Entra app (multitenant) | `<workload-app-id>` | `az ad app show --id …` |
-| Application ID URI | `https://workload.asmdb.cloud/fe/be/Org.AsmdbAnalytical/1` | same |
+| Application ID URI | `https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1` | same |
 | Exposed scope | `FabricWorkloadControl`, Power BI `871c010f-5e61-4fb1-83ac-98610a7e9110` preauthorised | same |
 | Federated credential | subject `<backend-mi-principal-id>` (backend managed identity), audience `api://AzureADTokenExchange` | `…/federatedIdentityCredentials` |
 | Key Vault | `<key-vault-name>`, **RBAC authorisation enabled** | `az keyvault show` |
@@ -125,7 +125,7 @@ For asmDB the verified domain is `asmdb.cloud`, so use this shape:
 verified domain   asmdb.cloud
 frontend          https://fe.asmdb.cloud/
 redirect URI      https://fe.asmdb.cloud/close
-App ID URI        https://workload.asmdb.cloud/fe/be/Org.AsmdbAnalytical/1
+App ID URI        https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1
 ```
 
 `fe.workload.asmdb.cloud` looks reasonable and is **rejected**, because two labels sit between the host and the verified domain. The upload fails with:
@@ -134,7 +134,7 @@ App ID URI        https://workload.asmdb.cloud/fe/be/Org.AsmdbAnalytical/1
 Frontend Uri domain workload.asmdb.cloud is not in the tenant domains list
 ```
 
-That message names a host nobody configured — `workload.asmdb.cloud` is simply what remains after Fabric removes `fe`. If you see a domain you never typed, this is why. The packaging preflight now enforces the same rule, so the failure happens locally rather than at upload.
+That message names a host nobody configured — `asmdb.cloud` is simply what remains after Fabric removes `fe`. If you see a domain you never typed, this is why. The packaging preflight now enforces the same rule, so the failure happens locally rather than at upload.
 
 A default Azure hostname such as `*.azurestaticapps.net` or `*.azurecontainerapps.io` does **not** satisfy the Fabric publishing requirement. The hosting resource must have a custom domain under `asmdb.cloud` before packaging for upload.
 
@@ -196,7 +196,7 @@ Portal path: **App registrations** → **asmDB Analytical Capabilities** → **E
 Value:
 
 ```text
-https://workload.asmdb.cloud/fe/be/Org.AsmdbAnalytical/1
+https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1
 ```
 
 CLI equivalent:
@@ -204,10 +204,10 @@ CLI equivalent:
 ```powershell
 az ad app update `
   --id "<app-id>" `
-  --identifier-uris "https://workload.asmdb.cloud/fe/be/Org.AsmdbAnalytical/1"
+  --identifier-uris "https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1"
 ```
 
-How to know it worked: the Application ID URI begins with `https://workload.asmdb.cloud/` and contains the current workload id.
+How to know it worked: the Application ID URI begins with `https://asmdb.cloud/` and contains the current workload id.
 
 Failure looks like: an `api://...` URI or an Azure-assigned/default domain remains. That does not satisfy the documented Fabric publishing requirement.
 

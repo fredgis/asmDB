@@ -24,7 +24,7 @@ param(
     [string]$AppServicePlan = 'plan-asmdb-analytical',
     [string]$BackendAppName = 'asmdb-analytical-backend',
     [string]$StaticWebAppName = 'asmdb-analytical-frontend',
-    [string]$CustomDomain = 'REPLACE-ME.fe.workload.asmdb.cloud',
+    [string]$CustomDomain = 'fe.asmdb.cloud',
     [string]$EntraAppName = 'asmDB Analytical Capabilities',
     [string]$TenantId = '',
     [string]$AppId = '',
