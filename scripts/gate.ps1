@@ -158,6 +158,12 @@ function Get-GateScope {
 
     $changed = @()
     $known = $false
+    # git writes progress and hints to stderr, and this script runs with
+    # $ErrorActionPreference = 'Stop', under which a native command's stderr
+    # becomes a terminating error. That turned every detection into the "cannot
+    # tell" fallback and quietly ran the full suite every time.
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         # What this push would add to the remote, plus anything uncommitted.
         # `git diff` returning nothing is a *fact* (nothing changed), not a
@@ -177,6 +183,8 @@ function Get-GateScope {
         $known = $true
     } catch {
         $known = $false
+    } finally {
+        $ErrorActionPreference = $previousEap
     }
 
     if (-not $known) {
