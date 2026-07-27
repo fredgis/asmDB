@@ -1,5 +1,5 @@
 import type { WorkloadClientAPI } from "@ms-fabric/workload-client";
-import { authHeaders, getFabricToken } from "./auth-helper";
+import { authHeaders, invalidateFabricToken } from "./auth-helper";
 import { API_BASE, DependencyError } from "./api";
 import type { LakehouseInfo, LoadIssue } from "@/types/workload";
 
@@ -83,12 +83,7 @@ async function parseLakehouseFailure(response: Response): Promise<LoadIssue> {
   return { dependency: "fabric", code, message: payload?.message ?? defaultMessage };
 }
 
-export async function fetchLakehouses(workloadClient: WorkloadClientAPI | null, workspaceId: string): Promise<LakehouseInfo[]> {
-  const token = await getFabricToken(workloadClient);
-  if (!token) {
-    throw new DependencyError({ dependency: "identity", code: "token_unavailable", message: "Could not acquire the workload token to ask the backend for lakehouses." });
-  }
-
+export async function fetchLakehouses(token: string, workspaceId: string): Promise<LakehouseInfo[]> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE}/api/lakehouses?workspaceId=${encodeURIComponent(workspaceId)}`, {
@@ -98,7 +93,9 @@ export async function fetchLakehouses(workloadClient: WorkloadClientAPI | null, 
     throw new DependencyError({ dependency: "backend", message: `Lakehouse request could not reach the backend: ${error instanceof Error ? error.message : String(error)}` });
   }
 
+  if (response.status === 401) invalidateFabricToken();
   if (!response.ok) throw new DependencyError(await parseLakehouseFailure(response));
   const payload = (await response.json()) as { lakehouses?: LakehouseInfo[] };
   return payload.lakehouses ?? [];
 }
+

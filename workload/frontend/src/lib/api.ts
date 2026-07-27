@@ -1,5 +1,4 @@
-import type { WorkloadClientAPI } from "@ms-fabric/workload-client";
-import { authHeaders, getFabricToken } from "./auth-helper";
+import { authHeaders, invalidateFabricToken } from "./auth-helper";
 import type { DatabaseInfo, LoadIssue } from "@/types/workload";
 
 export const API_BASE = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? "" : "https://asmdb-analytical-backend.azurewebsites.net");
@@ -22,19 +21,22 @@ async function parseFailure(response: Response, fallback: string): Promise<LoadI
   } catch {
     payload = null;
   }
+  if (response.status === 401) invalidateFabricToken();
+
   const code = payload?.errorCode ?? payload?.code ?? String(response.status);
   const message = payload?.message ?? fallback;
-  const lowered = code.toLowerCase();
-  const dependency = lowered.includes("identity") || lowered.includes("obo") || lowered.includes("consent") || response.status === 401 || response.status === 403
-    ? "identity"
-    : lowered.includes("asmdb") || lowered.includes("cloud")
-      ? "asmdb-cloud"
-      : "backend";
+  const lowered = `${payload?.dependency ?? ""} ${code}`.toLowerCase();
+  const dependency = lowered.includes("asmdb") || lowered.includes("cloud")
+    ? "asmdb-cloud"
+    : lowered.includes("fabric")
+      ? "fabric"
+      : lowered.includes("identity") || lowered.includes("obo") || lowered.includes("consent") || response.status === 401
+        ? "identity"
+        : "backend";
   return { dependency, code, message };
 }
 
-export async function fetchHealth(workloadClient: WorkloadClientAPI | null): Promise<{ status: string; version?: string }> {
-  const token = await getFabricToken(workloadClient);
+export async function fetchHealth(token: string): Promise<{ status: string; version?: string }> {
   let response: Response;
   try {
     response = await fetch(url("/health"), { headers: authHeaders(token) });
@@ -45,8 +47,7 @@ export async function fetchHealth(workloadClient: WorkloadClientAPI | null): Pro
   return response.json() as Promise<{ status: string; version?: string }>;
 }
 
-export async function fetchDatabases(workloadClient: WorkloadClientAPI | null): Promise<DatabaseInfo[]> {
-  const token = await getFabricToken(workloadClient);
+export async function fetchDatabases(token: string): Promise<DatabaseInfo[]> {
   let response: Response;
   try {
     response = await fetch(url("/api/databases"), { headers: authHeaders(token) });
@@ -58,8 +59,7 @@ export async function fetchDatabases(workloadClient: WorkloadClientAPI | null): 
   return (payload.databases ?? []).filter((database) => database.tier === "premium");
 }
 
-export async function previewCdc(workloadClient: WorkloadClientAPI | null, instanceId: string): Promise<unknown> {
-  const token = await getFabricToken(workloadClient);
+export async function previewCdc(token: string, instanceId: string): Promise<unknown> {
   let response: Response;
   try {
     response = await fetch(url(`/api/cdc/${encodeURIComponent(instanceId)}/preview?limit=20`), { headers: authHeaders(token) });
@@ -69,4 +69,3 @@ export async function previewCdc(workloadClient: WorkloadClientAPI | null, insta
   if (!response.ok) throw new DependencyError(await parseFailure(response, "CDC preview failed."));
   return response.json();
 }
-

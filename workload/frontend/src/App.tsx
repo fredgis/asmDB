@@ -4,6 +4,7 @@ import type { OptionOnSelectData, SelectionEvents } from "@fluentui/react-compon
 import { useWorkloadClient } from "./context/WorkloadContext";
 import { DependencyError, fetchDatabases, fetchHealth, previewCdc } from "./lib/api";
 import { fetchLakehouses, resolveWorkspaceId } from "./lib/fabric";
+import { getFabricToken } from "./lib/auth-helper";
 import { byteLength, CONTENT_LIMIT_BYTES, decodeSample } from "./lib/decoder";
 import { graphFromLinks, loadLinks, saveLineage, saveLinks } from "./lib/onelake";
 import type { DatabaseInfo, DecoderMode, LakehouseInfo, LinkState, LoadIssue, Loadable, RequestState, RunRecord, SyncLink } from "./types/workload";
@@ -122,30 +123,45 @@ function App() {
     setLakehouses((current) => ({ ...current, state: "checking" }));
     setLinks((current) => ({ ...current, state: "checking" }));
 
-    try {
-      const health = await fetchHealth(workloadClient);
-      setConnection({ state: "ready", data: health, updatedAt: new Date() });
-    } catch (error) {
-      setConnection({ state: "failed", data: {}, issue: issueFrom(error, { dependency: "backend", message: "Backend health check failed." }) });
-    }
+    const token = await getFabricToken(workloadClient);
+    const tokenIssue: LoadIssue = {
+      dependency: "identity",
+      code: "token_unavailable",
+      message: "Could not acquire the workload token. Sign in to Fabric again or check consent for the workload application.",
+    };
 
-    try {
-      const premiumDatabases = await fetchDatabases(workloadClient);
-      setDatabases({ state: premiumDatabases.length ? "ready" : "no-data", data: premiumDatabases, updatedAt: new Date() });
-      setSourceId((current) => current && premiumDatabases.some((database) => database.id === current) ? current : premiumDatabases[0]?.id ?? "");
-    } catch (error) {
-      setDatabases({ state: "failed", data: [], issue: issueFrom(error, { dependency: "asmdb-cloud", message: "Could not list premium asmDB databases." }) });
+    if (!token) {
+      setConnection({ state: "failed", data: {}, issue: tokenIssue });
+      setDatabases({ state: "failed", data: [], issue: tokenIssue });
+      setLakehouses({ state: "failed", data: [], issue: tokenIssue });
       setSourceId("");
-    }
-
-    try {
-      const workspaceId = await resolveWorkspaceId(workloadClient);
-      const workspaceLakehouses = await fetchLakehouses(workloadClient, workspaceId);
-      setLakehouses({ state: workspaceLakehouses.length ? "ready" : "no-data", data: workspaceLakehouses, updatedAt: new Date() });
-      setTargetId((current) => current && workspaceLakehouses.some((lakehouse) => lakehouse.id === current) ? current : workspaceLakehouses[0]?.id ?? "");
-    } catch (error) {
-      setLakehouses({ state: "failed", data: [], issue: issueFrom(error, { dependency: "fabric", message: "Could not list Fabric lakehouses in this workspace." }) });
       setTargetId("");
+    } else {
+      try {
+        const health = await fetchHealth(token);
+        setConnection({ state: "ready", data: health, updatedAt: new Date() });
+      } catch (error) {
+        setConnection({ state: "failed", data: {}, issue: issueFrom(error, { dependency: "backend", message: "Backend health check failed." }) });
+      }
+
+      try {
+        const premiumDatabases = await fetchDatabases(token);
+        setDatabases({ state: premiumDatabases.length ? "ready" : "no-data", data: premiumDatabases, updatedAt: new Date() });
+        setSourceId((current) => current && premiumDatabases.some((database) => database.id === current) ? current : premiumDatabases[0]?.id ?? "");
+      } catch (error) {
+        setDatabases({ state: "failed", data: [], issue: issueFrom(error, { dependency: "asmdb-cloud", message: "Could not list premium asmDB databases." }) });
+        setSourceId("");
+      }
+
+      try {
+        const workspaceId = await resolveWorkspaceId(workloadClient);
+        const workspaceLakehouses = await fetchLakehouses(token, workspaceId);
+        setLakehouses({ state: workspaceLakehouses.length ? "ready" : "no-data", data: workspaceLakehouses, updatedAt: new Date() });
+        setTargetId((current) => current && workspaceLakehouses.some((lakehouse) => lakehouse.id === current) ? current : workspaceLakehouses[0]?.id ?? "");
+      } catch (error) {
+        setLakehouses({ state: "failed", data: [], issue: issueFrom(error, { dependency: "fabric", message: "Could not list Fabric lakehouses in this workspace." }) });
+        setTargetId("");
+      }
     }
 
     try {
@@ -181,6 +197,9 @@ function App() {
   const activityRows: RunRecord[] = links.data.map((link) => ({ id: link.id, source: link.source, target: link.target, status: link.status, lastRun: link.lastRun, lag: link.lag }));
   const canCreate = Boolean(selectedSource && selectedTarget && links.state !== "failed");
   const connectionBadge = "tint";
+  const headerIssue = connection.state === "failed" ? connection.issue : databases.state === "failed" ? databases.issue : lakehouses.state === "failed" ? lakehouses.issue : links.state === "failed" ? links.issue : undefined;
+  const headerChecking = connection.state === "checking" || databases.state === "checking" || lakehouses.state === "checking" || links.state === "checking";
+  const headerConnected = !headerIssue && !headerChecking && connection.state === "ready";
 
   function onSelect(setter: (value: string) => void) {
     return (_event: SelectionEvents, data: OptionOnSelectData) => {
@@ -231,7 +250,11 @@ function App() {
     setPreviewState("checking");
     setPreviewText("Requesting a bounded CDC preview from the backend.");
     try {
-      const preview = await previewCdc(workloadClient, selectedSource.id);
+      const token = await getFabricToken(workloadClient);
+      if (!token) {
+        throw new DependencyError({ dependency: "identity", code: "token_unavailable", message: "Could not acquire the workload token. Sign in to Fabric again or check consent for the workload application." });
+      }
+      const preview = await previewCdc(token, selectedSource.id);
       const text = JSON.stringify(preview, null, 2);
       const content = firstPreviewSample(preview);
       setSample(content.slice(0, CONTENT_LIMIT_BYTES));
@@ -252,7 +275,7 @@ function App() {
             <div className="productTitle"><h1>asmDB Analytical Capabilities</h1><p>Analytical sync links from premium asmDB databases to Fabric lakehouses in this workspace.</p></div>
           </div>
           <div className="statusCluster">
-            <Badge appearance={connectionBadge} color={connection.state === "ready" ? "success" : connection.state === "checking" ? "brand" : "danger"}>{connection.state === "ready" ? `✓ Connected at ${formatTime(connection.updatedAt)}` : connection.state === "checking" ? "○ Checking dependencies" : `! ${issueText(connection.issue)}`}</Badge>
+            <Badge appearance={connectionBadge} color={headerConnected ? "success" : headerChecking ? "brand" : "danger"}>{headerConnected ? `✓ Connected at ${formatTime(connection.updatedAt)}` : headerChecking ? "○ Checking dependencies" : `! ${issueText(headerIssue)}`}</Badge>
             <Button onClick={() => void refresh()}>Retry</Button>
           </div>
         </header>
@@ -369,5 +392,7 @@ function StateMessage({ state, text }: { state: RequestState; text: string }) {
 }
 
 export default App;
+
+
 
 
