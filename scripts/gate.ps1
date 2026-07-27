@@ -16,7 +16,8 @@
 #>
 [CmdletBinding()]
 param(
-    [switch]$Quick
+    [switch]$Quick,
+    [switch]$Full
 )
 
 $ErrorActionPreference = 'Stop'
@@ -135,6 +136,74 @@ function Get-Go {
     throw 'go.exe not found. Expected C:\Program Files\Go\bin\go.exe or go on PATH.'
 }
 
+# Which suites does this push actually need?
+#
+# Running every suite on every push made a documentation change cost four
+# minutes, which is the fastest way to get a gate bypassed and then removed. A
+# gate nobody runs protects nothing. So the scope is derived from what changed:
+# the engine suites run when the engine changed, the Go suites when Go changed,
+# and a push that only touches Markdown or images runs the cheap structural
+# checks alone.
+#
+# The rule is deliberately conservative. Anything unrecognised turns everything
+# on, and -Full forces the whole suite regardless.
+function Get-GateScope {
+    $scope = [ordered]@{ Engine = $false; Go = $false; Site = $false; Reason = '' }
+
+    if ($Full) {
+        $scope.Engine = $true; $scope.Go = $true; $scope.Site = $true
+        $scope.Reason = '-Full requested'
+        return $scope
+    }
+
+    $changed = @()
+    try {
+        # What this push would add to the remote. Falls back to the working tree
+        # when the branch is not tracked yet.
+        $range = git rev-parse --abbrev-ref '@{upstream}' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $range) {
+            $changed = @(git diff --name-only '@{upstream}...HEAD' 2>$null)
+            $changed += @(git diff --name-only HEAD 2>$null)
+        } else {
+            $changed = @(git diff --name-only HEAD 2>$null)
+        }
+        $changed = $changed | Where-Object { $_ } | Sort-Object -Unique
+    } catch {
+        $changed = @()
+    }
+
+    if (-not $changed -or $changed.Count -eq 0) {
+        $scope.Engine = $true; $scope.Go = $true; $scope.Site = $true
+        $scope.Reason = 'could not determine what changed, so everything runs'
+        return $scope
+    }
+
+    foreach ($f in $changed) {
+        switch -Regex ($f) {
+            '^(src|tests)/'            { $scope.Engine = $true; continue }
+            '^scripts/'                { $scope.Engine = $true; $scope.Go = $true; continue }
+            '^saas/(controlplane|sidecar)/' { $scope.Go = $true; continue }
+            '^site/'                   { $scope.Site = $true; continue }
+            '^workload/'               { $scope.Site = $true; continue }
+            '^(docs|mcp|clients|examples|poc)/' { continue }
+            '\.(md|png|jpg|jpeg|svg|txt|json)$' { continue }
+            '^\.git'                   { continue }
+            default {
+                # Unrecognised path: assume the worst rather than guess.
+                $scope.Engine = $true; $scope.Go = $true; $scope.Site = $true
+            }
+        }
+    }
+
+    $parts = @()
+    if ($scope.Engine) { $parts += 'engine' }
+    if ($scope.Go)     { $parts += 'go' }
+    if ($scope.Site)   { $parts += 'site' }
+    if (-not $parts)   { $parts = @('structural checks only') }
+    $scope.Reason = ("{0} file(s) changed -> {1}" -f $changed.Count, ($parts -join ' + '))
+    return $scope
+}
+
 if ($env:ASMDB_BYPASS_GATE) {
     Write-Host 'ASMDB pre-push gate BYPASSED because ASMDB_BYPASS_GATE is set.' -ForegroundColor Yellow
     Write-Host 'Use only for emergencies; git --no-verify is the other explicit bypass.' -ForegroundColor Yellow
@@ -145,29 +214,36 @@ try {
     Write-Host 'asmdb local gate starting' -ForegroundColor Cyan
     if ($Quick) { Write-Host 'Quick mode: smoke suite and Go vet/test are skipped. Pushes run the full gate.' -ForegroundColor Yellow }
 
+    $scope = Get-GateScope
+    Write-Host ("Scope: {0}" -f $scope.Reason) -ForegroundColor Cyan
+
+    # These are cheap and catch the two mistakes that actually reached a commit:
+    # a broken script and a stray compiled binary. They always run.
     Test-PowerShellSyntax
     Test-NoForbiddenBinaries
 
-    Invoke-GateCommand `
-        -Name 'Build Windows engine' `
-        -Repro '.\scripts\build.ps1' `
-        -FilePath 'powershell' `
-        -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\build.ps1'))
+    if ($scope.Engine) {
+        Invoke-GateCommand `
+            -Name 'Build Windows engine' `
+            -Repro '.\scripts\build.ps1' `
+            -FilePath 'powershell' `
+            -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\build.ps1'))
 
-    Invoke-GateCommand `
-        -Name 'Build Linux engine' `
-        -Repro '.\scripts\build.ps1 -Linux' `
-        -FilePath 'powershell' `
-        -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\build.ps1'), '-Linux')
+        Invoke-GateCommand `
+            -Name 'Build Linux engine' `
+            -Repro '.\scripts\build.ps1 -Linux' `
+            -FilePath 'powershell' `
+            -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\build.ps1'), '-Linux')
 
-    Invoke-GateCommand `
-        -Name 'Validate Linux ELF' `
-        -Repro 'python tests\validate_elf.py build\asmdb' `
-        -FilePath 'python' `
-        -Arguments @((Join-Path $RepoRoot 'tests\validate_elf.py'), (Join-Path $RepoRoot 'build\asmdb')) `
-        -RequiredOutput 'RESULT: ALL OK'
+        Invoke-GateCommand `
+            -Name 'Validate Linux ELF' `
+            -Repro 'python tests\validate_elf.py build\asmdb' `
+            -FilePath 'python' `
+            -Arguments @((Join-Path $RepoRoot 'tests\validate_elf.py'), (Join-Path $RepoRoot 'build\asmdb')) `
+            -RequiredOutput 'RESULT: ALL OK'
+    }
 
-    if (-not $Quick) {
+    if ($scope.Engine -and -not $Quick) {
         $gateTemp = Join-Path $RepoRoot 'build\gate-temp'
         New-Item -ItemType Directory -Force -Path $gateTemp | Out-Null
         $smokeEnv = @{
@@ -186,25 +262,29 @@ try {
             -Environment $smokeEnv
     }
 
-    $go = Get-Go
-    foreach ($module in @('saas\controlplane', 'saas\sidecar')) {
-        $moduleDir = Join-Path $RepoRoot $module
-        $goEnv = @{}
-        if ($module -eq 'saas\controlplane') {
-            $goEnv = @{ ASMDB_PLATFORM_SECRET = 'local-gate-platform-secret' }
-        }
-        Invoke-GateCommand -Name "Go build $module" -Repro "cd $module; go build ./..." -FilePath $go -Arguments @('build', './...') -WorkingDirectory $moduleDir -Environment $goEnv
-        if (-not $Quick) {
-            Invoke-GateCommand -Name "Go vet $module" -Repro "cd $module; go vet ./..." -FilePath $go -Arguments @('vet', './...') -WorkingDirectory $moduleDir -Environment $goEnv
-            Invoke-GateCommand -Name "Go test $module" -Repro "cd $module; go test ./..." -FilePath $go -Arguments @('test', './...') -WorkingDirectory $moduleDir -Environment $goEnv
+    if ($scope.Go) {
+        $go = Get-Go
+        foreach ($module in @('saas\controlplane', 'saas\sidecar')) {
+            $moduleDir = Join-Path $RepoRoot $module
+            $goEnv = @{}
+            if ($module -eq 'saas\controlplane') {
+                $goEnv = @{ ASMDB_PLATFORM_SECRET = 'local-gate-platform-secret' }
+            }
+            Invoke-GateCommand -Name "Go build $module" -Repro "cd $module; go build ./..." -FilePath $go -Arguments @('build', './...') -WorkingDirectory $moduleDir -Environment $goEnv
+            if (-not $Quick) {
+                Invoke-GateCommand -Name "Go vet $module" -Repro "cd $module; go vet ./..." -FilePath $go -Arguments @('vet', './...') -WorkingDirectory $moduleDir -Environment $goEnv
+                Invoke-GateCommand -Name "Go test $module" -Repro "cd $module; go test ./..." -FilePath $go -Arguments @('test', './...') -WorkingDirectory $moduleDir -Environment $goEnv
+            }
         }
     }
 
-    Invoke-GateCommand `
-        -Name 'Console JavaScript syntax' `
-        -Repro 'node --check site\js\console.js' `
-        -FilePath 'node' `
-        -Arguments @('--check', (Join-Path $RepoRoot 'site\js\console.js'))
+    if ($scope.Site) {
+        Invoke-GateCommand `
+            -Name 'Console JavaScript syntax' `
+            -Repro 'node --check site\js\console.js' `
+            -FilePath 'node' `
+            -Arguments @('--check', (Join-Path $RepoRoot 'site\js\console.js'))
+    }
 
     $Total.Stop()
     Write-Host ("`nasmdb local gate passed in {0:n1}s." -f $Total.Elapsed.TotalSeconds) -ForegroundColor Green
@@ -215,3 +295,4 @@ try {
     Write-Host $_.Exception.Message -ForegroundColor Red
     exit 1
 }
+
