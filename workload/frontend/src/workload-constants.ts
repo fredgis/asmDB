@@ -13,6 +13,11 @@ export const SYNC_HUB_EDITOR_PATH = "/sync-hub";
 // Must match the Entra redirect URI path configured for the workload SPA.
 export const CLOSE_REDIRECT_PATH = "/close";
 
+// Must match the Application ID URI on the workload's Entra app, and the
+// scope it exposes. The backend accepts this URI as a token audience.
+export const APP_ID_URI = "https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1";
+export const BACKEND_SCOPE = `${APP_ID_URI}/FabricWorkloadControl`;
+
 export function isKnownFrontendPath(pathname: string): boolean {
   return pathname === "/" || pathname.startsWith(SYNC_HUB_EDITOR_PATH) || pathname.startsWith(CLOSE_REDIRECT_PATH);
 }

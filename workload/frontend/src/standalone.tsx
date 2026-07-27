@@ -6,7 +6,7 @@ export function renderStandalone() {
   if (!root) return;
 
   const fakeWorkloadClient = {
-    auth: { acquireAccessToken: async () => ({ token: undefined }) },
+    auth: { acquireFrontendAccessToken: async () => ({ token: undefined }) },
     theme: {
       get: async () => ({ theme: "light" }),
       onChange: (handler: (theme: unknown) => void) => {

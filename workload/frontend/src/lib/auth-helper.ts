@@ -1,4 +1,5 @@
 import type { WorkloadClientAPI } from "@ms-fabric/workload-client";
+import { BACKEND_SCOPE } from "../workload-constants";
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
 let inFlightToken: Promise<string | undefined> | null = null;
@@ -20,17 +21,22 @@ export async function getFabricToken(
   if (!forceRefresh && isUsableCachedToken() && cachedToken) return cachedToken.token;
   if (!forceRefresh && inFlightToken) return inFlightToken;
 
+  // acquireFrontendAccessToken, not acquireAccessToken. The latter is the WDK
+  // "Remote" method: it asks Fabric to mint a token for the audience declared
+  // in the manifest's AADBEApp/ResourceId. This workload is
+  // HostingType="FERemote", which has no AADBEApp element at all, so Fabric
+  // cannot determine an audience and refuses before contacting Entra - hence
+  // no network request, and the opaque `{error: 2}` in the console, which is
+  // WorkloadAuthError.WorkloadConfigError: "the redirectUri/Audience does not
+  // meet the requirements".
   inFlightToken = workloadClient.auth
-    .acquireAccessToken({
-      additionalScopesToConsent: [],
-      claimsForConditionalAccessPolicy: "",
-    })
-    .then((result) => {
+    .acquireFrontendAccessToken({ scopes: [BACKEND_SCOPE] })
+    .then((result): string | undefined => {
       if (!result?.token) return undefined;
       cachedToken = { token: result.token, expiresAt: expiryMs(result.expiry) };
       return result.token;
     })
-    .catch((error) => {
+    .catch((error: unknown): string | undefined => {
       console.warn("Failed to acquire Fabric access token:", error);
       return undefined;
     })
