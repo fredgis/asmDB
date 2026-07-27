@@ -12,8 +12,8 @@ in **[`docs/WORKLOAD.md`](../docs/WORKLOAD.md)** — read that first.
 
 | Path | Contents |
 |---|---|
-| `mockup/index.html` | The design target. Open it directly in a browser; there is no build step and no server. |
-| `mockup/mockup.css` | Its styles. Brand tokens are copied from `site/css/tokens.css`, which remains the source of truth. |
+| `mockup/index.html` | The design target. Open it directly in a browser; it is self-contained, with no build step and no server. |
+| `mockup/assets/asmdb-logo.png` | The asmdb mark, copied from `site/assets/logo.png`. |
 
 ## What will be here
 

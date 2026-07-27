@@ -389,6 +389,38 @@ literals scattered through components. We are doing the opposite.
 
 ---
 
+## 5b. What the mockup commits us to
+
+[`workload/mockup/index.html`](../workload/mockup/index.html) is the design target.
+Every control on it is a promise, so each is mapped here to the part of the plan that
+has to deliver it. Anything on screen that is not in this table is decoration and can be
+dropped without argument.
+
+| On screen | Plan | Note |
+|---|---|---|
+| Source database · target lakehouse | Workstreams C + D | Databases come from the control plane through the backend; lakehouses from the Fabric API. |
+| **Sync mode** — `CDC Incremental` | §4.4 | The only mode at first release. A `Full reload` mode is the reseed path (§4.5) surfaced as a choice; do not offer modes we have not built. |
+| Target table prefix | §4.1 | One asmDB database is one Delta table, so the prefix is what keeps a lakehouse legible. |
+| **Content decoding** — decoder, sample, decoded preview, `46 / 176 bytes` | §4.2 | The counter is the engine's real limit: 176 bytes, 175 usable. Showing it beats an error later. The preview decodes **client-side** — it is a sample, not a round trip into a customer's database. |
+| Create notebook · Generate notebook · Preview CDC | §1 · Phase 2 | `Preview CDC` reads a bounded page through the gateway (§3.2) and respects the same caps. |
+| Current lineage, with `Active / Planned / Warning` | §2.2 | Edges are ours, stored in `Files/lineage/`. **`Planned` means configured but never run** — worth showing, because a link created and never scheduled is the most common silent failure. |
+| Recent sync activity — status, last run, lag | Phase 4 | Lag in minutes; see below. |
+| Selected link details, incl. **decoder** and **next run** | Phase 4 | Next run comes from the notebook's Fabric schedule, not from us. |
+| Coverage & readiness | Phase 4 | "Not configured" is a database with no link at all — the number that sells the product, and the only one requiring us to list databases the user has never touched. |
+| `Data updated · Auto-refresh` | Phase 4 | Obeys the rule already paid for once in asmdb Cloud: a failed poll shows the last good sample marked stale, never a blank panel. |
+
+### Two things the mockup must not say
+
+**Not "real-time".** Decision D3 is analytics cadence. The lag figures are minutes and
+the copy reads "analytical sync", not "real-time analytical sync". A screenshot promising
+seconds becomes a commitment the moment someone shows it to a customer — and the sync is
+driven by a Fabric notebook schedule, which gives minutes.
+
+**Not Fabric's lineage.** The panel shows edges we hold. It must never imply that opening
+Fabric's own lineage view will show the same graph (§5).
+
+---
+
 ## 6. Development plan
 
 Seven workstreams. **Scopes are disjoint by directory** so they can run in parallel
