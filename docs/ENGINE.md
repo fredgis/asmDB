@@ -73,6 +73,18 @@ Everything in [§12 Roadmap](#12-roadmap) — columnar storage, compression,
 bitmap/secondary indexes, partitioning, parallel scans, MVCC — is **not yet
 implemented** and is labelled as such throughout.
 
+### The whole picture, on one page
+
+The rest of this document is byte-level detail. This poster is the argument
+behind it: why the capacity is fixed, why only three quarters of the slots are
+usable, why the engine refuses to resize itself, and why a 1 GiB file does not
+necessarily cost 1 GiB — plus an honest look at where that limit stops being
+coherent and starts being structural.
+
+<p align="center">
+  <img src="assets/asmdb-engine-how-it-works.png" alt="How the asmdb engine works: a database is an array of 256-byte slots; capacity must be known in advance because the slot number is derived from the hash and the table size; only about 75% of slots are usable because linear probing degrades as the fill rate rises; automatic resizing is a non-goal because a crash-safe resize is effectively a whole subsystem; the fixed slot size makes addressing pointer arithmetic; sparse files mean a 1 GiB region need not occupy 1 GiB on disk, though Azure Files NFS does not preserve that; and what the database limit actually means in records, bytes and transactions" width="90%">
+</p>
+
 ---
 
 ## 2. Build toolchain & executable layout (PE64 + ELF64)
