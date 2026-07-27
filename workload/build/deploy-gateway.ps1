@@ -166,7 +166,24 @@ try {
         Invoke-Az @('acr','build','--registry',$RegistryName,'--image',"$ImageRepository`:$ImageTag",'--file',(Join-Path $GatewayRoot 'Dockerfile'),$GatewayRoot) "Build and push $image" -SkipWhenWhatIf
     }
 
-    $effectiveToken = if ([string]::IsNullOrWhiteSpace($GatewayToken)) { New-StrongToken } else { $GatewayToken }
+    # Reuse the token already on the Container App. Minting a new one on every
+    # run silently invalidates the copy the backend holds and the copy in Key
+    # Vault, so a redeploy - for an unrelated reason such as a code change -
+    # would break every consumer with a 401 that looks like a permissions
+    # fault. Rotation should be a deliberate act, so it needs -GatewayToken.
+    $existingToken = $null
+    if ([string]::IsNullOrWhiteSpace($GatewayToken) -and -not $WhatIfPreference) {
+        $secretJson = az containerapp secret show --subscription $SubscriptionId --resource-group $ResourceGroup --name $ContainerAppName --secret-name 'gateway-token' --query 'value' -o tsv 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($secretJson)) {
+            $existingToken = $secretJson.Trim()
+            Write-Step 'Reusing the existing gateway token; pass -GatewayToken to rotate it'
+        }
+    }
+    $effectiveToken =
+        if (-not [string]::IsNullOrWhiteSpace($GatewayToken)) { $GatewayToken }
+        elseif (-not [string]::IsNullOrWhiteSpace($existingToken)) { $existingToken }
+        else { New-StrongToken }
+    $tokenIsNew = [string]::IsNullOrWhiteSpace($existingToken)
     $appBody = @{
         location = $Location
         identity = @{
@@ -257,6 +274,9 @@ try {
     Write-Host ''
     Write-Ok "Gateway URL: $url"
     Write-Host "Bearer token (store in Key Vault; it is shown only by this script run): $effectiveToken"
+    if (-not $tokenIsNew) {
+        Write-Warn 'This is the existing token, not a new one. Consumers keep working; pass -GatewayToken to rotate deliberately.'
+    }
 } finally {
     Remove-Item $ScratchRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
