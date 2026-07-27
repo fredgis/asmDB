@@ -38,14 +38,14 @@ async function writeText(workloadClient: WorkloadClientAPI | null, path: string,
   }
 }
 
-export async function loadLinks(workloadClient: WorkloadClientAPI | null): Promise<SyncLink[] | null> {
+export async function loadLinks(workloadClient: WorkloadClientAPI | null): Promise<SyncLink[]> {
   const text = await readText(workloadClient, "Files/links.json");
-  if (!text) return null;
+  if (!text) return [];
   try {
     return JSON.parse(text) as SyncLink[];
   } catch (error) {
     console.warn("Invalid Files/links.json", error);
-    return null;
+    return [];
   }
 }
 
@@ -71,8 +71,8 @@ export async function saveLineage(workloadClient: WorkloadClientAPI | null, grap
 export function graphFromLinks(links: SyncLink[]): LineageGraph {
   const nodes = new Map<string, { id: string; label: string; kind: "database" | "lakehouse" }>();
   const edges = links.map((link) => {
-    const sourceId = `db:${link.source}`;
-    const targetId = `lakehouse:${link.target}`;
+    const sourceId = link.sourceId ? `db:${link.sourceId}` : `db:${link.source}`;
+    const targetId = link.targetId ? `lakehouse:${link.targetId}` : `lakehouse:${link.target}`;
     nodes.set(sourceId, { id: sourceId, label: link.source, kind: "database" });
     nodes.set(targetId, { id: targetId, label: link.target, kind: "lakehouse" });
     return { id: link.id, source: sourceId, target: targetId, status: link.status };

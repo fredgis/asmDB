@@ -101,6 +101,7 @@ function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     upstreamCdcBytes: 256 * 1024,
     upstreamTimeoutMs: 1000,
     cdcTokenTtlSeconds: 900,
+    allowedOrigins: [],
     ...overrides,
   };
 }
@@ -185,6 +186,42 @@ describe("configuration", () => {
         ASMDB_GATEWAY_TOKEN: "gateway-secret",
       })
     ).toThrow(/ASMDB_WL_USE_MANAGED_IDENTITY=true.*ASMDB_WL_ENTRA_CLIENT_SECRET/s);
+  });
+});
+
+describe("CORS", () => {
+  // The frontend is served from its own domain and calls this API from inside
+  // the Fabric iframe, so the Origin is that domain, not a Fabric one.
+  const frontend = "https://fe.asmdb.cloud";
+
+  async function preflight(origin: string, allowedOrigins: string[] = [frontend]) {
+    const app = createApp({ config: testConfig({ allowedOrigins }) });
+    return request(app)
+      .options("/api/databases")
+      .set("origin", origin)
+      .set("access-control-request-method", "GET");
+  }
+
+  it("allows the configured frontend origin", async () => {
+    const res = await preflight(frontend);
+    expect(res.headers["access-control-allow-origin"]).toBe(frontend);
+  });
+
+  it("allows Fabric and Power BI hosts", async () => {
+    for (const origin of ["https://app.fabric.microsoft.com", "https://app.powerbi.com"]) {
+      const res = await preflight(origin);
+      expect(res.headers["access-control-allow-origin"]).toBe(origin);
+    }
+  });
+
+  it("refuses an origin that is neither configured nor a host domain", async () => {
+    const res = await preflight("https://evil.example");
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("refuses the frontend origin when it is not configured", async () => {
+    const res = await preflight(frontend, []);
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
   });
 });
 

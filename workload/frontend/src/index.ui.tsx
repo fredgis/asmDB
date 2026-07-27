@@ -42,6 +42,9 @@ export async function initialize(params: InitParams) {
   const history = createBrowserHistory();
 
   workloadClient.navigation.onNavigate((route) => {
+    if (route.workspaceObjectIdHint) {
+      window.sessionStorage.setItem("asmdb.workspaceObjectIdHint", route.workspaceObjectIdHint);
+    }
     history.replace(route.targetUrl);
   });
 
@@ -70,4 +73,5 @@ export async function initialize(params: InitParams) {
 
   createRoot(rootElement).render(<ThemedRoot workloadClient={workloadClient} />);
 }
+
 

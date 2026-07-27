@@ -196,3 +196,13 @@ dd { margin: 0; font-weight: 700; }
   .detailsGrid, .detailsGrid div { grid-template-columns: minmax(0, 1fr); }
   .footer { align-items: flex-start; flex-direction: column; }
 }
+
+/* Workload content only: Fabric owns workspace navigation and signed-in user chrome. */
+.appShell { grid-template-columns: minmax(0, 1fr); }
+.workloadContent { width: min(100%, 1520px); margin: 0 auto; }
+.fieldCaption { grid-column: 2; margin: -4px 0 6px; color: var(--colorNeutralForeground3); font-size: 12px; }
+.honestCoverage .coverageList strong { font-family: var(--asmdb-font-mono); }
+.unknownDonut { background: var(--colorNeutralBackground2); border: 1px solid var(--colorNeutralStroke2); }
+.unknownDonut::before { display: none; }
+@media (max-width: 760px) { .fieldCaption { grid-column: 1; } }
+@media (max-width: 520px) { .fabricRail { display: none; } }

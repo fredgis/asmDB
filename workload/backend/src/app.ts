@@ -8,6 +8,7 @@ import { OboTokenBroker, type ClientAssertionProvider } from "./services/obo.js"
 import { CloudDatabaseService } from "./services/cloud-databases.js";
 import { CdcGatewayService } from "./services/cdc-gateway.js";
 import { CdcTokenService } from "./services/cdc-token.js";
+import { FabricService } from "./services/fabric.js";
 import { apiRouter } from "./routes/api.js";
 import { healthRouter } from "./routes/health.js";
 import { errorBody, HttpError } from "./errors.js";
@@ -38,6 +39,10 @@ function rateLimiter(limit: number) {
 }
 
 function corsOrigin(config: AppConfig) {
+  const allowList = new Set(
+    config.allowedOrigins.map((origin) => origin.replace(/\/+$/, "").toLowerCase())
+  );
+
   return (
     origin: string | undefined,
     callback: (err: Error | null, allow?: boolean) => void
@@ -47,8 +52,15 @@ function corsOrigin(config: AppConfig) {
       return;
     }
 
+    // The workload frontend is served from its own domain and calls this API
+    // from inside the Fabric iframe, so the browser sends that domain as the
+    // Origin - not a fabric.microsoft.com one. Allowing only Fabric hosts
+    // blocks every real request, and the failure surfaces as a bare "backend
+    // unavailable" with the actual reason visible only in the browser console.
     const allowed =
+      allowList.has(origin.replace(/\/+$/, "").toLowerCase()) ||
       /^https:\/\/[a-z0-9.-]+\.fabric\.microsoft\.com$/i.test(origin) ||
+      /^https:\/\/[a-z0-9.-]+\.powerbi\.com$/i.test(origin) ||
       (config.nodeEnv === "development" && /^https?:\/\/localhost(:\d+)?$/i.test(origin));
 
     callback(null, allowed);
@@ -62,6 +74,7 @@ export function createApp(options: CreateAppOptions = {}) {
     databases: new CloudDatabaseService(config, broker),
     cdcGateway: new CdcGatewayService(config),
     cdcTokens: new CdcTokenService(config),
+    fabric: new FabricService(config, broker),
   };
 
   const app = express();
@@ -78,6 +91,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.use("/health", healthRouter(VERSION));
   app.use("/api/databases", rateLimiter(limits.databases), auth);
+  app.use("/api/lakehouses", rateLimiter(limits.databases), auth);
   app.use("/api/cdc", rateLimiter(limits.cdcPreview), auth);
   app.use("/api/cdc-token", rateLimiter(limits.cdcToken), auth);
   app.use("/api", apiRouter(services));

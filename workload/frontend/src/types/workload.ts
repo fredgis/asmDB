@@ -1,4 +1,4 @@
-export type RequestState = "not-configured" | "no-data" | "failed" | "ready" | "stale";
+export type RequestState = "not-configured" | "no-data" | "failed" | "ready" | "stale" | "checking";
 export type DecoderMode = "none" | "hex" | "base64" | "json" | "csv" | "messagepack";
 export type LinkState = "Active" | "Planned" | "Warning";
 
@@ -12,10 +12,18 @@ export interface DatabaseInfo {
   capacity?: number;
 }
 
+export interface LakehouseInfo {
+  id: string;
+  name: string;
+  workspaceId: string;
+}
+
 export interface SyncLink {
   id: string;
   source: string;
+  sourceId?: string;
   target: string;
+  targetId?: string;
   mode: string;
   prefix: string;
   decoder: DecoderMode;
@@ -40,4 +48,19 @@ export interface RunRecord {
   lastRun?: string;
   lag?: string;
   message?: string;
+}
+
+export type Dependency = "backend" | "identity" | "asmdb-cloud" | "fabric" | "onelake";
+
+export interface LoadIssue {
+  dependency: Dependency;
+  message: string;
+  code?: string;
+}
+
+export interface Loadable<T> {
+  state: RequestState;
+  data: T;
+  issue?: LoadIssue;
+  updatedAt?: Date;
 }

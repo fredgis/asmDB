@@ -10,6 +10,8 @@ export type ErrorCode =
   | "upstream_malformed"
   | "cdc_gap"
   | "cdc_corrupt"
+  | "fabric_forbidden"
+  | "fabric_unavailable"
   | "rate_limited";
 
 export class HttpError extends Error {

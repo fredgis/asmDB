@@ -63,8 +63,8 @@ export class OboTokenBroker {
 
   private readonly config: AppConfig;
 
-  async exchange(userAssertion: string): Promise<string> {
-    const scope = await this.getCloudScope();
+  async exchange(userAssertion: string, scopeOverride?: string): Promise<string> {
+    const scope = scopeOverride ?? (await this.getCloudScope());
     const tokenEndpoint =
       this.config.tokenEndpoint ??
       `https://login.microsoftonline.com/${this.config.tenantId}/oauth2/v2.0/token`;

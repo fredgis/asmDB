@@ -26,6 +26,15 @@ export const configSchema = z
     upstreamCdcBytes: positiveInt.default(256 * 1024),
     upstreamTimeoutMs: positiveInt.default(8000),
     cdcTokenTtlSeconds: positiveInt.default(15 * 60),
+    allowedOrigins: z
+      .string()
+      .default("")
+      .transform((value) =>
+        value
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0)
+      ),
   })
   .superRefine((config, ctx) => {
     if (!config.useManagedIdentity && !config.clientSecret) {
@@ -60,5 +69,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     upstreamCdcBytes: env.ASMDB_UPSTREAM_CDC_BYTES,
     upstreamTimeoutMs: env.ASMDB_UPSTREAM_TIMEOUT_MS,
     cdcTokenTtlSeconds: env.ASMDB_CDC_TOKEN_TTL_SECONDS,
+    allowedOrigins: env.ASMDB_ALLOWED_ORIGINS,
   });
 }
