@@ -133,7 +133,7 @@ does not carry a client secret. The full design is in
 [`docs/SAAS.md`](docs/SAAS.md), and the engine/platform threat model is in
 [`docs/SECURITY.md`](docs/SECURITY.md).
 
-## asmDB Analytical Capabilities — a Fabric workload (planned)
+## asmDB Analytical Capabilities — a Fabric workload
 
 asmdb is a transactional engine and deliberately not an analytical one: one fixed
 record, one table per database, no joins and no aggregation. **asmDB Analytical
@@ -147,20 +147,33 @@ database into a Delta table in a Fabric lakehouse and keeps it current from the
 
 The design decision that shapes it: **Fabric Spark writes the Delta tables, we do
 not.** The workload generates a notebook in the customer's own workspace and lets
-Fabric schedule it. No customer row passes through anything we operate, the compute is
-billed to the capacity where their analytics budget already lives, and the sync is a
-notebook they can read rather than a connector they must trust.
+Fabric run it on a schedule. No customer row passes through anything we operate, the
+compute is billed to the capacity where their analytics budget already lives, and the
+sync is a notebook they can read rather than a connector they must trust.
 
-**Nothing is built yet.** The architecture, the honest list of what Fabric does and does
-not support, and the multi-workstream development plan are in
-[`docs/WORKLOAD.md`](docs/WORKLOAD.md); the design target is
-[`workload/mockup/index.html`](workload/mockup/index.html). The first thing it needs is an
-endpoint asmdb does not have today — a way to read change frames over HTTP.
+Four components are built and tested, and the engine and the hosted service are
+untouched:
+
+| | What it does |
+|---|---|
+| [`workload/cdc-gateway/`](workload/cdc-gateway/) | Serves change frames over HTTP from a **read-only** mount of the share instances write to. Refuses to start if the mount is writable, so the guarantee is structural rather than intentional. |
+| [`workload/notebooks/`](workload/notebooks/) | The generated PySpark sync. Applies changes with `MERGE`, then writes the watermark — in that order, so a crash replays a batch instead of skipping one. |
+| [`workload/backend/`](workload/backend/) | Exchanges the Fabric token for an asmdb Cloud token on behalf of the user, and never falls back to a service identity. Only premium databases are listed. |
+| [`workload/frontend/`](workload/frontend/) | Fluent v9 surface on the asmdb brand ramp, following the host's light and dark themes. |
+
+`.\workload\build\pack.ps1` builds, validates and emits a single uploadable `.nupkg`,
+printing its path and where to upload it. It refuses to produce a release package while
+any placeholder remains.
+
+The architecture and the honest list of what Fabric does and does not support are in
+[`docs/WORKLOAD.md`](docs/WORKLOAD.md); the ordered installation procedure, including
+the Entra domain prerequisites and their lead times, is in
+[`workload/docs/INSTALL.md`](workload/docs/INSTALL.md).
 
 ## Table of contents
 
 - [asmdb Cloud](#asmdb-cloud) — hosted asmdb instances, API surfaces and service design
-- [asmDB Analytical Capabilities](#asmdb-analytical-capabilities--a-fabric-workload-planned) — planned Microsoft Fabric workload
+- [asmDB Analytical Capabilities](#asmdb-analytical-capabilities--a-fabric-workload) — Microsoft Fabric workload
 - [What fits, and what is enforced](#what-fits-and-what-is-enforced) — capacity, schema and hard limits
 - [Why it's interesting](#why-its-interesting)
 - [Quickstart](#quickstart)
