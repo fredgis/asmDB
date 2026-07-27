@@ -133,9 +133,34 @@ does not carry a client secret. The full design is in
 [`docs/SAAS.md`](docs/SAAS.md), and the engine/platform threat model is in
 [`docs/SECURITY.md`](docs/SECURITY.md).
 
+## asmDB Analytical Capabilities — a Fabric workload (planned)
+
+asmdb is a transactional engine and deliberately not an analytical one: one fixed
+record, one table per database, no joins and no aggregation. **asmDB Analytical
+Capabilities** is the bridge — a custom Microsoft Fabric workload that turns an asmdb
+database into a Delta table in a Fabric lakehouse and keeps it current from the
+[change log](#change-data-capture) the engine already writes.
+
+<p align="center">
+  <img src="docs/assets/asmdb-workload-mockup.png" alt="asmDB Analytical Capabilities: a Fabric workload showing connected databases, a sync-link builder, lineage between asmdb databases and Fabric lakehouses, recent sync activity and coverage" width="90%">
+</p>
+
+The design decision that shapes it: **Fabric Spark writes the Delta tables, we do
+not.** The workload generates a notebook in the customer's own workspace and lets
+Fabric schedule it. No customer row passes through anything we operate, the compute is
+billed to the capacity where their analytics budget already lives, and the sync is a
+notebook they can read rather than a connector they must trust.
+
+**Nothing is built yet.** The architecture, the honest list of what Fabric does and does
+not support, and the multi-workstream development plan are in
+[`docs/WORKLOAD.md`](docs/WORKLOAD.md); the design target is
+[`workload/mockup/index.html`](workload/mockup/index.html). The first thing it needs is an
+endpoint asmdb does not have today — a way to read change frames over HTTP.
+
 ## Table of contents
 
 - [asmdb Cloud](#asmdb-cloud) — hosted asmdb instances, API surfaces and service design
+- [asmDB Analytical Capabilities](#asmdb-analytical-capabilities--a-fabric-workload-planned) — planned Microsoft Fabric workload
 - [What fits, and what is enforced](#what-fits-and-what-is-enforced) — capacity, schema and hard limits
 - [Why it's interesting](#why-its-interesting)
 - [Quickstart](#quickstart)

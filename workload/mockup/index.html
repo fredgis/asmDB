@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>asmDB Analytical Capabilities — Fabric workload mockup</title>
+<meta name="description" content="Design mockup for the asmDB Analytical Capabilities workload for Microsoft Fabric: sync links from asmDB premium databases to Fabric lakehouses, with lineage and monitoring.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="mockup.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ===================== Fabric shell — host chrome ===================== -->
+  <!-- Rendered muted on purpose: we do not own this, it is drawn for context. -->
+  <nav class="shell" aria-label="Microsoft Fabric (host application)">
+    <div class="shell__brand">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+        <path d="M4 3h6a4 4 0 0 1 0 8H7v6H4V3z" fill="currentColor"/>
+      </svg>
+      Fabric
+    </div>
+    <ul class="shell__nav">
+      <li><a href="#"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 7l6-5 6 5v7H2V7z" stroke="currentColor" stroke-width="1.3"/></svg>Home</a></li>
+      <li><a href="#"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v6M5 8h6" stroke="currentColor" stroke-width="1.3"/></svg>Create</a></li>
+      <li><a href="#"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 4h5l1.5 2H14v7H2V4z" stroke="currentColor" stroke-width="1.3"/></svg>Browse</a></li>
+      <li><a href="#"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 2a9 6 0 0 0 0 12" stroke="currentColor" stroke-width="1.3"/></svg>OneLake</a></li>
+      <li><a href="#"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="2" y="2" width="5" height="5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="9" width="5" height="5" stroke="currentColor" stroke-width="1.3"/></svg>Apps</a></li>
+      <li><a href="#"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 12l4-4 3 3 5-6" stroke="currentColor" stroke-width="1.3"/></svg>Metrics</a></li>
+      <li><a href="#"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v3l2 2" stroke="currentColor" stroke-width="1.3"/></svg>Monitoring hub</a></li>
+    </ul>
+    <div class="shell__sep"></div>
+    <ul class="shell__nav">
+      <li><a href="#"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="5.5" cy="6" r="2" stroke="currentColor" stroke-width="1.3"/><circle cx="10.5" cy="6" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M2 13a3.5 3.5 0 0 1 7 0M7 13a3.5 3.5 0 0 1 7 0" stroke="currentColor" stroke-width="1.3"/></svg>Workspaces</a></li>
+    </ul>
+    <div class="shell__ws">
+      <span class="shell__ws-badge">CA</span>
+      <span>Contoso Analytics Workspace</span>
+    </div>
+    <div class="shell__foot">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 3h12v8H8l-4 3v-3H2V3z" stroke="currentColor" stroke-width="1.3"/></svg>
+      Give feedback
+    </div>
+  </nav>
+
+  <!-- ======================= asmDB workload surface ======================= -->
+  <div class="surface">
+
+    <header class="topbar">
+      <div class="wspicker">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="5.5" cy="6" r="2" stroke="currentColor" stroke-width="1.3"/><circle cx="10.5" cy="6" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M2 13a3.5 3.5 0 0 1 7 0M7 13a3.5 3.5 0 0 1 7 0" stroke="currentColor" stroke-width="1.3"/></svg>
+        <span>Contoso Analytics Workspace</span>
+        <svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 5l3 3 3-3" stroke="currentColor" stroke-width="1.4"/></svg>
+      </div>
+
+      <div class="title">
+        <span class="title__mark" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <ellipse cx="12" cy="6" rx="7" ry="3" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3" stroke="currentColor" stroke-width="1.8"/>
+          </svg>
+        </span>
+        <div>
+          <h1>asmDB Analytical Capabilities</h1>
+          <p>Unified analytical sync and lineage for Microsoft Fabric</p>
+        </div>
+      </div>
+
+      <span class="pill pill--ok">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.4"/><path d="M5 8.2l2 2 4-4.4" stroke="currentColor" stroke-width="1.6"/></svg>
+        All systems operational
+      </span>
+
+      <div class="topbar__icons">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6a4 4 0 0 1 8 0c0 3 1 4 1 4H3s1-1 1-4z" stroke="currentColor" stroke-width="1.3"/><path d="M6.5 12.5a1.5 1.5 0 0 0 3 0" stroke="currentColor" stroke-width="1.3"/></svg>
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" stroke="currentColor" stroke-width="1.3"/></svg>
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M6.3 6.2a1.8 1.8 0 1 1 2.4 1.7c-.5.2-.7.6-.7 1.1" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="11.4" r=".8" fill="currentColor"/></svg>
+        <span class="avatar" aria-hidden="true">SA</span>
+        <span class="who"><b>System Admin</b><span>Contoso</span></span>
+      </div>
+    </header>
+
+    <main class="content">
+
+      <!-- ------------------------- hero + KPIs ------------------------- -->
+      <section class="masthead" aria-label="Overview">
+
+        <div class="card hero">
+          <div class="hero__art" aria-hidden="true">
+            <svg width="150" height="150" viewBox="0 0 150 150" fill="none">
+              <defs>
+                <linearGradient id="cube" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0" stop-color="oklch(75% 0.19 292)"/>
+                  <stop offset="1" stop-color="oklch(72% 0.15 205)"/>
+                </linearGradient>
+              </defs>
+              <path d="M75 22 122 46v52L75 122 28 98V46z" stroke="url(#cube)" stroke-width="2.2" fill="oklch(30% 0.10 292 / 0.28)"/>
+              <path d="M28 46l47 24 47-24M75 70v52" stroke="url(#cube)" stroke-width="1.6" opacity=".75"/>
+              <ellipse cx="75" cy="62" rx="17" ry="7" stroke="oklch(88% 0.14 205)" stroke-width="2"/>
+              <path d="M58 62v16c0 3.9 7.6 7 17 7s17-3.1 17-7V62" stroke="oklch(88% 0.14 205)" stroke-width="2"/>
+              <g stroke="oklch(82% 0.145 205)" stroke-width="1.6" opacity=".9">
+                <path d="M122 60c12 0 12 -10 24 -10M122 72h26M122 84c12 0 12 10 24 10"/>
+              </g>
+              <g fill="oklch(82% 0.145 205)">
+                <circle cx="146" cy="50" r="2.6"/><circle cx="148" cy="72" r="2.6"/><circle cx="146" cy="94" r="2.6"/>
+              </g>
+            </svg>
+          </div>
+          <div>
+            <h2>Connect asmDB premium databases to Fabric lakehouses</h2>
+            <p>
+              Create real-time analytical sync links from asmDB premium databases to
+              Fabric lakehouses with built-in lineage, monitoring, and enterprise-grade
+              reliability.
+            </p>
+          </div>
+        </div>
+
+        <div class="kpis">
+          <div class="kpi">
+            <p class="kpi__label">
+              <svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.3"/></svg>
+              Connected Premium Databases
+            </p>
+            <p class="kpi__value">16</p>
+            <p class="kpi__delta"><b>▲ 2</b> vs last 7 days</p>
+          </div>
+          <div class="kpi">
+            <p class="kpi__label">
+              <svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 4.5V14H2V6.5L8 2z" stroke="currentColor" stroke-width="1.3"/></svg>
+              Synced Lakehouses
+            </p>
+            <p class="kpi__value">6</p>
+            <p class="kpi__delta"><b>▲ 1</b> vs last 7 days</p>
+          </div>
+          <div class="kpi">
+            <p class="kpi__label">
+              <svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6.5 9.5a3 3 0 0 1 0-4l1.5-1.5a3 3 0 1 1 4.2 4.2L11 9.6" stroke="currentColor" stroke-width="1.3"/><path d="M9.5 6.5a3 3 0 0 1 0 4L8 12a3 3 0 1 1-4.2-4.2L5 6.4" stroke="currentColor" stroke-width="1.3"/></svg>
+              Active Sync Links
+            </p>
+            <p class="kpi__value">12</p>
+            <p class="kpi__delta"><b>▲ 3</b> vs last 7 days</p>
+          </div>
+          <div class="kpi">
+            <p class="kpi__label">
+              <svg class="icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l5 2v4.5c0 3-2.1 5-5 5.5-2.9-.5-5-2.5-5-5.5V4l5-2z" stroke="currentColor" stroke-width="1.3"/><path d="M5.8 8.2l1.6 1.6 3-3.4" stroke="currentColor" stroke-width="1.4"/></svg>
+              Sync Health
+            </p>
+            <p class="kpi__value">99.98%</p>
+            <p class="kpi__delta"><b>▲ 0.01%</b> vs last 7 days</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- --------------------- create link + lineage --------------------- -->
+      <section class="grid-2" aria-label="Create and inspect sync links">
+
+        <div class="card">
+          <div class="card__head">
+            <svg class="icon" width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6.5 9.5a3 3 0 0 1 0-4l1.5-1.5a3 3 0 1 1 4.2 4.2L11 9.6" stroke="currentColor" stroke-width="1.4"/><path d="M9.5 6.5a3 3 0 0 1 0 4L8 12a3 3 0 1 1-4.2-4.2L5 6.4" stroke="currentColor" stroke-width="1.4"/></svg>
+            <h2>Create Sync Link</h2>
+          </div>
+
+          <div class="field">
+            <label for="src">Source Database</label>
+            <div class="control" id="src">
+              <svg class="icon" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.3"/></svg>
+              <span>Orders_DB</span>
+              <svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 5l3 3 3-3" stroke="currentColor" stroke-width="1.4"/></svg>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="tgt">Target Lakehouse</label>
+            <div class="control" id="tgt">
+              <svg class="icon" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 4.5V14H2V6.5L8 2z" stroke="currentColor" stroke-width="1.3"/></svg>
+              <span>Sales_Lakehouse</span>
+              <svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 5l3 3 3-3" stroke="currentColor" stroke-width="1.4"/></svg>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="mode">Sync Mode</label>
+            <div class="control" id="mode">
+              <svg class="icon" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 8a6 6 0 0 1 10-4.4M14 8a6 6 0 0 1-10 4.4" stroke="currentColor" stroke-width="1.3"/><path d="M12 1.5v2.6H9.4M4 14.5v-2.6h2.6" stroke="currentColor" stroke-width="1.3"/></svg>
+              <span>CDC Incremental</span>
+              <svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 5l3 3 3-3" stroke="currentColor" stroke-width="1.4"/></svg>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="prefix">Target Table Prefix</label>
+            <div class="control control--mono" id="prefix">
+              <svg class="icon" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 4h10M8 4v8" stroke="currentColor" stroke-width="1.4"/></svg>
+              <span>sales_</span>
+            </div>
+          </div>
+
+          <p class="check">
+            <span class="check__box" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2l2.2 2.2L9.5 3.6" stroke="currentColor" stroke-width="1.8"/></svg></span>
+            Create Notebook
+          </p>
+
+          <div class="btn-row">
+            <button class="btn btn--primary" type="button">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.2l1.5 3.5 3.8.3-2.9 2.5.9 3.7L8 10.3 4.7 12.2l.9-3.7-2.9-2.5 3.8-.3L8 2.2z" fill="currentColor"/></svg>
+              Create Link
+            </button>
+            <button class="btn" type="button">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3" y="2" width="10" height="12" rx="1.5" stroke="currentColor" stroke-width="1.3"/><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" stroke="currentColor" stroke-width="1.2"/></svg>
+              Generate Notebook
+            </button>
+            <button class="btn" type="button">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M5 3.5l7 4.5-7 4.5v-9z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+              Preview CDC
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card__head">
+            <svg class="icon" width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="4" cy="4" r="2" stroke="currentColor" stroke-width="1.3"/><circle cx="4" cy="12" r="2" stroke="currentColor" stroke-width="1.3"/><circle cx="12" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M6 5.2L10 7M6 10.8L10 9" stroke="currentColor" stroke-width="1.3"/></svg>
+            <h2>Current Lineage</h2>
+            <span class="spacer"></span>
+            <button class="btn" type="button">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" stroke="currentColor" stroke-width="1.4"/></svg>
+              Fit to view
+            </button>
+            <span class="zoom">
+              <button class="btn" type="button" aria-label="Zoom out">−</button>
+              <span class="zoom__level">100%</span>
+              <button class="btn" type="button" aria-label="Zoom in">+</button>
+            </span>
+          </div>
+
+          <div class="lineage">
+            <div class="lineage__row">
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.3"/></svg><span>Orders_DB</span></span>
+              <span class="edge edge--ok"><span class="edge__dot" role="img" aria-label="healthy"><svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2l2.2 2.2L9.5 3.6" stroke="currentColor" stroke-width="1.8"/></svg></span></span>
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 4.5V14H2V6.5L8 2z" stroke="currentColor" stroke-width="1.3"/></svg><span>Sales_Lakehouse</span></span>
+            </div>
+            <div class="lineage__row">
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.3"/></svg><span>Customer360_DB</span></span>
+              <span class="edge edge--ok"><span class="edge__dot" role="img" aria-label="healthy"><svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2l2.2 2.2L9.5 3.6" stroke="currentColor" stroke-width="1.8"/></svg></span></span>
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 4.5V14H2V6.5L8 2z" stroke="currentColor" stroke-width="1.3"/></svg><span>CRM_Lakehouse</span></span>
+            </div>
+            <div class="lineage__row">
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.3"/></svg><span>Inventory_DB</span></span>
+              <span class="edge edge--warn"><span class="edge__dot" role="img" aria-label="degraded"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 2.6l4.2 7.2H1.8L6 2.6z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M6 5.4v2" stroke="currentColor" stroke-width="1.3"/></svg></span></span>
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 4.5V14H2V6.5L8 2z" stroke="currentColor" stroke-width="1.3"/></svg><span>Supply_Lakehouse</span></span>
+            </div>
+            <div class="lineage__row">
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.3"/></svg><span>Products_DB</span></span>
+              <span class="edge edge--ok"><span class="edge__dot" role="img" aria-label="healthy"><svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2l2.2 2.2L9.5 3.6" stroke="currentColor" stroke-width="1.8"/></svg></span></span>
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 4.5V14H2V6.5L8 2z" stroke="currentColor" stroke-width="1.3"/></svg><span>Product_Lakehouse</span></span>
+            </div>
+            <div class="lineage__row">
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.3"/></svg><span>Finance_DB</span></span>
+              <span class="edge edge--ok"><span class="edge__dot" role="img" aria-label="healthy"><svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2l2.2 2.2L9.5 3.6" stroke="currentColor" stroke-width="1.8"/></svg></span></span>
+              <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 4.5V14H2V6.5L8 2z" stroke="currentColor" stroke-width="1.3"/></svg><span>Finance_Lakehouse</span></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ------------------- activity + details + coverage ------------------- -->
+      <section class="trio" aria-label="Activity, selected link and coverage">
+
+        <div class="card">
+          <div class="card__head">
+            <svg class="icon" width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.3"/><path d="M8 4.6V8l2.4 1.6" stroke="currentColor" stroke-width="1.3"/></svg>
+            <h2>Recent Sync Activity</h2>
+          </div>
+          <div class="tablewrap">
+            <table>
+              <thead>
+                <tr><th scope="col">Source → Target</th><th scope="col">Status</th><th scope="col">Last Run</th><th scope="col">Lag</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><span class="pair"><svg class="icon" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.4"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.4"/></svg><span>Orders_DB → Sales_Lakehouse</span></span></td>
+                  <td><span class="status status--ok">● Active</span></td>
+                  <td class="when">1 min ago</td>
+                  <td class="num">1.2 sec</td>
+                </tr>
+                <tr>
+                  <td><span class="pair"><svg class="icon" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.4"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.4"/></svg><span>Customer360_DB → CRM_Lakehouse</span></span></td>
+                  <td><span class="status status--ok">● Active</span></td>
+                  <td class="when">2 min ago</td>
+                  <td class="num">1.8 sec</td>
+                </tr>
+                <tr>
+                  <td><span class="pair"><svg class="icon" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.4"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.4"/></svg><span>Inventory_DB → Supply_Lakehouse</span></span></td>
+                  <td><span class="status status--warn">⚠ Warning</span></td>
+                  <td class="when">3 min ago</td>
+                  <td class="num">45.6 sec</td>
+                </tr>
+                <tr>
+                  <td><span class="pair"><svg class="icon" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.4"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.4"/></svg><span>Products_DB → Product_Lakehouse</span></span></td>
+                  <td><span class="status status--ok">● Active</span></td>
+                  <td class="when">4 min ago</td>
+                  <td class="num">2.1 sec</td>
+                </tr>
+                <tr>
+                  <td><span class="pair"><svg class="icon" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.4"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.4"/></svg><span>Finance_DB → Finance_Lakehouse</span></span></td>
+                  <td><span class="status status--ok">● Active</span></td>
+                  <td class="when">5 min ago</td>
+                  <td class="num">1.6 sec</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <a class="more" href="#">View all activity →</a>
+        </div>
+
+        <div class="card">
+          <div class="card__head">
+            <svg class="icon" width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6.5 9.5a3 3 0 0 1 0-4l1.5-1.5a3 3 0 1 1 4.2 4.2L11 9.6" stroke="currentColor" stroke-width="1.4"/><path d="M9.5 6.5a3 3 0 0 1 0 4L8 12a3 3 0 1 1-4.2-4.2L5 6.4" stroke="currentColor" stroke-width="1.4"/></svg>
+            <h2>Selected Link Details</h2>
+            <span class="spacer"></span>
+            <button class="btn" type="button" aria-label="More actions">⋯</button>
+          </div>
+
+          <div class="linkhead">
+            <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.6" ry="2" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 4v8c0 1.1 2 2 4.6 2s4.6-.9 4.6-2V4" stroke="currentColor" stroke-width="1.3"/></svg><span>Orders_DB</span></span>
+            <span aria-hidden="true" style="color:var(--color-ink-3)">⟶</span>
+            <span class="node"><svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l6 4.5V14H2V6.5L8 2z" stroke="currentColor" stroke-width="1.3"/></svg><span>Sales_Lakehouse</span></span>
+          </div>
+
+          <dl class="detail">
+            <dt>Status</dt><dd><span class="status status--ok">● Active</span></dd>
+            <dt>Current Lag</dt><dd class="mono">1.2 sec</dd>
+            <dt>Notebook</dt><dd style="color:var(--color-ok)">Generated</dd>
+            <dt>Last Run</dt><dd class="mono">May 12, 2025 10:42:33 AM</dd>
+            <dt>Next Run</dt><dd class="mono">May 12, 2025 10:43:33 AM</dd>
+            <dt>Sync Mode</dt><dd>CDC Incremental</dd>
+          </dl>
+
+          <div class="btn-row" style="margin-top:var(--space-lg)">
+            <button class="btn btn--primary" type="button">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M9 2h5v5" stroke="currentColor" stroke-width="1.4"/><path d="M14 2L7.5 8.5" stroke="currentColor" stroke-width="1.4"/><path d="M12 9.5V13a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3.5" stroke="currentColor" stroke-width="1.4"/></svg>
+              Open Notebook
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card__head">
+            <svg class="icon" width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2l5 2v4.5c0 3-2.1 5-5 5.5-2.9-.5-5-2.5-5-5.5V4l5-2z" stroke="currentColor" stroke-width="1.3"/><path d="M5.8 8.2l1.6 1.6 3-3.4" stroke="currentColor" stroke-width="1.4"/></svg>
+            <h2>Coverage &amp; Readiness</h2>
+          </div>
+
+          <div class="coverage">
+            <!-- conic-gradient donut: 78 / 11 / 6 / 5 -->
+            <div class="donut" role="img" aria-label="Coverage: 78 percent fully synced, 11 percent partially synced, 6 percent not synced, 5 percent not configured"
+                 style="background: conic-gradient(
+                    var(--color-ok) 0 78%,
+                    oklch(70% 0.15 240) 78% 89%,
+                    var(--color-warn) 89% 95%,
+                    var(--color-ink-4) 95% 100%);
+                    border-radius:999px;">
+              <div class="donut__hole">
+                <div>
+                  <div class="donut__pct">78%</div>
+                  <div class="donut__cap">Coverage</div>
+                </div>
+              </div>
+            </div>
+
+            <ul class="legend">
+              <li><span class="swatch" style="background:var(--color-ok)"></span><span class="name">Fully Synced<span class="frac">37 / 47</span></span><span class="pct">78%</span></li>
+              <li><span class="swatch" style="background:oklch(70% 0.15 240)"></span><span class="name">Partially Synced<span class="frac">5 / 47</span></span><span class="pct">11%</span></li>
+              <li><span class="swatch" style="background:var(--color-warn)"></span><span class="name">Not Synced<span class="frac">3 / 47</span></span><span class="pct">6%</span></li>
+              <li><span class="swatch" style="background:var(--color-ink-4)"></span><span class="name">Not Configured<span class="frac">2 / 47</span></span><span class="pct">5%</span></li>
+            </ul>
+          </div>
+
+          <a class="more" href="#">View readiness report →</a>
+        </div>
+      </section>
+    </main>
+
+    <p class="mock-note">
+      <b>This is a design mockup, not a running workload.</b> Every number on this page is
+      illustrative. The Fabric shell on the left is drawn for context only — it belongs to the host
+      application. The plan that this mockup accompanies is in
+      <a href="../../docs/WORKLOAD.md">docs/WORKLOAD.md</a>.
+    </p>
+
+  </div>
+</div>
+
+</body>
+</html>
+
