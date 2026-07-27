@@ -25,3 +25,14 @@ npm-debug.log*
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Local configuration. .env may hold an Entra client secret in the
+# development credential mode; keep only the .example files in git.
+.env
+.env.*
+!.env.example
+
+# Build output (workload backend/frontend, packaged workload)
+workload/*/dist/
+workload/build/out/
+*.nupkg

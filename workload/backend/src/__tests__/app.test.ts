@@ -1,0 +1,448 @@
+import http from "node:http";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import request from "supertest";
+import { exportJWK, generateKeyPair, SignJWT, type JWK } from "jose";
+import { createApp } from "../app.js";
+import { loadConfig, type AppConfig } from "../config.js";
+import type { ClientAssertionProvider } from "../services/obo.js";
+
+const tenantId = "11111111-1111-1111-1111-111111111111";
+const clientId = "22222222-2222-2222-2222-222222222222";
+
+interface MockState {
+  tokenStatus: number;
+  tokenBody: unknown;
+  tokenRequests: URLSearchParams[];
+  databasesStatus: number;
+  databasesBody: unknown;
+  gatewayStatus: number;
+  gatewayBody: string;
+  gatewayHeaders: Record<string, string>;
+  databaseCalls: number;
+}
+
+let publicJwk: JWK;
+let privateKey: CryptoKey;
+let server: http.Server;
+let baseUrl: string;
+let state: MockState;
+
+function resetState(): void {
+  state = {
+    tokenStatus: 200,
+    tokenBody: { access_token: "asmdb-user-token" },
+    tokenRequests: [],
+    databasesStatus: 200,
+    databasesBody: {
+      databases: [
+        {
+          id: "db_premium",
+          name: "orders",
+          tier: "premium",
+          engine: "1.7.0",
+          endpoint: "https://www.asmdb.cloud/db/premium",
+          rows: "123456",
+          capacity: "3145728",
+        },
+        {
+          id: "db_free",
+          name: "toy",
+          tier: "free",
+          engine: "1.7.0",
+          endpoint: "https://www.asmdb.cloud/db/free",
+          rows: "393216",
+          capacity: "393216",
+        },
+      ],
+    },
+    gatewayStatus: 200,
+    gatewayBody:
+      '{"commitSeq":"4211","flags":{"reset":false},"ops":[{"op":"upsert","id":"1","record":{"value":42}}]}\n',
+    gatewayHeaders: {
+      "content-type": "application/x-ndjson",
+      "x-asmdb-base-seq": "4200",
+      "x-asmdb-last-seq": "4211",
+      "x-asmdb-has-more": "false",
+    },
+    databaseCalls: 0,
+  };
+}
+
+function writeJson(res: http.ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+}
+
+function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+  return {
+    nodeEnv: "test",
+    port: 5010,
+    tenantId,
+    clientId,
+    clientSecret: "dev-secret",
+    useManagedIdentity: false,
+    managedIdentityClientId: undefined,
+    cloudApi: baseUrl,
+    cloudScope: "api://asmdb-cloud/.default",
+    gatewayUrl: baseUrl,
+    gatewayToken: "gateway-secret",
+    jwksUri: `${baseUrl}/jwks`,
+    tokenEndpoint: `${baseUrl}/token`,
+    requestBodyLimit: "16kb",
+    upstreamJsonBytes: 1024 * 1024,
+    upstreamCdcBytes: 256 * 1024,
+    upstreamTimeoutMs: 1000,
+    cdcTokenTtlSeconds: 900,
+    ...overrides,
+  };
+}
+
+async function signToken(claims: Record<string, unknown> = {}): Promise<string> {
+  return new SignJWT({
+    oid: "user-1",
+    fabric_workspace_id: "workspace-1",
+    ...claims,
+  })
+    .setProtectedHeader({ alg: "RS256", kid: "test-key" })
+    .setIssuer(`https://login.microsoftonline.com/${tenantId}/v2.0`)
+    .setAudience(clientId)
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .sign(privateKey);
+}
+
+async function authedGetDatabases(app: ReturnType<typeof createApp>) {
+  const token = await signToken();
+  return request(app).get("/api/databases").set("authorization", `Bearer ${token}`);
+}
+
+beforeAll(async () => {
+  const keyPair = await generateKeyPair("RS256", { extractable: true });
+  privateKey = keyPair.privateKey;
+  publicJwk = await exportJWK(keyPair.publicKey);
+  publicJwk.kid = "test-key";
+  publicJwk.alg = "RS256";
+  publicJwk.use = "sig";
+
+  resetState();
+  server = http.createServer((req, res) => {
+    void (async () => {
+      if (req.url === "/jwks") {
+        writeJson(res, 200, { keys: [publicJwk] });
+        return;
+      }
+      if (req.url === "/token") {
+        state.tokenRequests.push(new URLSearchParams(await readBody(req)));
+        writeJson(res, state.tokenStatus, state.tokenBody);
+        return;
+      }
+      if (req.url === "/databases") {
+        state.databaseCalls += 1;
+        writeJson(res, state.databasesStatus, state.databasesBody);
+        return;
+      }
+      if (req.url?.startsWith("/cdc/")) {
+        res.writeHead(state.gatewayStatus, state.gatewayHeaders);
+        res.end(state.gatewayBody);
+        return;
+      }
+      writeJson(res, 404, { error: { code: "not_found" } });
+    })();
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("No test server port");
+  baseUrl = `http://127.0.0.1:${address.port}`;
+});
+
+afterAll(async () => {
+  await new Promise<void>((resolve, reject) =>
+    server.close((err) => (err ? reject(err) : resolve()))
+  );
+});
+
+beforeEach(() => {
+  resetState();
+});
+
+describe("configuration", () => {
+  it("fails startup when no OBO client credential mode is configured", () => {
+    expect(() =>
+      loadConfig({
+        ASMDB_WL_ENTRA_TENANT_ID: tenantId,
+        ASMDB_WL_ENTRA_CLIENT_ID: clientId,
+        ASMDB_CLOUD_API: "https://www.asmdb.cloud/api/v1",
+        ASMDB_GATEWAY_URL: "https://gateway.example",
+        ASMDB_GATEWAY_TOKEN: "gateway-secret",
+      })
+    ).toThrow(/ASMDB_WL_USE_MANAGED_IDENTITY=true.*ASMDB_WL_ENTRA_CLIENT_SECRET/s);
+  });
+});
+
+describe("Fabric JWT validation", () => {
+  it("rejects an absent JWT", async () => {
+    const app = createApp({ config: testConfig() });
+    const res = await request(app).get("/api/databases");
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("unauthorized");
+  });
+
+  it("rejects a malformed JWT", async () => {
+    const app = createApp({ config: testConfig() });
+    const res = await request(app)
+      .get("/api/databases")
+      .set("authorization", "Bearer not-a-jwt");
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("unauthorized");
+  });
+
+  it("rejects a JWT with the wrong audience", async () => {
+    const token = await signToken();
+    const app = createApp({ config: testConfig({ clientId: "wrong-audience" }) });
+    const res = await request(app)
+      .get("/api/databases")
+      .set("authorization", `Bearer ${token}`);
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("unauthorized");
+  });
+
+  it("rejects a JWT with the wrong issuer", async () => {
+    const app = createApp({ config: testConfig({ tenantId: "33333333-3333-3333-3333-333333333333" }) });
+    const token = await signToken();
+    const res = await request(app)
+      .get("/api/databases")
+      .set("authorization", `Bearer ${token}`);
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("unauthorized");
+  });
+});
+
+describe("OBO client authentication", () => {
+  it("sends a client secret in local-development credential mode", async () => {
+    const app = createApp({ config: testConfig() });
+    const res = await authedGetDatabases(app);
+
+    expect(res.status).toBe(200);
+    expect(state.tokenRequests).toHaveLength(1);
+    expect(state.tokenRequests[0]?.get("client_secret")).toBe("dev-secret");
+    expect(state.tokenRequests[0]?.get("client_assertion")).toBeNull();
+    expect(state.tokenRequests[0]?.get("client_assertion_type")).toBeNull();
+  });
+
+  it("sends a managed-identity federated client assertion when configured", async () => {
+    const provider: ClientAssertionProvider = { getAssertion: async () => "mi-assertion" };
+    const app = createApp({
+      config: testConfig({ useManagedIdentity: true, clientSecret: "dev-secret" }),
+      clientAssertionProvider: provider,
+    });
+    const res = await authedGetDatabases(app);
+
+    expect(res.status).toBe(200);
+    expect(state.tokenRequests).toHaveLength(1);
+    expect(state.tokenRequests[0]?.get("client_secret")).toBeNull();
+    expect(state.tokenRequests[0]?.get("client_assertion")).toBe("mi-assertion");
+    expect(state.tokenRequests[0]?.get("client_assertion_type")).toBe(
+      "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+    );
+  });
+});
+
+describe("asmDB workload API", () => {
+  it("returns only premium databases", async () => {
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+    const res = await request(app)
+      .get("/api/databases")
+      .set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      databases: [
+        {
+          id: "db_premium",
+          name: "orders",
+          tier: "premium",
+          engine: "1.7.0",
+          endpoint: "https://www.asmdb.cloud/db/premium",
+          rows: "123456",
+          capacity: "3145728",
+        },
+      ],
+    });
+  });
+
+  it("does not fall back to a service identity when OBO fails", async () => {
+    state.tokenStatus = 400;
+    state.tokenBody = { error: "invalid_grant" };
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .get("/api/databases")
+      .set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("obo_exchange_failed");
+    expect(state.databaseCalls).toBe(0);
+  });
+
+  it("pins CDC pagination headers", async () => {
+    state.gatewayHeaders["x-asmdb-has-more"] = "true";
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .get("/api/cdc/db_test123/preview?from=1&limit=20")
+      .set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      baseSeq: "4200",
+      lastSeq: "4211",
+      hasMore: true,
+    });
+  });
+
+  it("propagates cdc_gap as its own condition", async () => {
+    state.gatewayStatus = 409;
+    state.gatewayHeaders = { "content-type": "application/json" };
+    state.gatewayBody = JSON.stringify({
+      error: {
+        code: "cdc_gap",
+        message: "retention trimmed past requested sequence",
+        baseSeq: "5000",
+        requestedFrom: "120",
+      },
+    });
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .get("/api/cdc/db_test123/preview?from=120&limit=20")
+      .set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toEqual({
+      code: "cdc_gap",
+      message: "retention trimmed past requested sequence",
+      baseSeq: "5000",
+      requestedFrom: "120",
+    });
+  });
+
+  it("propagates cdc_corrupt as its own condition with optional fields optional", async () => {
+    state.gatewayStatus = 409;
+    state.gatewayHeaders = { "content-type": "application/json" };
+    state.gatewayBody = JSON.stringify({
+      error: {
+        code: "cdc_corrupt",
+        message: "complete CDC frame failed CRC",
+        detail: "crc mismatch",
+        commitSeq: "4212",
+      },
+    });
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .get("/api/cdc/db_test123/preview?from=4212&limit=20")
+      .set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toEqual({
+      code: "cdc_corrupt",
+      message: "complete CDC frame failed CRC",
+      detail: "crc mismatch",
+      commitSeq: "4212",
+    });
+  });
+
+  it("maps share_unreadable 503 as a transient client-visible condition", async () => {
+    state.gatewayStatus = 503;
+    state.gatewayHeaders = { "content-type": "application/json" };
+    state.gatewayBody = JSON.stringify({
+      error: {
+        code: "share_unreadable",
+        message: "share temporarily unreadable",
+        detail: "permission denied",
+      },
+    });
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .get("/api/cdc/db_test123/preview?from=1&limit=20")
+      .set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body.error).toEqual({
+      code: "share_unreadable",
+      message: "share temporarily unreadable",
+      detail: "permission denied",
+    });
+  });
+
+
+  it("maps an infrastructure HTML 503 as transient, not malformed", async () => {
+    state.gatewayStatus = 503;
+    state.gatewayHeaders = { "content-type": "text/html" };
+    state.gatewayBody = "<html><body>503 Service Unavailable</body></html>";
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .get("/api/cdc/db_test123/preview?from=1&limit=20")
+      .set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body.error).toEqual({
+      code: "share_unreadable",
+      message: "CDC gateway is temporarily unavailable",
+      upstreamStatus: 503,
+      upstreamBodySnippet: "<html><body>503 Service Unavailable</body></html>",
+    });
+  });
+
+  it("refuses an oversized upstream response", async () => {
+    state.gatewayBody = `${"x".repeat(200)}\n`;
+    const token = await signToken();
+    const app = createApp({ config: testConfig({ upstreamCdcBytes: 32 }) });
+
+    const res = await request(app)
+      .get("/api/cdc/db_test123/preview?limit=20")
+      .set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("upstream_too_large");
+  });
+
+  it("rate limits per route", async () => {
+    const token = await signToken();
+    const app = createApp({ config: testConfig(), rateLimits: { cdcToken: 1 } });
+
+    const first = await request(app)
+      .post("/api/cdc-token")
+      .set("authorization", `Bearer ${token}`)
+      .send({ instanceId: "db_test123" });
+    const second = await request(app)
+      .post("/api/cdc-token")
+      .set("authorization", `Bearer ${token}`)
+      .send({ instanceId: "db_test123" });
+
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({ instanceId: "db_test123" });
+    expect(first.body.reference).toMatch(/^cdc_ref\./);
+    expect(second.status).toBe(429);
+    expect(second.body.error.code).toBe("rate_limited");
+  });
+});
+
