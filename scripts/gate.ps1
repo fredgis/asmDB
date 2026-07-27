@@ -157,24 +157,36 @@ function Get-GateScope {
     }
 
     $changed = @()
+    $known = $false
     try {
-        # What this push would add to the remote. Falls back to the working tree
-        # when the branch is not tracked yet.
-        $range = git rev-parse --abbrev-ref '@{upstream}' 2>$null
-        if ($LASTEXITCODE -eq 0 -and $range) {
-            $changed = @(git diff --name-only '@{upstream}...HEAD' 2>$null)
-            $changed += @(git diff --name-only HEAD 2>$null)
-        } else {
-            $changed = @(git diff --name-only HEAD 2>$null)
+        # What this push would add to the remote, plus anything uncommitted.
+        # `git diff` returning nothing is a *fact* (nothing changed), not a
+        # failure to determine — conflating the two made a clean tree run the
+        # most expensive path instead of the cheapest.
+        $upstream = git rev-parse --abbrev-ref '@{upstream}' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $upstream) {
+            $ahead = @(git diff --name-only '@{upstream}...HEAD' 2>$null)
+            if ($LASTEXITCODE -ne 0) { throw 'diff against upstream failed' }
+            $changed += $ahead
         }
-        $changed = $changed | Where-Object { $_ } | Sort-Object -Unique
+        $dirty = @(git diff --name-only HEAD 2>$null)
+        if ($LASTEXITCODE -ne 0) { throw 'diff against HEAD failed' }
+        $changed += $dirty
+        $changed += @(git ls-files --others --exclude-standard 2>$null)
+        $changed = @($changed | Where-Object { $_ } | Sort-Object -Unique)
+        $known = $true
     } catch {
-        $changed = @()
+        $known = $false
     }
 
-    if (-not $changed -or $changed.Count -eq 0) {
+    if (-not $known) {
         $scope.Engine = $true; $scope.Go = $true; $scope.Site = $true
         $scope.Reason = 'could not determine what changed, so everything runs'
+        return $scope
+    }
+
+    if ($changed.Count -eq 0) {
+        $scope.Reason = 'nothing to push and nothing uncommitted; structural checks only'
         return $scope
     }
 
