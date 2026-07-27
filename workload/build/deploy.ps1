@@ -21,6 +21,14 @@ param(
     # cannot follow $Location into swedencentral. A resource may sit in a
     # different region from its resource group, so the group stays put.
     [string]$StaticWebAppLocation = 'westeurope',
+    # The service resource group and VNet, where the CDC gateway lives. The
+    # gateway must mount the same Azure Files share the instances write to, so
+    # it cannot move to the analytics group. Only the subnet below is created
+    # here; nothing existing in the service group is modified.
+    [string]$ServiceResourceGroup = '<service-resource-group>',
+    [string]$ServiceVNet = 'asmdb-vnet',
+    [string]$BackendSubnet = 'snet-appsvc',
+    [string]$BackendSubnetPrefix = '10.20.6.0/24',
     [string]$AppServicePlan = 'plan-asmdb-analytical',
     [string]$BackendAppName = 'asmdb-analytical-backend',
     [string]$StaticWebAppName = 'asmdb-analytical-frontend',
@@ -403,6 +411,23 @@ if (Test-Phase 'infrastructure') {
     Invoke-Az @('webapp','create','--resource-group',$ResourceGroup,'--plan',$AppServicePlan,'--name',$BackendAppName,'--runtime','NODE:22-lts') 'Ensure backend Web App' -SkipWhenWhatIf
     Invoke-Az @('webapp','identity','assign','--resource-group',$ResourceGroup,'--name',$BackendAppName) 'Enable backend managed identity' -SkipWhenWhatIf
     Invoke-Az @('staticwebapp','create','--name',$StaticWebAppName,'--resource-group',$ResourceGroup,'--location',$StaticWebAppLocation,'--sku','Standard') 'Ensure Static Web App' -SkipWhenWhatIf
+
+    # The CDC gateway runs in an internal Container Apps environment inside the
+    # service VNet, on a private IP with no public DNS. App Service can only
+    # reach a private address through regional VNet integration - a private
+    # endpoint would govern inbound traffic, which is not the direction that
+    # needs solving here.
+    #
+    # This is additive: a new delegated subnet, and outbound integration on our
+    # own app. Nothing existing in the service resource group is reconfigured,
+    # and the gateway stays off the public internet. Name resolution works
+    # because Azure already links the environment's private DNS zone to the
+    # VNet, so the App Service resolves the gateway to its private IP once it
+    # uses the platform resolver.
+    Invoke-Az @('network','vnet','subnet','create','--resource-group',$ServiceResourceGroup,'--vnet-name',$ServiceVNet,'--name',$BackendSubnet,'--address-prefixes',$BackendSubnetPrefix,'--delegations','Microsoft.Web/serverFarms') 'Ensure delegated subnet for backend VNet integration' -SkipWhenWhatIf
+    $vnetId = "/subscriptions/$SubscriptionId/resourceGroups/$ServiceResourceGroup/providers/Microsoft.Network/virtualNetworks/$ServiceVNet"
+    Invoke-Az @('webapp','vnet-integration','add','--resource-group',$ResourceGroup,'--name',$BackendAppName,'--vnet',$vnetId,'--subnet',$BackendSubnet) 'Integrate the backend into the service VNet' -SkipWhenWhatIf
+    Invoke-Az @('webapp','config','set','--resource-group',$ResourceGroup,'--name',$BackendAppName,'--vnet-route-all-enabled','true') 'Route backend outbound traffic through the VNet' -SkipWhenWhatIf
     $BackendUrl = if ($BackendUrl) { $BackendUrl } else { "https://$BackendAppName.azurewebsites.net" }
     $FrontendUrl = if ($FrontendUrl) { $FrontendUrl } else { "https://$CustomDomain" }
     Write-Ok "Backend URL: $BackendUrl"

@@ -343,6 +343,58 @@ How to know it worked: the backend App Service and Static Web App are in `<analy
 
 Failure looks like: the script says the resource group is missing or an isolation violation occurred. Stop and fix the subscription/resource-group parameters.
 
+### 4.1 Reaching the CDC gateway, which is private
+
+The CDC gateway is the one component that does **not** live in the analytics resource group. It reads the change log from a read-only mount of the Azure Files share the asmDB Cloud instances write to, and that share is in `<service-resource-group>` — so the gateway is there too, in an **internal** Container Apps environment, on a private address inside `asmdb-vnet` with no public DNS.
+
+That is the desired shape: the gateway is never exposed to the internet. It does mean the backend cannot reach it by default, and the CDC preview reports an unavailable dependency until this step is done.
+
+**Regional VNet integration is the mechanism, not a private endpoint.** A private endpoint governs *inbound* traffic to a resource; the problem here is *outbound* — App Service reaching a private address. VNet integration is the only way an App Service can route to one.
+
+It is nonetheless additive, which is what matters for a resource group running a live service: it creates a new subnet and enables outbound integration on the workload's own app. No existing resource is reconfigured, and nothing becomes public.
+
+`deploy.ps1 -Only infrastructure` performs all three steps. Manually:
+
+```powershell
+az network vnet subnet create `
+  --resource-group <service-resource-group> --vnet-name asmdb-vnet `
+  --name snet-appsvc --address-prefixes 10.20.6.0/24 `
+  --delegations Microsoft.Web/serverFarms
+
+az webapp vnet-integration add `
+  --resource-group <analytics-resource-group> --name asmdb-analytical-backend `
+  --vnet "/subscriptions/<sub>/resourceGroups/<service-resource-group>/providers/Microsoft.Network/virtualNetworks/asmdb-vnet" `
+  --subnet snet-appsvc
+
+az webapp config set `
+  --resource-group <analytics-resource-group> --name asmdb-analytical-backend `
+  --vnet-route-all-enabled true
+```
+
+Then set `ASMDB_GATEWAY_URL` to the gateway's internal FQDN and `ASMDB_GATEWAY_TOKEN` to its bearer token, and restart.
+
+Name resolution needs no work: Azure already links the Container Apps environment's private DNS zone to `asmdb-vnet`, so once the app routes through the VNet it resolves the gateway to its private IP.
+
+**How to know it worked** — verify from inside the App Service rather than trusting the configuration:
+
+```powershell
+$tok = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+$cmd = 'curl -s -w "\nHTTP=%{http_code}\n" --max-time 20 https://<gateway-fqdn>/healthz'
+Invoke-RestMethod -Uri "https://asmdb-analytical-backend.scm.azurewebsites.net/api/command" -Method Post `
+  -Headers @{ Authorization = "Bearer $tok"; "Content-Type" = "application/json" } `
+  -Body (@{ command = $cmd; dir = "/home" } | ConvertTo-Json)
+```
+
+Expect `{"status":"ok"}` and `HTTP=200`. Resolving the hostname to a `10.20.*` address confirms the private path is in use.
+
+**Failure looks like:**
+
+- the name resolves to a public address, or not at all — the app is not routing through the VNet. Check `vnet-route-all-enabled`;
+- the name resolves but the connection times out — the subnet delegation or the integration did not take;
+- everything resolves but the gateway answers 401 — the bearer token is wrong, which is a configuration problem rather than a network one.
+
+**A note on the token.** It is set as an application setting rather than a Key Vault reference. The vault has public network access disabled by tenant policy and is reachable only through the Fabric managed private endpoint, so App Service cannot read it. A Key Vault reference would fail at startup. This is a deliberate trade-off, not an oversight: revisit it if a private endpoint for App Service is added to the vault.
+
 ## 5. Enable the workload once in Fabric
 
 What to do after the first package is uploaded:
