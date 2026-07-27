@@ -280,7 +280,7 @@ a { color: var(--color-accent); }
 
 /* -------------------------------- tables -------------------------------- */
 
-.trio { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.95fr) minmax(0, 1fr); gap: var(--space-lg); align-items: start; }
+.trio { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.9fr) minmax(0, 1fr); gap: var(--space-lg); align-items: start; }
 @media (max-width: 1500px) { .trio { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
 @media (max-width: 900px)  { .trio { grid-template-columns: minmax(0, 1fr); } }
 
@@ -289,11 +289,11 @@ table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
 thead th {
   text-align: left; font-weight: 500; color: var(--color-ink-3);
   font-size: var(--text-xs); letter-spacing: 0.04em; text-transform: uppercase;
-  padding: 0 var(--space-md) var(--space-xs) 0;
+  padding: 0 var(--space-sm) var(--space-xs) 0;
   border-bottom: 1px solid var(--color-rule); white-space: nowrap;
 }
 thead th:last-child { padding-right: 0; text-align: right; }
-tbody td { padding: var(--space-sm) var(--space-md) var(--space-sm) 0; border-bottom: 1px solid var(--color-rule); vertical-align: middle; }
+tbody td { padding: var(--space-sm) var(--space-sm) var(--space-sm) 0; border-bottom: 1px solid var(--color-rule); vertical-align: middle; }
 tbody td:last-child { padding-right: 0; }
 tbody tr:last-child td { border-bottom: 0; }
 td.when { white-space: nowrap; color: var(--color-ink-2); }
@@ -352,3 +352,4 @@ td.num { font-family: var(--font-mono); text-align: right; white-space: nowrap; 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
+
