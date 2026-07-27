@@ -421,6 +421,43 @@ Fabric's own lineage view will show the same graph (§5).
 
 ---
 
+## 5c. Who is allowed to sync what
+
+**Decision: anyone who can already reach asmdb Cloud, and only `premium` databases.**
+
+That is the whole rule, and it is deliberately not a new permission system. asmdb Cloud
+is single-organisation (§5b), so "can reach asmdb Cloud" means "is a member of
+`ASMDB_ADMIN`". Two consequences follow, and both matter more than they look:
+
+**The workload does not re-implement the check.** The backend exchanges the Fabric
+user's token for an asmdb Cloud call (on-behalf-of) and lets the control plane apply its
+own rule. One authority decides who sees what. If the workload kept its own copy of the
+rule, the two would drift, and it is always the copy that ends up wrong — a user removed
+from `ASMDB_ADMIN` would keep working through Fabric.
+
+**The `premium` filter is a filter, not a security boundary.** `GET /api/v1/databases`
+already returns `tier`, so the backend lists only `premium` and needs no change to asmdb
+Cloud at all. It is not protecting anything the caller could not otherwise see; it is
+refusing to offer something that would disappoint. A `free` database holds 393,216 rows
+and a `standard` one 1,572,864 — neither is an interesting analytical subject, and
+offering them would generate support conversations rather than value.
+
+### The Entra application is separate from asmdb Cloud's
+
+**Decision: a second, dedicated app registration.** This is right, and the reason is
+worth writing down. The asmdb Cloud application carries `ASMDB_ADMIN`, whose members can
+create, delete and rotate the token of every database. A Fabric workload runs in an
+iframe, in the customer's tenant, and its token passes through components we do not
+fully control. Lending it that identity would give an analytical surface the power to
+destroy transactional databases.
+
+The workload app is therefore a **multitenant SPA using authorisation-code with PKCE and
+no client secret**, exposing its own `api://<client-id>`. It needs delegated Power BI
+Service permissions (`00000009-0000-0000-c000-000000000000`): `Workspace.Read.All`,
+`Item.Read.All`, `Item.ReadWrite.All` — the last because the workload creates notebooks.
+
+---
+
 ## 6. Development plan
 
 Seven workstreams. **Scopes are disjoint by directory** so they can run in parallel
@@ -555,7 +592,158 @@ contract first and let the frontend build against it.
 
 ---
 
-## 7. Risks, ranked by what they would actually cost
+## 7. Installing it
+
+Written to be followed by someone who did not build it. Every step is either a command
+or an explicit "this cannot be scripted". The sequence is derived from two workloads by
+the same author that are running today — [SkyNav](https://github.com/fredgis/SkyNav),
+which automates most of it, and [FabricPRA](https://github.com/fredgis/FabricPRA), which
+does the Entra registration by hand. Where they differ, SkyNav is the better model.
+
+### 7.1 Prerequisites
+
+| | Why |
+|---|---|
+| Node.js **20+**, npm | Frontend and backend toolchain |
+| PowerShell **7+** | The deployment script |
+| Azure CLI, signed in | Infrastructure and the app registration |
+| `nuget` CLI | Packaging (falls back to manual) |
+| `@azure/static-web-apps-cli` via npx | Frontend deployment |
+| Fabric capacity: **F64+**, or **F2** in developer mode | Custom workloads are not available below this |
+| A **verified custom domain** resolving to the Static Web App | The manifest's `ServiceEndpoint/Url` must resolve **at upload time**, or the upload is rejected |
+| Fabric **tenant admin** | Only an admin can upload a workload and enable it |
+| Entra privileges to register an app and **grant admin consent** | Consent is not something a normal user can give |
+
+### 7.2 The order, and why it is not negotiable
+
+Nine of the ten steps below fail in a way that does not name its cause if done out of
+order. That is the single most valuable thing in this section.
+
+```mermaid
+flowchart TD
+  A["1 · Register the Entra app"] --> B["2 · Patch the manifest<br/>with AppId + frontend URL"]
+  A --> C["3 · Create Azure infrastructure"]
+  C --> D["4 · Deploy the backend"]
+  D --> E["5 · Build the frontend<br/>VITE_API_URL baked in"]
+  E --> F["6 · Deploy the frontend<br/>to the manifest URL"]
+  B --> G["7 · nuget pack"]
+  F --> G
+  G --> H["8 · Upload the .nupkg<br/>Fabric Admin Portal · manual"]
+  H --> I["9 · Enable at tenant level<br/>manual"]
+  I --> J["10 · Enable on the capacity<br/>manual"]
+```
+
+**What breaks, and how badly it lies to you:**
+
+| Mistake | Symptom |
+|---|---|
+| Wrong `AppId` in the manifest | The workload loads and authentication fails **silently**, with nothing in the UI |
+| Frontend URL in the manifest ≠ actual deployment URL | Fabric refuses to load the iframe, with no useful message |
+| Frontend built before the backend URL is known | The wrong API URL is compiled into the bundle; it looks deployed and calls nothing |
+| Capacity enabled before tenant | The capacity setting silently has no effect |
+| Oversized or wrong-format assets | Rejected at **upload**, not at packaging — after everything else is done |
+
+### 7.3 Step 1 — Register the Entra application
+
+A **multitenant SPA**, authorisation-code with PKCE, **no client secret**.
+
+```powershell
+az ad app create `
+  --display-name "asmDB Analytical Capabilities" `
+  --sign-in-audience AzureADMultipleOrgs `
+  --enable-id-token-issuance true `
+  --enable-access-token-issuance true `
+  --public-client-redirect-uris "http://localhost:60006/close"
+```
+
+Then the SPA redirect URIs. The Fabric and Power BI forms are
+`workloadSignIn/{tenantId}/{WorkloadName}`, and `{WorkloadName}` **must** equal the value
+in `WorkloadManifest.xml`:
+
+```
+http://localhost:60006/close
+https://app.fabric.microsoft.com/workloadSignIn/{tenantId}/Org.AsmdbAnalytical
+https://app.powerbi.com/workloadSignIn/{tenantId}/Org.AsmdbAnalytical
+https://{custom-domain}/close
+```
+
+> `/close` must actually be served by the frontend and call `window.close()`. Both
+> reference workloads do this in `main.tsx`; it is not optional and it is easy to miss
+> because nothing fails until a user signs in.
+
+Delegated permissions on the Power BI Service API
+(`00000009-0000-0000-c000-000000000000`): `Workspace.Read.All`, `Item.Read.All`,
+`Item.ReadWrite.All`. Then `az ad app permission admin-consent --id <app-id>`.
+
+This app is **not** asmdb Cloud's — see §5c.
+
+### 7.4 Steps 2–7 — Build and deploy
+
+Scripted, in `workload/build/deploy.ps1`, following SkyNav's phase structure:
+validate → login → app registration → infrastructure → build → backend → frontend →
+pack. The two constraints the script must respect are already stated above: the manifest
+is patched **before** packing, and the frontend is built **after** the backend URL is
+known.
+
+Asset rules enforced at pack time rather than discovered at upload:
+
+- every `assets/*` reference in the JSON manifests must resolve to a real file;
+- extensions limited to `.png`, `.jpg`, `.jpeg`;
+- each asset **≤ 1.5 MB**;
+- `slideMedia` videos must be YouTube or Vimeo *embed* URLs.
+
+### 7.5 Steps 8–10 — What cannot be scripted
+
+No CLI exists for any of these. A Fabric **tenant admin** must do them, in this order:
+
+1. **Upload** the `.nupkg` — `admin.fabric.microsoft.com` → Workload Publishing → Upload.
+2. **Enable at tenant level** — Admin Portal → Tenant settings → Additional workloads.
+3. **Enable on the capacity** — Admin Portal → Capacity settings → enable
+   `Org.AsmdbAnalytical`. Nothing happens if step 2 was skipped, and no error says so.
+
+### 7.6 One step neither reference workload has ever done
+
+Our design has the generated notebook read its asmDB credential from **Azure Key Vault
+using the workspace's managed identity** (D1). Neither SkyNav nor FabricPRA uses Key
+Vault at all — both avoid secrets entirely via managed identity on an App Service, which
+is a *different* identity from the one a notebook runs under.
+
+So this step is ours to prove:
+
+- the **workspace's managed identity** must be granted **Key Vault Secrets User** on the
+  vault. That is a Fabric administration action against an Azure resource, automated
+  nowhere, and it is exactly the kind of step that gets forgotten and produces a 403 the
+  notebook cannot explain;
+- it must be verified end to end before Phase 2 is called done, not assumed.
+
+Treat this as the highest-risk item in the whole installation, because it is the only one
+with no working precedent.
+
+---
+
+## 8. Publishing to the Workload Hub
+
+**There is no documented path in either reference workload.** Neither repository contains
+a certification checklist, a review process, Fabric UX compliance evidence, or real
+privacy, terms and support pages — the `supportLink` entries in both are placeholder
+GitHub URLs. That is worth stating plainly rather than implying we know the route.
+
+What we do know is the metadata the manifest carries and the packaging validates:
+`documentation`, `certification`, `help`, `privacy`, `terms` and `license` links, plus
+`slideMedia` screenshots and an optional video. Those must become **real pages**, not
+placeholders, before any submission.
+
+Two things to settle before submitting, not after:
+
+1. **Fabric UX compliance.** Publishing to the Hub requires it, the limits are not
+   published, and — now confirmed — *neither reference workload has attempted custom
+   branding*, so there is no precedent to lean on. See §5.
+2. **What the listing claims.** Everything in §5c applies with more force in a public
+   listing than in an internal screenshot.
+
+---
+
+## 9. Risks, ranked by what they would actually cost
 
 | Risk | Consequence | Mitigation |
 |---|---|---|
@@ -570,7 +758,7 @@ contract first and let the frontend build against it.
 
 ---
 
-## 8. What we are explicitly not building
+## 10. What we are explicitly not building
 
 - **No reverse sync.** Fabric never writes back into asmDB. One direction only — the
   engine is single-writer and a second writer would be a correctness disaster.
@@ -581,7 +769,7 @@ contract first and let the frontend build against it.
 
 ---
 
-## 9. Naming
+## 11. Naming
 
 - Workload: **asmDB Analytical Capabilities**
 - Workload id: `Org.AsmdbAnalytical`
@@ -590,16 +778,36 @@ contract first and let the frontend build against it.
 
 ---
 
-## 10. References
+## 12. References
 
 | Source | Used for |
 |---|---|
 | `github.com/microsoft/fabric-extensibility-toolkit` | Manifest schema, client SDK, OneLake and scheduler clients, theming |
 | `learn.microsoft.com/en-us/fabric/extensibility-toolkit/` | Hosting model, OneLake storage, Fabric API access, publishing |
-| `github.com/fredgis/SkyNav` | A working workload: manifest shapes, bootstrap, JWT validation, packaging, deploy order |
+| [`github.com/fredgis/SkyNav`](https://github.com/fredgis/SkyNav) | A working workload with the deployment **automated**: app registration, infrastructure, build, deploy, pack. The installation sequence in §7 is derived from it. |
+| [`github.com/fredgis/FabricPRA`](https://github.com/fredgis/FabricPRA) | A second working workload. Same skeleton, Entra registration done by hand — useful mainly as confirmation that the manifest shapes and bootstrap pattern are stable across projects rather than one-offs. |
 | [`docs/CDC.md`](CDC.md) | Change log format, sequences, RESET, retention |
 | [`saas/contracts/CONTRACTS.md`](../saas/contracts/CONTRACTS.md) | asmDB Cloud API surface, tiers, one-table-per-database |
 | [`docs/SECURITY.md`](SECURITY.md) | Existing credential classes and the narrow-scope precedent |
+
+### What the reference workloads do **not** answer
+
+Both were read specifically to find precedents for our two riskiest choices. Neither has
+one:
+
+- **Custom branding.** Both ship stock `webLightTheme` with hard-coded hex literals, and
+  neither reads `workloadClient.theme` or reacts to the host switching light and dark.
+  Fluent UI v9 supports a custom brand ramp — `createLightTheme` / `createDarkTheme` over
+  a 16-shade `BrandVariants` — but no working example exists in this codebase to copy.
+- **Key Vault from a notebook.** Both avoid secrets entirely through a managed identity on
+  an App Service, which is a different identity from the one a Fabric notebook runs under.
+  Our D1 design has no precedent here (§7.6).
+
+Neither is a reason to change course. Both are reasons to schedule them early rather than
+assume them.
+
+
+
 
 
 
