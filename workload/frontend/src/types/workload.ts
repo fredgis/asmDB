@@ -50,7 +50,7 @@ export interface RunRecord {
   message?: string;
 }
 
-export type Dependency = "backend" | "identity" | "asmdb-cloud" | "fabric" | "onelake";
+export type Dependency = "backend" | "identity" | "asmdb-cloud" | "fabric" | "item-definition";
 
 export interface LoadIssue {
   dependency: Dependency;
@@ -64,3 +64,4 @@ export interface Loadable<T> {
   issue?: LoadIssue;
   updatedAt?: Date;
 }
+

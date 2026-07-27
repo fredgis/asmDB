@@ -6,7 +6,7 @@ import { DependencyError, fetchDatabases, fetchHealth, previewCdc } from "./lib/
 import { fetchLakehouses, resolveWorkspaceId } from "./lib/fabric";
 import { getFabricToken } from "./lib/auth-helper";
 import { byteLength, CONTENT_LIMIT_BYTES, decodeSample } from "./lib/decoder";
-import { graphFromLinks, loadLinks, saveLineage, saveLinks } from "./lib/onelake";
+import { graphFromLinks, loadLinks, saveLinkState } from "./lib/onelake";
 import type { DatabaseInfo, DecoderMode, LakehouseInfo, LinkState, LoadIssue, Loadable, RequestState, RunRecord, SyncLink } from "./types/workload";
 import "./styles.css";
 
@@ -27,7 +27,8 @@ function emptyLoadable<T>(data: T): Loadable<T> {
 
 function issueFrom(error: unknown, fallback: LoadIssue): LoadIssue {
   if (error instanceof DependencyError) return error.issue;
-  return { ...fallback, message: error instanceof Error ? error.message : String(error) };
+  const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : fallback.code;
+  return { ...fallback, code, message: error instanceof Error ? error.message : String(error) };
 }
 
 function statusIcon(status: LinkState | "Failed") {
@@ -111,6 +112,8 @@ function App() {
   const [selectedId, setSelectedId] = useState("");
   const [previewState, setPreviewState] = useState<RequestState>("not-configured");
   const [previewText, setPreviewText] = useState("Select a premium asmDB database and request a CDC preview. No sample has been fetched yet.");
+  const [saveState, setSaveState] = useState<RequestState>("not-configured");
+  const [saveMessage, setSaveMessage] = useState("Choose a source database and target lakehouse, then create a link.");
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -169,7 +172,7 @@ function App() {
       setLinks({ state: storedLinks.length ? "ready" : "no-data", data: storedLinks, updatedAt: new Date() });
       setSelectedId((current) => current && storedLinks.some((link) => link.id === current) ? current : storedLinks[0]?.id ?? "");
     } catch (error) {
-      setLinks({ state: "failed", data: [], issue: issueFrom(error, { dependency: "onelake", message: "Could not read Files/links.json from this workload item." }) });
+      setLinks({ state: "failed", data: [], issue: issueFrom(error, { dependency: "item-definition", message: "Could not read links.json from this workload item definition." }) });
       setSelectedId("");
     }
   }, [workloadClient]);
@@ -213,7 +216,12 @@ function App() {
 
   async function createLink(event: React.FormEvent) {
     event.preventDefault();
-    if (!selectedSource || !selectedTarget) return;
+    setSaveState("checking");
+    if (!selectedSource || !selectedTarget) {
+      setSaveState("not-configured");
+      setSaveMessage("Select both a premium asmDB source database and a Fabric target lakehouse before creating a link.");
+      return;
+    }
     const link: SyncLink = {
       id: `${selectedSource.id}-${selectedTarget.id}-${Date.now()}`,
       source: selectedSource.name,
@@ -230,14 +238,19 @@ function App() {
       lag: "No data",
     };
     const nextLinks = [link, ...links.data];
-    const savedLinks = await saveLinks(workloadClient, nextLinks);
-    const savedLineage = await saveLineage(workloadClient, graphFromLinks(nextLinks));
-    if (!savedLinks || !savedLineage) {
-      showToast("Could not save the link to this workload item's OneLake Files folder. Nothing was added.");
+    try {
+      const persistedLinks = await saveLinkState(workloadClient, nextLinks);
+      setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
+      setSelectedId(persistedLinks.find((saved) => saved.id === link.id)?.id ?? persistedLinks[0]?.id ?? "");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSaveState("failed");
+      setSaveMessage(message);
+      showToast(message);
       return;
     }
-    setLinks({ state: "ready", data: nextLinks, updatedAt: new Date() });
-    setSelectedId(link.id);
+    setSaveState("ready");
+    setSaveMessage(`Saved to links.json and lineage/graph.json: ${selectedSource.name} -> ${selectedTarget.name}.`);
     showToast(`Sync link saved: ${selectedSource.name} to ${selectedTarget.name}.`);
   }
 
@@ -284,11 +297,11 @@ function App() {
           <section className="hero panel" aria-labelledby="overview-heading">
             <div className="introCard">
               <div className="heroVisual"><img src="/assets/asmdb-logo.png" alt="" width="150" height="150" /></div>
-              <div><h2 id="overview-heading">Connect real asmDB premium databases to real Fabric lakehouses</h2><p>No bearer token entry. The backend uses the signed-in Fabric identity to list the same premium asmDB Cloud databases the user can access in the console.</p></div>
+              <div><h2 id="overview-heading">Sync asmDB databases to Fabric lakehouses</h2><p>Create a link, generate the notebook, and track lineage from this workload item.</p></div>
             </div>
             <Kpi title="Premium asmDB databases" state={databases.state} value={databases.state === "ready" ? String(databases.data.length) : "—"} caption={databases.state === "no-data" ? "No premium databases visible for this user." : databases.state === "failed" ? issueText(databases.issue) : "From GET /api/databases."} />
             <Kpi title="Workspace lakehouses" state={lakehouses.state} value={lakehouses.state === "ready" ? String(lakehouses.data.length) : "—"} caption={lakehouses.state === "failed" ? issueText(lakehouses.issue) : "From Fabric workspace items."} />
-            <Kpi title="Sync links" state={links.state} value={links.state === "ready" ? String(links.data.length) : "—"} caption={links.state === "no-data" ? "No links in Files/links.json yet." : "From this item OneLake Files."} />
+            <Kpi title="Sync links" state={links.state} value={links.state === "ready" ? String(links.data.length) : "—"} caption={links.state === "no-data" ? "No links in links.json yet." : "From this item definition."} />
             <Kpi title="Sync health" state={links.state} value="—" caption="Unknown until a real run record exists." />
           </section>
 
@@ -333,7 +346,8 @@ function App() {
                     <pre aria-live="polite">{decoded.preview}</pre>
                   </div>
                 </section>
-                <div className="actions"><Button type="button" onClick={() => { setCreateNotebook(true); showToast("Notebook creation will be requested when this link is saved."); }}>Generate Notebook</Button><Button type="button" onClick={onPreviewCdc} disabled={!selectedSource}>Preview CDC</Button><Button appearance="primary" type="submit" disabled={!canCreate}>✦ Create Link</Button></div>
+                <div className="actions"><Button type="button" onClick={() => { setCreateNotebook(true); setSaveMessage("Notebook creation will be requested when this link is saved."); showToast("Notebook creation will be requested when this link is saved."); }}>Generate Notebook</Button><Button type="button" onClick={onPreviewCdc} disabled={!selectedSource}>Preview CDC</Button><Button appearance="primary" type="submit" disabled={!canCreate || saveState === "checking"}>{saveState === "checking" ? "Saving…" : "✦ Create Link"}</Button></div>
+                <div className="saveStatus"><StateMessage state={saveState} text={saveMessage} /></div>
               </form>
             </article>
 
@@ -344,7 +358,7 @@ function App() {
                   const sourceNode = lineage.nodes.find((node) => node.id === edge.source);
                   const targetNode = lineage.nodes.find((node) => node.id === edge.target);
                   return <button className="lineageRow" type="button" key={edge.id} onClick={() => setSelectedId(edge.id)} aria-label={`${sourceNode?.label} to ${targetNode?.label}, ${edge.status}`}><span className="node src">▤ {sourceNode?.label}</span><span className={`edge ${statusClass(edge.status)}`}><span>{statusIcon(edge.status)} {edge.status}</span></span><span className="node target">⌂ {targetNode?.label}</span></button>;
-                }) : <StateMessage state={links.state === "failed" ? "failed" : "no-data"} text={links.state === "failed" ? issueText(links.issue) : "No sync links are stored in this workload item yet. Create a link to write Files/links.json and Files/lineage/graph.json."} />}
+                }) : <StateMessage state={links.state === "failed" ? "failed" : "no-data"} text={links.state === "failed" ? issueText(links.issue) : "No sync links are stored in this workload item yet. Create a link to write links.json and lineage/graph.json item definition parts."} />}
                 <div className="legend" aria-label="Lineage states"><span>✓ Active</span><span>○ Planned</span><span>! Warning</span></div>
               </div>
             </article>
@@ -367,9 +381,9 @@ function App() {
             </article>
           </section>
 
-          <section className="panel cdcPanel" aria-label="CDC preview state"><StateMessage state={previewState} text={previewText} /></section>
+          <section className="panel cdcPanel" aria-labelledby="cdc-heading"><div className="panelHead"><h2 id="cdc-heading"><span aria-hidden="true">▤</span>CDC Preview</h2></div><div className="panelBody"><StateMessage state={previewState} text={previewText} /></div></section>
 
-          <footer className="footer"><span>{connection.updatedAt ? `✓ Data checked: ${formatTime(connection.updatedAt)}` : "○ Data not checked yet"}</span><span>◌ Auto-refresh: manual retry</span><nav><a href="../../docs/WORKLOAD.md">Documentation ↗</a><a href="https://asmdb.cloud">asmDB Status ↗</a></nav></footer>
+          <footer className="footer"><span>{connection.updatedAt ? `✓ Data checked: ${formatTime(connection.updatedAt)}` : "○ Data not checked yet"}</span></footer>
         </section>
       </main>
       <div className={`toast ${toast ? "show" : ""}`} role="status" aria-live="polite">{toast}</div>
@@ -392,6 +406,8 @@ function StateMessage({ state, text }: { state: RequestState; text: string }) {
 }
 
 export default App;
+
+
 
 
 

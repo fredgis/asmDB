@@ -206,3 +206,19 @@ dd { margin: 0; font-weight: 700; }
 .unknownDonut::before { display: none; }
 @media (max-width: 760px) { .fieldCaption { grid-column: 1; } }
 @media (max-width: 520px) { .fabricRail { display: none; } }
+
+/* Product surface refinements after live Fabric review. */
+:root {
+  --asmdb-on-brand-surface: var(--colorNeutralForegroundOnBrand, var(--asmdb-ink));
+  --asmdb-on-brand-surface-muted: color-mix(in oklch, var(--asmdb-on-brand-surface) 76%, transparent);
+}
+.hero { color: var(--asmdb-on-brand-surface); }
+.hero .introCard p, .hero .kpi em { color: var(--asmdb-on-brand-surface-muted); }
+.hero .kpi { color: var(--asmdb-on-brand-surface); }
+.hero .kpi span, .hero .kpi strong { color: var(--asmdb-on-brand-surface); }
+.saveStatus { grid-column: 1 / -1; }
+.bottomGrid > .panel, .cdcPanel { display: grid; grid-template-rows: 64px minmax(0, 1fr); align-content: start; }
+.bottomGrid > .panel > .panelHead, .cdcPanel > .panelHead { min-height: 64px; padding-block: 18px 10px; align-items: start; }
+.bottomGrid .stateMessage, .cdcPanel .stateMessage { margin: 0 16px 16px; align-self: start; }
+.panelBody { min-width: 0; align-self: start; }
+.footer { justify-content: flex-start; min-height: auto; }
