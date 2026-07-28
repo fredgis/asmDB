@@ -246,6 +246,25 @@ tree. That keeps the download page, the manifest and the running fleet on the
 same build by construction. The release procedure in [§8c](#8c-releasing-a-new-engine-version)
 explains why the image is pinned to the version tag rather than `latest`.
 
+**The cost of that coupling, recorded deliberately.** The site is copied into the
+image (`saas/controlplane/Dockerfile`, `COPY site/ /app/site/`), so there is no
+way to change a sentence on the marketing page without rebuilding the container —
+including reassembling the engine binaries — and rolling the control plane. A
+typo fix and an engine release cost the same and carry the same risk.
+
+That coupling buys something real: the download page can never advertise a build
+the fleet is not running, because both come out of one image. But it is paid for
+in editorial friction, and friction of that shape has a predictable effect —
+small corrections stop being made, and the site drifts away from the product it
+describes. That is not hypothetical here: three claims on the site were found
+wrong during a documentation audit, one of them a Python client that does not
+exist.
+
+**Planned:** serve the static site from blob storage or a CDN origin, keeping
+`/downloads/` and its manifest in the image so the build-integrity property
+survives. Copy changes then become an upload measured in seconds, and the
+control plane is rolled only when the control plane actually changes.
+
 ---
 
 ## 5. Authentication and tokens

@@ -15,7 +15,16 @@ poc/
 examples/
 tests/
 clients/
-mcp/node_modules
+
+# Every node_modules, not just the one that existed when this file was written.
+# workload/ arrived later and brought 420 MB across three of them, which turned
+# `az acr build` into a pack step that never finished uploading. Neither
+# root-context image copies anything from workload/, so exclude it wholesale;
+# the CDC gateway builds from its own directory as its own context and is
+# unaffected by this file.
+**/node_modules
+workload/
+
 docs/assets
 *.dat
 *.wal
