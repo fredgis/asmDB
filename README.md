@@ -156,6 +156,13 @@ Capabilities** is the bridge — a custom Microsoft Fabric workload that turns a
 database into a Delta table in a Fabric lakehouse and keeps it current from the
 [change log](#change-data-capture) the engine already writes.
 
+A Fabric administrator meets it first in the Workload Hub, where it is uploaded as a
+signed package and enabled per tenant and per capacity:
+
+<p align="center">
+  <img src="docs/assets/asmdb-workload-hub.png" alt="The workload's page in the Fabric Workload Hub: the banner and title, the asmDB Sync Hub item type, publisher support links, a Get started card, and an At a glance carousel showing the workload's own interface" width="90%">
+</p>
+
 <p align="center">
   <img src="docs/assets/asmdb-workload.png" alt="asmDB Analytical Capabilities running inside Fabric: connected status, counts of premium databases, workspace lakehouses and sync links, a sync-link builder, and a lineage graph from one asmdb database to two Fabric lakehouses whose edges are coloured Active and Planned from real notebook run history" width="90%">
 </p>
