@@ -36,6 +36,7 @@ func (a *api) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", a.handleHealth)
 	mux.Handle("GET /cdc/{instanceId}", a.auth(http.HandlerFunc(a.handleCDC)))
 	mux.Handle("GET /cdc/{instanceId}/head", a.auth(http.HandlerFunc(a.handleHead)))
+	mux.Handle("GET /snapshot/{instanceId}", a.auth(http.HandlerFunc(a.handleSnapshot)))
 	return loggingMiddleware(mux)
 }
 
@@ -121,6 +122,40 @@ func (a *api) handleCDC(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *api) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	after, ok := parseAfter(w, r)
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, r)
+	if !ok {
+		return
+	}
+	instanceDir, cdcPath, err := a.resolveInstance(r.PathValue("instanceId"))
+	if err != nil {
+		writeResolveError(w, err)
+		return
+	}
+	baseName := strings.TrimSuffix(filepath.Base(cdcPath), ".cdc")
+	page, err := readSnapshotPage(filepath.Join(instanceDir, baseName+".dat"), after, limit)
+	if err != nil {
+		writeSnapshotError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Asmdb-Snapshot-Seq", strconv.FormatUint(page.Seq, 10))
+	w.Header().Set("X-Asmdb-Live-Rows", strconv.FormatUint(page.LiveRows, 10))
+	w.Header().Set("X-Asmdb-Rows", strconv.Itoa(len(page.Rows)))
+	w.Header().Set("X-Asmdb-Has-More", strconv.FormatBool(page.HasMore))
+	w.Header().Set("X-Asmdb-Next-After", strconv.FormatUint(page.NextAfter, 10))
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	for _, row := range page.Rows {
+		_ = enc.Encode(row)
+	}
+}
+
 func parseFrom(w http.ResponseWriter, r *http.Request) (uint64, bool) {
 	raw := r.URL.Query().Get("from")
 	if raw == "" {
@@ -130,6 +165,19 @@ func parseFrom(w http.ResponseWriter, r *http.Request) (uint64, bool) {
 	n, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "from must be a non-negative decimal integer", "")
+		return 0, false
+	}
+	return n, true
+}
+
+func parseAfter(w http.ResponseWriter, r *http.Request) (uint64, bool) {
+	raw := r.URL.Query().Get("after")
+	if raw == "" {
+		return 0, true
+	}
+	n, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "after must be a non-negative decimal integer", "")
 		return 0, false
 	}
 	return n, true

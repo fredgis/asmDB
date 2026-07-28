@@ -34,6 +34,7 @@ KEY_VAULT_SECRET_NAME = "__ASMDB_KEY_VAULT_SECRET_NAME__"
 DECODER = "None"  # None, Hex, Base64, JSON, CSV, MessagePack
 DECODER_CONFIG: Dict[str, Any] = {}
 PAGE_LIMIT = 5000
+MAX_RESEEDS_PER_RUN = 3
 HARD_DELETE = False
 ACK_PATH_TEMPLATE = "/cdc/{instance_id}/ack"
 
@@ -94,13 +95,21 @@ def parse_ndjson(text: str) -> ParsedNdjson:
 
 
 def classify_gateway_response(status_code: int, body: str) -> ParsedNdjson:
-    if status_code == 409:
-        payload = json.loads(body)
+    error: Mapping[str, Any] = {}
+    code = None
+    if status_code in (409, 503):
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = {}
         error = payload.get("error", {}) if isinstance(payload, dict) else {}
-        code = error.get("code")
-        if code in ("cdc_gap", "cdc_corrupt"):
-            raise ReseedRequired(code, error)
+        code = error.get("code") if isinstance(error, dict) else None
+    if status_code == 409:
+        if code in ("cdc_gap", "cdc_corrupt", "snapshot_moved"):
+            raise ReseedRequired(str(code), error)
     if status_code == 503:
+        if code == "snapshot_unstable":
+            raise TransientGatewayError(f"snapshot_unstable: snapshot unavailable while a bulk operation is in flight: {body[:500]}")
         raise TransientGatewayError(f"CDC gateway temporarily unreadable: {body[:500]}")
     if status_code < 200 or status_code >= 300:
         raise SyncError(f"CDC gateway returned HTTP {status_code}: {body[:500]}")
@@ -417,6 +426,153 @@ def fetch_cdc_page(
             backoff *= 2
 
 
+def fetch_snapshot_page(
+    gateway_url: str,
+    instance_id: str,
+    token: str,
+    after: int,
+    limit: int,
+    max_attempts: int = 4,
+    initial_backoff_seconds: float = 2.0,
+) -> Tuple[List[Dict[str, Any]], Mapping[str, str]]:
+    import requests
+
+    url = gateway_url.rstrip("/") + f"/snapshot/{instance_id}?" + urlencode({"after": str(after), "limit": str(limit)})
+    attempt = 1
+    backoff = initial_backoff_seconds
+    while True:
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/x-ndjson"},
+            timeout=60,
+        )
+        try:
+            parsed = classify_gateway_response(response.status_code, response.text)
+            return parsed.frames, response.headers
+        except TransientGatewayError:
+            if attempt >= max_attempts:
+                raise
+            print(
+                f"WARNING: snapshot endpoint returned 503 for after={after}; "
+                f"retrying in {backoff:g}s (attempt {attempt + 1}/{max_attempts})"
+            )
+            time.sleep(backoff)
+            attempt += 1
+            backoff *= 2
+
+
+def seed_from_snapshot(
+    spark_session: Any,
+    gateway_url: str,
+    instance_id: str,
+    token: str,
+    table_name: str,
+    limit: int = PAGE_LIMIT,
+    max_restarts: int = 4,
+) -> int:
+    restart = 0
+    stage_table = _snapshot_stage_table_name(table_name)
+    while True:
+        after = 0
+        snapshot_seq: Optional[int] = None
+        row_count = 0
+        try:
+            drop_table_if_exists(spark_session, stage_table)
+            create_empty_snapshot_stage(spark_session, stage_table)
+            while True:
+                ops, headers = fetch_snapshot_page(gateway_url, instance_id, token, after, limit)
+                page_seq = _header_int(headers, "X-Asmdb-Snapshot-Seq", -1)
+                if page_seq < 0:
+                    raise SyncError("snapshot response missing X-Asmdb-Snapshot-Seq; existing table was left untouched")
+                if snapshot_seq is None:
+                    snapshot_seq = page_seq
+                elif page_seq != snapshot_seq:
+                    raise ReseedRequired("snapshot_moved", {"firstSeq": snapshot_seq, "pageSeq": page_seq})
+                rows = [row_from_op(op, snapshot_seq, decoder=DECODER, config=DECODER_CONFIG) for op in ops]
+                append_snapshot_rows(spark_session, stage_table, rows)
+                row_count += len(rows)
+
+                has_more = str(headers.get("X-Asmdb-Has-More", "false")).lower() == "true"
+                if not has_more:
+                    break
+                next_after = _header_value(headers, "X-Asmdb-Next-After")
+                if next_after in (None, ""):
+                    raise SyncError("snapshot response missing X-Asmdb-Next-After while X-Asmdb-Has-More=true; existing table was left untouched")
+                after = int(next_after)
+        except ReseedRequired as moved:
+            drop_table_if_exists(spark_session, stage_table)
+            if moved.reason != "snapshot_moved":
+                raise
+            restart += 1
+            if restart >= max_restarts:
+                raise FullReloadUnavailable(
+                    "snapshot moved repeatedly while reading; the table changed mid-snapshot and the "
+                    f"existing lakehouse table {table_name} was left untouched"
+                ) from moved
+            print(
+                "WARNING: snapshot moved while reading; restarting from the first page "
+                f"(attempt {restart + 1}/{max_restarts})"
+            )
+            continue
+        except TransientGatewayError as exc:
+            drop_table_if_exists(spark_session, stage_table)
+            raise FullReloadUnavailable(
+                "snapshot_unstable: snapshot is unavailable while a bulk operation is in flight; "
+                f"the existing lakehouse table {table_name} was left untouched"
+            ) from exc
+        except SyncError as exc:
+            drop_table_if_exists(spark_session, stage_table)
+            raise FullReloadUnavailable(
+                f"snapshot seed failed: {exc}; the existing lakehouse table {table_name} was left untouched"
+            ) from exc
+
+        if snapshot_seq is None:
+            drop_table_if_exists(spark_session, stage_table)
+            raise FullReloadUnavailable(
+                f"snapshot seed failed: no snapshot sequence was returned; the existing lakehouse table {table_name} was left untouched"
+            )
+        try:
+            apply_staged_rebuild(spark_session, table_name, stage_table, snapshot_seq)
+        finally:
+            drop_table_if_exists(spark_session, stage_table)
+        print(f"WARNING: seeded table from snapshot; watermark={snapshot_seq}, rows={row_count}")
+        return snapshot_seq
+
+
+def _snapshot_stage_table_name(table_name: str) -> str:
+    suffix = f"__asmdb_snapshot_stage_{int(time.time() * 1000)}"
+    if "." in table_name:
+        prefix, leaf = table_name.rsplit(".", 1)
+        return f"{prefix}.{leaf}{suffix}"
+    return f"{table_name}{suffix}"
+
+
+def drop_table_if_exists(spark_session: Any, table_name: str) -> None:
+    spark_session.sql(f"DROP TABLE IF EXISTS {table_name}")
+
+
+def create_empty_snapshot_stage(spark_session: Any, stage_table: str) -> None:
+    empty = spark_session.createDataFrame([], changes_schema([]))
+    empty.writeTo(stage_table).using("delta").createOrReplace()
+
+
+def append_snapshot_rows(spark_session: Any, stage_table: str, rows: Sequence[Mapping[str, Any]]) -> None:
+    if not rows:
+        return
+    from pyspark.sql import functions as F
+
+    staged = changes_dataframe(spark_session, rows).withColumn("_synced_at", F.current_timestamp())
+    staged.writeTo(stage_table).using("delta").option("mergeSchema", "true").append()
+
+
+def apply_staged_rebuild(spark_session: Any, table_name: str, stage_table: str, watermark: int) -> None:
+    plan = rebuild_write_plan()
+    if plan != ("replace_data", "write_watermark"):
+        raise AssertionError("snapshot rebuild must replace data before writing watermark")
+
+    spark_session.table(stage_table).writeTo(table_name).using("delta").createOrReplace()
+    write_watermark_property(spark_session, table_name, watermark)
+
 def acknowledge_watermark(gateway_url: str, instance_id: str, token: str, watermark: int) -> bool:
     import requests
 
@@ -463,6 +619,13 @@ def _header_int(headers: Mapping[str, str], name: str, default: int = 0) -> int:
         if key.lower() == name.lower():
             return int(value)
     return default
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> Optional[str]:
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
 
 
 def _quote_sql_string(value: str) -> str:
@@ -728,6 +891,7 @@ def run_sync() -> None:
     last_seq = read_watermark(spark, TARGET_TABLE)  # noqa: F821 - provided by Fabric
     from_seq = last_seq
     all_frames: List[Dict[str, Any]] = []
+    reset_count = 0
 
     while True:
         try:
@@ -740,13 +904,24 @@ def run_sync() -> None:
                 acknowledge_watermark(GATEWAY_URL, INSTANCE_ID, token, new_watermark)
                 return
             if reseed.reason == "reset_frame":
-                raise FullReloadUnavailable(
-                    "the source table was replaced wholesale (TRUNCATE, RESTORE or BENCH), which the engine "
-                    f"reports as a single RESET frame at commitSeq={reseed.detail.get('commitSeq')} carrying no rows. "
-                    "The change log therefore does not contain the new contents, and replaying it would empty "
-                    f"the lakehouse table rather than reload it. {TARGET_TABLE} has been left exactly as it was. "
-                    "Seed the table from the current source state, then resume syncing after that sequence."
-                ) from reseed
+                reset_count += 1
+                if reset_count > MAX_RESEEDS_PER_RUN:
+                    raise FullReloadUnavailable(
+                        "the source table is being replaced faster than this sync can follow: "
+                        f"it was reset {reset_count} times in this run. "
+                        f"{TARGET_TABLE} holds the last successfully seeded image."
+                    ) from reseed
+                print(
+                    "WARNING: source table was replaced wholesale "
+                    f"at commitSeq={reseed.detail.get('commitSeq')}; seeding from snapshot "
+                    f"({reset_count}/{MAX_RESEEDS_PER_RUN})"
+                )
+                new_watermark = seed_from_snapshot(spark, GATEWAY_URL, INSTANCE_ID, token, TARGET_TABLE, PAGE_LIMIT)  # noqa: F821
+                acknowledge_watermark(GATEWAY_URL, INSTANCE_ID, token, new_watermark)
+                last_seq = new_watermark
+                from_seq = new_watermark
+                all_frames = []
+                continue
             raise
 
         if not frames:

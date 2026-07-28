@@ -360,8 +360,10 @@ if resp.error in ("cdc_gap", "cdc_corrupt"):
         rebuild_table_by_replaying_cdc_from_base(); return
     raise FullReloadUnavailable("retention has trimmed the history needed for a complete rebuild")
 
-#    a RESET frame encountered mid-incremental stream is surfaced as an incident
-#    rather than papered over; RESET during a complete rebuild clears the image
+#    a RESET frame encountered mid-incremental stream is not papered over: the
+#    log carries no rows for it, so the table is seeded from the gateway's
+#    snapshot of the current state and consumption resumes at the snapshot's
+#    own sequence; RESET during a complete rebuild clears the image
 
 # 3. collapse to one row per id — the last write in the batch wins
 # 4. MERGE INTO ... WHEN MATCHED UPDATE / WHEN NOT MATCHED INSERT
@@ -885,7 +887,7 @@ Two things to settle before submitting, not after:
 | **Fabric UX compliance forbids our palette** | Restyling a finished application | **D2 is now "publish to the Hub", so this is live.** Resolve at the start of Phase 4. |
 | Lineage cannot be contributed to Fabric | Our edges are ours alone | Already assumed and designed for: stored in the item definition as `lineage/graph.json`, presented as ours |
 | **The gateway's mount is misconfigured read-write** | A bug in analytics could damage a transactional database | Read-only at the mount, asserted at startup and in a test, not merely intended |
-| A large database's first sync is slow | Bad first impression | **Planned.** A snapshot/backup seed path does not exist in the workload today; current automatic rebuild can only replay retained CDC from `baseSeq=0`. |
+| A large database's first sync is slow | Bad first impression | **Partly addressed.** The gateway now serves the current table state from the `.dat` file at `GET /snapshot/{instanceId}`, pinned to the `HDR_SEQ` it was read at, so a consumer can seed and then resume incrementally with no gap. It is used to recover from `RESET`; it is not yet used to shorten a first sync. |
 | asmDB free tier is 393,216 rows | Analytics on a free-tier database is not interesting | Position for `premium`; the mockup already says "premium databases" |
 
 ---

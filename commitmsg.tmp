@@ -1,0 +1,45 @@
+Seed the table from a snapshot when the source is replaced wholesale
+
+TRUNCATE, RESTORE and BENCH replace the whole table, and the engine
+reports each as one RESET frame carrying no operations - a deliberate
+design, stated in cdc.inc and parse.inc. A consumer that met one was
+stuck for ever: the change log holds no rows for the new contents, so
+replaying it clears the image and leaves nothing. Refusing was correct
+but permanent.
+
+The engine already carried what a seed needs. HDR_SEQ at header offset
+88 is the last commit sequence published to the change log, so a
+snapshot can be pinned to an exact point in the log; that is what makes
+"seed, then resume incrementally" correct rather than approximate.
+
+The gateway now serves GET /snapshot/{instanceId}. It reads the header
+before and after the scan and refuses rather than serve a torn image:
+503 while a bulk operation is in flight, 409 if the sequence moved. The
+notebook seeds from it on RESET, writes the snapshot sequence as its
+watermark, and resumes at that sequence in the same run.
+
+Two faults found in review rather than in testing, because both only
+appear at scale. The seed accumulated every row in driver memory before
+writing anything, against a table whose capacity is over three million
+rows; it now stages page by page and swaps once, still replacing data
+before the watermark. And the scan was bounded by rows found rather than
+slots examined, which matters because the engine reserves the file up
+front and writes sparsely - the live instance holds 2.44 MiB of data in
+a 1 GiB reservation, so a snapshot of an empty table would have read a
+gigabyte looking for rows that were not there. It is now bounded per
+page and ends early when the header's live count says the table is
+empty: measured at 1.1 seconds against the real file.
+
+Reseeding is capped per run, so a source being replaced faster than it
+can be followed fails with that explanation instead of rewriting the
+lakehouse table in a loop.
+
+The preview no longer presents dead rows as current. A change log keeps
+its history, so after a TRUNCATE it happily returned six frames of rows
+that no longer exist, with no hint that two RESETs had invalidated them,
+and drew the decoder sample from the oldest of them. It now reports the
+log's range, names the newest RESET, strikes through superseded entries
+and leaves the sample empty rather than offer a ghost.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: ab8ae5e0-e62f-4539-823d-70570d7062e3

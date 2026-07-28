@@ -47,10 +47,18 @@ confirmation against the real Azure Files read-only mount.
 - `GET /cdc/{instanceId}?from=<seq>&limit=<n>` returns one JSON object per
   complete CDC frame, with `X-Asmdb-Base-Seq`, `X-Asmdb-Last-Seq`, and
   `X-Asmdb-Has-More` headers.
+- `GET /snapshot/{instanceId}?after=<slot>&limit=<n>` returns one upsert-shaped
+  JSON object per live row from the current `.dat` image, pinned to
+  `X-Asmdb-Snapshot-Seq`. Paging is by slot index using `X-Asmdb-Next-After`;
+  each page also reports the source header's `X-Asmdb-Live-Rows`.
 
-`limit` defaults to 100 and is capped at 1000 frames. The cap bounds memory,
-latency, and notebook retry cost while still allowing efficient watermark paging;
-clients should keep paging from the last consumed `commitSeq`.
+`limit` defaults to 100 and is capped at 1000 frames or snapshot rows. Snapshot
+pages also scan at most 8192 slots (2 MiB of records) per request, so sparse
+reservations can legitimately return zero NDJSON rows with
+`X-Asmdb-Has-More: true`; clients should continue from `X-Asmdb-Next-After`.
+The caps bound memory, latency, and notebook retry cost while still allowing
+efficient watermark paging; clients should keep paging CDC from the last
+consumed `commitSeq` and snapshot pages from `X-Asmdb-Next-After`.
 
 ## Error vocabulary and consumer response
 
@@ -61,6 +69,8 @@ clients should keep paging from the last consumed `commitSeq`.
 | 404 | `not_found` | Instance directory or `.cdc` file is absent. | Treat the link as misconfigured or deleted. |
 | 409 | `cdc_gap` | `from` is below the log `baseSeq`; history was trimmed. | Stop incremental consumption, reseed from current table state, then resume after the new watermark. |
 | 409 | `cdc_corrupt` | A complete frame failed validation. The response includes `baseSeq`, `lastSeq`, and `commitSeq` of the damaged frame when known. | Stop incremental consumption, alert an operator, reseed from current table state, then resume from the known-good `lastSeq`. |
+| 409 | `snapshot_moved` | The table's `HDR_SEQ` changed while a snapshot page was being read. | Retry the snapshot page; do not use the torn response. |
+| 503 | `snapshot_unstable` | A TRUNCATE, RESTORE, BENCH, or RESET is in flight. | Retry later; the table image is intentionally transient. |
 | 503 | `share_unreadable` | The share, `.cdc`, or `.dat` cannot be read right now. | Retry later; this is reserved for transient mount/permission/I/O failures. |
 
 Torn tails are not errors. If an append is in flight or a crash left an

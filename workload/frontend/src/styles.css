@@ -384,3 +384,11 @@ dd { margin: 0; font-weight: 700; }
   .lineageMobileList { display: grid; }
   .monitorStats { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* A change log keeps its history, so a preview can show rows that a later
+   TRUNCATE, RESTORE or BENCH already discarded. Dim them rather than letting
+   them read as current, and never rely on the dimming alone to say so. */
+.supersededRow { opacity: 0.55; }
+.supersededRow td, .supersededRow dd { text-decoration: line-through; }
+.supersededRow td:first-child, .supersededRow .surfaceBadge { text-decoration: none; }
+.cdcCard.supersededRow { border-style: dashed; }

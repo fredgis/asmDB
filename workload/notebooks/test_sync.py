@@ -22,12 +22,14 @@ from sync_template import (
     collapse_frames,
     decode_content,
     fetch_cdc_page,
+    fetch_snapshot_page,
     fold_rebuild_frames,
     get_gateway_token,
     incremental_write_plan,
     parse_ndjson,
     rebuild_from_cdc_base,
     rebuild_write_plan,
+    seed_from_snapshot,
 )
 
 
@@ -393,7 +395,7 @@ def test_rebuild_paging_also_uses_exclusive_from(monkeypatch):
     assert requested == [0, 2]
 
 
-def test_a_reset_frame_fails_the_run_rather_than_emptying_the_table(monkeypatch):
+def test_a_reset_frame_seeds_from_snapshot_then_resumes_from_snapshot_sequence(monkeypatch):
     """BENCH, TRUNCATE and RESTORE emit one RESET frame carrying no operations.
 
     The change log cannot rebuild the table from that: replaying it clears the
@@ -401,21 +403,228 @@ def test_a_reset_frame_fails_the_run_rather_than_emptying_the_table(monkeypatch)
     writing an empty table would destroy the lakehouse copy.
     """
 
+    requested = []
+
     def fake_fetch(gateway, instance, token, from_seq, limit):
-        return ([frame(7, [], reset=True)], {"X-Asmdb-Has-More": "false"})
+        requested.append(from_seq)
+        if len(requested) == 1:
+            return ([frame(7, [], reset=True)], {"X-Asmdb-Has-More": "false"})
+        return ([frame(11, [upsert(2, 20)])], {"X-Asmdb-Has-More": "false"})
+
+    def fake_snapshot(gateway, instance, token, after, limit):
+        assert after == 0
+        return ([upsert(1, 10)], {"X-Asmdb-Snapshot-Seq": "10", "X-Asmdb-Has-More": "false"})
 
     monkeypatch.setattr("sync_template.fetch_cdc_page", fake_fetch)
+    monkeypatch.setattr("sync_template.fetch_snapshot_page", fake_snapshot)
     monkeypatch.setattr("sync_template.get_gateway_token", lambda vault, name: "token")
     monkeypatch.setattr("sync_template.spark", object(), raising=False)
     monkeypatch.setattr("sync_template.read_watermark", lambda spark, table: 6)
 
-    applied = []
-    monkeypatch.setattr("sync_template.apply_incremental_rows", lambda *a, **k: applied.append(a))
-    monkeypatch.setattr("sync_template.apply_rebuild_rows", lambda *a, **k: applied.append(a))
+    staged = []
+    rebuilds = []
+    increments = []
+    monkeypatch.setattr("sync_template.drop_table_if_exists", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.create_empty_snapshot_stage", lambda *a, **k: staged.clear())
+    monkeypatch.setattr("sync_template.append_snapshot_rows", lambda spark, stage, rows: staged.extend(rows))
+    monkeypatch.setattr("sync_template.apply_staged_rebuild", lambda spark, table, stage, watermark: rebuilds.append((spark, table, list(staged), watermark)))
+    monkeypatch.setattr("sync_template.apply_incremental_rows", lambda *a, **k: increments.append(a))
+    monkeypatch.setattr("sync_template.acknowledge_watermark", lambda *a, **k: True)
+
+    sync_template.run_sync()
+
+    assert requested == [6, 10], "incremental resume must use the snapshot sequence, not snapshot sequence + 1"
+    assert rebuilds[0][3] == 10
+    assert [row["id"] for row in rebuilds[0][2]] == [1]
+    assert increments[0][3] == 11
+
+
+def test_seed_from_snapshot_reassembles_multi_page_rows_exactly_once(monkeypatch):
+    calls = []
+
+    def fake_snapshot(gateway, instance, token, after, limit):
+        calls.append(after)
+        if after == 0:
+            return (
+                [upsert(1, 10), upsert(2, 20)],
+                {"X-Asmdb-Snapshot-Seq": "50", "X-Asmdb-Has-More": "true", "X-Asmdb-Next-After": "2"},
+            )
+        return ([upsert(3, 30)], {"X-Asmdb-Snapshot-Seq": "50", "X-Asmdb-Has-More": "false"})
+
+    staged = []
+    applied = {}
+    monkeypatch.setattr("sync_template.fetch_snapshot_page", fake_snapshot)
+    monkeypatch.setattr("sync_template.drop_table_if_exists", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.create_empty_snapshot_stage", lambda *a, **k: staged.clear())
+    monkeypatch.setattr("sync_template.append_snapshot_rows", lambda spark, stage, rows: staged.extend(rows))
+    monkeypatch.setattr(
+        "sync_template.apply_staged_rebuild",
+        lambda spark, table, stage, watermark: applied.update(rows=list(staged), watermark=watermark),
+    )
+
+    watermark = seed_from_snapshot("spark", "gateway", "instance", "token", "target")
+
+    assert calls == [0, 2]
+    assert watermark == 50
+    assert applied["watermark"] == 50
+    assert [row["id"] for row in applied["rows"]] == [1, 2, 3]
+
+
+def test_seed_from_snapshot_stages_each_page_without_accumulating_all_rows(monkeypatch):
+    calls = []
+    appended_batches = []
+
+    def fake_snapshot(gateway, instance, token, after, limit):
+        calls.append(after)
+        if after == 0:
+            return (
+                [upsert(1, 10), upsert(2, 20)],
+                {"X-Asmdb-Snapshot-Seq": "60", "X-Asmdb-Has-More": "true", "X-Asmdb-Next-After": "2"},
+            )
+        return ([upsert(3, 30)], {"X-Asmdb-Snapshot-Seq": "60", "X-Asmdb-Has-More": "false"})
+
+    monkeypatch.setattr("sync_template.fetch_snapshot_page", fake_snapshot)
+    monkeypatch.setattr("sync_template.drop_table_if_exists", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.create_empty_snapshot_stage", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "sync_template.append_snapshot_rows",
+        lambda spark, stage, rows: appended_batches.append([row["id"] for row in rows]),
+    )
+    monkeypatch.setattr("sync_template.apply_staged_rebuild", lambda *a, **k: None)
+
+    assert seed_from_snapshot("spark", "gateway", "instance", "token", "target") == 60
+    assert calls == [0, 2]
+    assert appended_batches == [[1, 2], [3]]
+
+
+def test_empty_snapshot_replaces_table_with_empty_image(monkeypatch):
+    monkeypatch.setattr(
+        "sync_template.fetch_snapshot_page",
+        lambda *args, **kwargs: ([], {"X-Asmdb-Snapshot-Seq": "30", "X-Asmdb-Has-More": "false"}),
+    )
+    staged = []
+    applied = {}
+    monkeypatch.setattr("sync_template.drop_table_if_exists", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.create_empty_snapshot_stage", lambda *a, **k: staged.clear())
+    monkeypatch.setattr("sync_template.append_snapshot_rows", lambda spark, stage, rows: staged.extend(rows))
+    monkeypatch.setattr(
+        "sync_template.apply_staged_rebuild",
+        lambda spark, table, stage, watermark: applied.update(rows=list(staged), watermark=watermark),
+    )
+
+    assert seed_from_snapshot("spark", "gateway", "instance", "token", "target") == 30
+    assert applied == {"rows": [], "watermark": 30}
+
+
+def test_snapshot_unstable_retries_then_fails_left_untouched(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 503
+        text = '{"error":{"code":"snapshot_unstable","message":"bulk operation in flight"}}'
+        headers = {}
+
+    def fake_get(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Response()
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(get=fake_get))
+    monkeypatch.setattr("sync_template.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("sync_template.drop_table_if_exists", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.create_empty_snapshot_stage", lambda *a, **k: None)
+
+    with pytest.raises(FullReloadUnavailable) as exc:
+        seed_from_snapshot("spark", "https://gateway.example", "instance", "token", "target")
+
+    assert len(calls) == 4
+    message = str(exc.value)
+    assert "snapshot_unstable" in message
+    assert "bulk operation is in flight" in message
+    assert "left untouched" in message
+
+
+def test_snapshot_moved_restarts_from_first_page(monkeypatch):
+    calls = []
+    responses = [
+        ([upsert(1, 10)], {"X-Asmdb-Snapshot-Seq": "100", "X-Asmdb-Has-More": "true", "X-Asmdb-Next-After": "1"}),
+        ReseedRequired("snapshot_moved", {"code": "snapshot_moved"}),
+        ([upsert(2, 20)], {"X-Asmdb-Snapshot-Seq": "101", "X-Asmdb-Has-More": "false"}),
+    ]
+
+    def fake_snapshot(gateway, instance, token, after, limit):
+        calls.append(after)
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    staged = []
+    applied = {}
+    monkeypatch.setattr("sync_template.fetch_snapshot_page", fake_snapshot)
+    monkeypatch.setattr("sync_template.drop_table_if_exists", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.create_empty_snapshot_stage", lambda *a, **k: staged.clear())
+    monkeypatch.setattr("sync_template.append_snapshot_rows", lambda spark, stage, rows: staged.extend(rows))
+    monkeypatch.setattr(
+        "sync_template.apply_staged_rebuild",
+        lambda spark, table, stage, watermark: applied.update(rows=list(staged), watermark=watermark),
+    )
+
+    assert seed_from_snapshot("spark", "gateway", "instance", "token", "target") == 101
+    assert calls == [0, 1, 0]
+    assert [row["id"] for row in applied["rows"]] == [2]
+
+
+def test_seed_path_uses_rebuild_write_plan_data_before_watermark(monkeypatch):
+    monkeypatch.setattr(
+        "sync_template.fetch_snapshot_page",
+        lambda *args, **kwargs: ([upsert(1, 10)], {"X-Asmdb-Snapshot-Seq": "40", "X-Asmdb-Has-More": "false"}),
+    )
+    observed = {}
+    monkeypatch.setattr("sync_template.drop_table_if_exists", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.create_empty_snapshot_stage", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.append_snapshot_rows", lambda *a, **k: None)
+
+    def fake_apply(spark, table, stage, watermark):
+        plan = rebuild_write_plan()
+        observed["plan"] = plan
+        observed["stage"] = stage
+        observed["watermark"] = watermark
+
+    monkeypatch.setattr("sync_template.apply_staged_rebuild", fake_apply)
+
+    seed_from_snapshot("spark", "gateway", "instance", "token", "target")
+
+    assert observed["plan"] == ("replace_data", "write_watermark")
+    assert observed["plan"].index("replace_data") < observed["plan"].index("write_watermark")
+    assert observed["watermark"] == 40
+
+
+def test_run_sync_bounds_repeated_reset_reseeds(monkeypatch):
+    requested = []
+    seeded = []
+
+    def fake_fetch(gateway, instance, token, from_seq, limit):
+        requested.append(from_seq)
+        return ([frame(from_seq + 1, [], reset=True)], {"X-Asmdb-Has-More": "false"})
+
+    def fake_seed(*args, **kwargs):
+        watermark = 100 + len(seeded)
+        seeded.append(watermark)
+        return watermark
+
+    monkeypatch.setattr("sync_template.fetch_cdc_page", fake_fetch)
+    monkeypatch.setattr("sync_template.seed_from_snapshot", fake_seed)
+    monkeypatch.setattr("sync_template.get_gateway_token", lambda vault, name: "token")
+    monkeypatch.setattr("sync_template.spark", object(), raising=False)
+    monkeypatch.setattr("sync_template.read_watermark", lambda spark, table: 6)
+    monkeypatch.setattr("sync_template.acknowledge_watermark", lambda *a, **k: True)
 
     with pytest.raises(FullReloadUnavailable) as exc:
         sync_template.run_sync()
 
-    assert "replaced wholesale" in str(exc.value)
-    assert "left exactly as it was" in str(exc.value)
-    assert applied == [], "a reset must not write anything"
+    message = str(exc.value)
+    assert seeded == [100, 101, 102]
+    assert requested == [6, 100, 101, 102]
+    assert "reset 4 times" in message
+    assert "being replaced faster than this sync can follow" in message
+    assert "last successfully seeded image" in message

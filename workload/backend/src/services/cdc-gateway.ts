@@ -74,7 +74,32 @@ export class CdcGatewayService {
     const url = new URL(joinUrl(this.config.gatewayUrl, `/cdc/${encodeURIComponent(instanceId)}`));
     url.searchParams.set("from", from);
     url.searchParams.set("limit", String(limit));
+    return this.forward(url, authorization, ["x-asmdb-base-seq", "x-asmdb-last-seq", "x-asmdb-has-more"]);
+  }
 
+  async snapshotPassthrough(
+    instanceId: string,
+    after: string,
+    limit: number,
+    authorization: string
+  ): Promise<{ status: number; body: string; headers: Record<string, string> }> {
+    const url = new URL(joinUrl(this.config.gatewayUrl, `/snapshot/${encodeURIComponent(instanceId)}`));
+    url.searchParams.set("after", after);
+    url.searchParams.set("limit", String(limit));
+    return this.forward(url, authorization, [
+      "x-asmdb-snapshot-seq",
+      "x-asmdb-rows",
+      "x-asmdb-live-rows",
+      "x-asmdb-has-more",
+      "x-asmdb-next-after",
+    ]);
+  }
+
+  private async forward(
+    url: URL,
+    authorization: string,
+    passHeaders: string[]
+  ): Promise<{ status: number; body: string; headers: Record<string, string> }> {
     const response = await fetchTextCapped(
       url.toString(),
       {
@@ -89,7 +114,7 @@ export class CdcGatewayService {
     );
 
     const headers: Record<string, string> = {};
-    for (const name of ["x-asmdb-base-seq", "x-asmdb-last-seq", "x-asmdb-has-more"]) {
+    for (const name of passHeaders) {
       const value = response.headers.get(name);
       if (value !== null) headers[name] = value;
     }

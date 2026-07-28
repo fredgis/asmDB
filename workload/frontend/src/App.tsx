@@ -52,8 +52,8 @@ interface CdcOperation {
 }
 
 type PreviewEntry =
-  | { kind: "reset"; commitSeq: string }
-  | { kind: "op"; commitSeq: string; op: string; id: string; tag: string; content: string; value: string; created: string; updated: string };
+  | { kind: "reset"; commitSeq: string; superseded?: boolean }
+  | { kind: "op"; commitSeq: string; op: string; id: string; tag: string; content: string; value: string; created: string; updated: string; superseded?: boolean };
 
 interface NotebookListItem {
   key: string;
@@ -268,7 +268,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function previewEntries(preview: unknown): PreviewEntry[] {
-  return extractFrames(preview).flatMap((frame) => {
+  const entries = extractFrames(preview).flatMap((frame) => {
     const commitSeq = String(frame.commitSeq ?? "—");
     if (frame.flags?.reset) return [{ kind: "reset", commitSeq } satisfies PreviewEntry];
     const ops = Array.isArray(frame.ops) ? frame.ops : [];
@@ -284,6 +284,59 @@ function previewEntries(preview: unknown): PreviewEntry[] {
       updated: operation.record?.updated ?? "—",
     }));
   });
+
+  const lastReset = lastResetSeq(preview);
+  if (lastReset === undefined) return entries;
+  return entries.map((entry) => {
+    const seq = Number(entry.commitSeq);
+    if (!Number.isFinite(seq) || seq > lastReset) return entry;
+    return { ...entry, superseded: true };
+  });
+}
+
+/**
+ * The change log keeps its history, so a preview happily shows rows that a later
+ * TRUNCATE, RESTORE or BENCH has already discarded. Those operations appear as a
+ * RESET frame carrying no operations, and every frame at or before the newest one
+ * describes a table that no longer exists.
+ */
+function lastResetSeq(preview: unknown): number | undefined {
+  let last: number | undefined;
+  for (const frame of extractFrames(preview)) {
+    if (!frame.flags?.reset) continue;
+    const seq = Number(frame.commitSeq);
+    if (Number.isFinite(seq)) last = last === undefined ? seq : Math.max(last, seq);
+  }
+  return last;
+}
+
+function logHead(preview: unknown): { baseSeq?: string; lastSeq?: string; hasMore?: boolean } {
+  if (!isRecord(preview)) return {};
+  return {
+    baseSeq: typeof preview.baseSeq === "string" ? preview.baseSeq : undefined,
+    lastSeq: typeof preview.lastSeq === "string" ? preview.lastSeq : undefined,
+    hasMore: preview.hasMore === true,
+  };
+}
+
+function previewSummary(preview: unknown, entries: PreviewEntry[]): string {
+  const head = logHead(preview);
+  const range = head.baseSeq !== undefined && head.lastSeq !== undefined
+    ? ` The log holds sequences ${head.baseSeq} to ${head.lastSeq}.`
+    : "";
+  if (!entries.length) {
+    return `The change log returned no frames.${range} Nothing has been written since the log was last trimmed.`;
+  }
+  const lastReset = lastResetSeq(preview);
+  const live = entries.filter((entry) => !entry.superseded).length;
+  const noun = `${entries.length} ${entries.length === 1 ? "entry" : "entries"}`;
+  if (lastReset === undefined) {
+    return `${noun} returned.${range}`;
+  }
+  if (live === 0) {
+    return `${noun} returned, and every one of them is superseded.${range} A RESET at sequence ${lastReset} means the whole table was replaced by TRUNCATE, RESTORE or BENCH. The rows below are history: they no longer exist in the source, and the change log does not carry the replacement.`;
+  }
+  return `${noun} returned, of which ${live} follow the RESET at sequence ${lastReset}.${range} Entries at or before that sequence describe rows the source has already discarded.`;
 }
 
 function firstPreviewSample(preview: unknown): string {
@@ -822,12 +875,13 @@ function App() {
       }
       const preview = await previewCdc(token, selectedSource.id);
       const text = JSON.stringify(preview, null, 2);
-      const content = firstPreviewSample(preview);
       const rows = previewEntries(preview);
+      const liveSample = rows.find((entry): entry is Extract<PreviewEntry, { kind: "op" }> => entry.kind === "op" && !entry.superseded && Boolean(entry.content) && entry.content !== "—");
+      const content = liveSample?.content ?? (lastResetSeq(preview) === undefined ? firstPreviewSample(preview) : "");
       setSample(content.slice(0, CONTENT_LIMIT_BYTES));
       setPreviewRows(rows);
       setPreviewState(rows.length || content || text !== "{}" ? "ready" : "no-data");
-      setPreviewText(rows.length ? `${rows.length} CDC preview ${rows.length === 1 ? "entry" : "entries"} returned.` : "The request succeeded but no content sample was present in the preview payload.");
+      setPreviewText(previewSummary(preview, rows));
     } catch (error) {
       setPreviewState("failed");
       setPreviewText(issueFrom(error, { dependency: "backend", message: "CDC preview failed." }).message);
@@ -1163,7 +1217,12 @@ function LineageDiagram({ graph, selectedId, onSelect }: { graph: ReturnType<typ
 }
 
 function CdcPreview({ entries }: { entries: PreviewEntry[] }) {
-  return <div className="cdcPreview"><div className="cdcTableWrap"><table className="cdcTable"><thead><tr><th>Commit</th><th>Op</th><th>ID</th><th>Tag</th><th>Content</th><th>Value</th><th>Created</th><th>Updated</th></tr></thead><tbody>{entries.map((entry, index) => entry.kind === "reset" ? <tr key={`${entry.commitSeq}-${index}`}><td>{entry.commitSeq}</td><td colSpan={7}><span className="surfaceBadge">Reset marker</span> Log was seeded; no row operation in this frame.</td></tr> : <tr key={`${entry.commitSeq}-${entry.id}-${index}`}><td>{entry.commitSeq}</td><td>{entry.op}</td><td>{entry.id}</td><td>{entry.tag}</td><td><span className="truncateCell" title={entry.content}>{entry.content}</span></td><td>{entry.value}</td><td title={entry.created}>{formatEpochMilliseconds(entry.created)}</td><td title={entry.updated}>{formatEpochMilliseconds(entry.updated)}</td></tr>)}</tbody></table></div><div className="cdcCards">{entries.map((entry, index) => entry.kind === "reset" ? <article key={`${entry.commitSeq}-${index}`} className="cdcCard"><strong>Commit {entry.commitSeq}</strong><span className="surfaceBadge">Reset marker</span><p>Log was seeded; no row operation in this frame.</p></article> : <article key={`${entry.commitSeq}-${entry.id}-${index}`} className="cdcCard"><strong>Commit {entry.commitSeq} · {entry.op}</strong><dl><div><dt>ID</dt><dd>{entry.id}</dd></div><div><dt>Tag</dt><dd>{entry.tag}</dd></div><div><dt>Content</dt><dd title={entry.content}>{entry.content}</dd></div><div><dt>Value</dt><dd>{entry.value}</dd></div><div><dt>Created</dt><dd title={entry.created}>{formatEpochMilliseconds(entry.created)}</dd></div><div><dt>Updated</dt><dd title={entry.updated}>{formatEpochMilliseconds(entry.updated)}</dd></div></dl></article>)}</div></div>;
+  const resetText = "The whole table was replaced here by TRUNCATE, RESTORE or BENCH. This frame carries no rows, and the change log does not hold the replacement.";
+  return <div className="cdcPreview"><div className="cdcTableWrap"><table className="cdcTable"><thead><tr><th>Commit</th><th>Op</th><th>ID</th><th>Tag</th><th>Content</th><th>Value</th><th>Created</th><th>Updated</th></tr></thead><tbody>{entries.map((entry, index) => entry.kind === "reset"
+    ? <tr key={`${entry.commitSeq}-${index}`} className={entry.superseded ? "supersededRow" : ""}><td>{entry.commitSeq}</td><td colSpan={7}><span className="surfaceBadge surfaceBadgeDanger">Table replaced</span> {resetText}</td></tr>
+    : <tr key={`${entry.commitSeq}-${entry.id}-${index}`} className={entry.superseded ? "supersededRow" : ""}><td>{entry.commitSeq}{entry.superseded ? <span className="surfaceBadge">Superseded</span> : null}</td><td>{entry.op}</td><td>{entry.id}</td><td>{entry.tag}</td><td><span className="truncateCell" title={entry.content}>{entry.content}</span></td><td>{entry.value}</td><td title={entry.created}>{formatEpochMilliseconds(entry.created)}</td><td title={entry.updated}>{formatEpochMilliseconds(entry.updated)}</td></tr>)}</tbody></table></div><div className="cdcCards">{entries.map((entry, index) => entry.kind === "reset"
+    ? <article key={`${entry.commitSeq}-${index}`} className={`cdcCard ${entry.superseded ? "supersededRow" : ""}`}><strong>Commit {entry.commitSeq}</strong><span className="surfaceBadge surfaceBadgeDanger">Table replaced</span><p>{resetText}</p></article>
+    : <article key={`${entry.commitSeq}-${entry.id}-${index}`} className={`cdcCard ${entry.superseded ? "supersededRow" : ""}`}><strong>Commit {entry.commitSeq} · {entry.op}{entry.superseded ? <span className="surfaceBadge">Superseded</span> : null}</strong><dl><div><dt>ID</dt><dd>{entry.id}</dd></div><div><dt>Tag</dt><dd>{entry.tag}</dd></div><div><dt>Content</dt><dd title={entry.content}>{entry.content}</dd></div><div><dt>Value</dt><dd>{entry.value}</dd></div><div><dt>Created</dt><dd title={entry.created}>{formatEpochMilliseconds(entry.created)}</dd></div><div><dt>Updated</dt><dd title={entry.updated}>{formatEpochMilliseconds(entry.updated)}</dd></div></dl></article>)}</div></div>;
 }
 
 export default App;

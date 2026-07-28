@@ -40,6 +40,16 @@ const querySchema = z.object({
     .transform((value) => Math.min(value, GATEWAY_PAGE_LIMIT)),
 });
 
+const snapshotQuerySchema = z.object({
+  after: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .default(GATEWAY_PAGE_LIMIT)
+    .transform((value) => Math.min(value, GATEWAY_PAGE_LIMIT)),
+});
+
 /**
  * Fabric Spark cannot reach the CDC gateway. The gateway runs in an internal Container
  * Apps environment, and Fabric does not create a private DNS zone for that resource type,
@@ -78,6 +88,42 @@ export function syncRouter(services: { cdcGateway: CdcGatewayService }): Router 
       const upstream = await services.cdcGateway.passthrough(
         params.data.instanceId,
         String(query.data.from),
+        query.data.limit,
+        authorization
+      );
+
+      for (const [name, value] of Object.entries(upstream.headers)) {
+        res.setHeader(name, value);
+      }
+      res.status(upstream.status).send(upstream.body);
+    })
+  );
+
+  router.get(
+    "/snapshot/:instanceId",
+    asyncHandler(async (req, res) => {
+      const params = paramsSchema.safeParse(req.params);
+      if (!params.success) {
+        throw validationError("Invalid snapshot path", params.error);
+      }
+
+      const query = snapshotQuerySchema.safeParse(req.query);
+      if (!query.success) {
+        throw validationError("Invalid snapshot query", query.error);
+      }
+
+      const authorization = req.header("authorization");
+      if (!authorization) {
+        throw new HttpError(
+          401,
+          "unauthorized",
+          "This route forwards the caller's bearer token to the CDC gateway. Send the gateway token in the Authorization header."
+        );
+      }
+
+      const upstream = await services.cdcGateway.snapshotPassthrough(
+        params.data.instanceId,
+        String(query.data.after),
         query.data.limit,
         authorization
       );

@@ -210,15 +210,7 @@ func (f cdcFrame) toJSON() frameJSON {
 	for _, op := range f.Ops {
 		out := opJSON{Op: op.Type, ID: formatUint(op.ID)}
 		if op.Record != nil {
-			r := op.Record
-			out.Record = map[string]string{
-				"id":      formatUint(r.ID),
-				"value":   strconvInt(r.Value),
-				"tag":     r.Tag,
-				"content": r.Content,
-				"created": strconvInt(r.Created),
-				"updated": strconvInt(r.Updated),
-			}
+			out = recordToUpsertJSON(*op.Record)
 		}
 		ops = append(ops, out)
 	}
@@ -226,6 +218,21 @@ func (f cdcFrame) toJSON() frameJSON {
 		CommitSeq: formatUint(f.CommitSeq),
 		Flags:     flagsJSON{Reset: f.Flags&resetFlag != 0},
 		Ops:       ops,
+	}
+}
+
+func recordToUpsertJSON(r record) opJSON {
+	return opJSON{
+		Op: "upsert",
+		ID: formatUint(r.ID),
+		Record: map[string]string{
+			"id":      formatUint(r.ID),
+			"value":   strconvInt(r.Value),
+			"tag":     r.Tag,
+			"content": r.Content,
+			"created": strconvInt(r.Created),
+			"updated": strconvInt(r.Updated),
+		},
 	}
 }
 
