@@ -147,9 +147,14 @@ database into a Delta table in a Fabric lakehouse and keeps it current from the
 
 The design decision that shapes it: **Fabric Spark writes the Delta tables, we do
 not.** The workload generates a notebook in the customer's own workspace and lets
-Fabric run it on a schedule. No customer row passes through anything we operate, the
-compute is billed to the capacity where their analytics budget already lives, and the
-sync is a notebook they can read rather than a connector they must trust.
+Fabric run it on a schedule. The compute is billed to the capacity where their
+analytics budget already lives, and the sync is a notebook they can read rather
+than a connector they must trust.
+
+Rows do pass through one component we operate — the CDC gateway, which reads the
+change log from a **read-only** mount of the share the instances write to and
+serves it to the customer's notebook. It stores nothing, and refuses to start if
+that mount is writable. Everything downstream of it is the customer's own.
 
 Four components are built and tested, and the engine and the hosted service are
 untouched:

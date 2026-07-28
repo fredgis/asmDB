@@ -26,17 +26,18 @@ The reference environment is provisioned. These are the real values; substitute 
 | Verified Entra domain | `asmdb.cloud` | `az rest --url https://graph.microsoft.com/v1.0/domains` |
 | Entra app (multitenant) | `<workload-app-id>` | `az ad app show --id …` |
 | Application ID URI | `https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1` | same |
-| Exposed scope | `FabricWorkloadControl`, Power BI `871c010f-5e61-4fb1-83ac-98610a7e9110` preauthorised | same |
+| Exposed scope | `FabricWorkloadControl`; preauthorise Power BI `871c010f-5e61-4fb1-83ac-98610a7e9110`, Fabric Client for Workloads `d2450708-699c-41e3-8077-b0c8341509aa`, and Power BI Service `00000009-0000-0000-c000-000000000000`; delegated `Fabric.Extend` consented | same |
 | Federated credential | subject `<backend-mi-principal-id>` (backend managed identity), audience `api://AzureADTokenExchange` | `…/federatedIdentityCredentials` |
-| Key Vault | `<key-vault-name>`, **RBAC authorisation enabled** | `az keyvault show` |
+| Key Vault | `<key-vault-name>`, **RBAC authorisation enabled**, public network access disabled | `az keyvault show` |
 | Key Vault grant | workspace identity `<fabric-workspace-name>` / `<workspace-identity-object-id>` → **Key Vault Secrets User** | `az role assignment list --scope <vault>` |
 | Backend | `https://asmdb-analytical-backend.azurewebsites.net` | `/health` returns `{"status":"ok","version":"0.1.0"}` |
 | Frontend | `https://fe.asmdb.cloud` | `/`, `/sync-hub` and `/close` all return 200 over HTTPS |
 
-Two things are deliberately **not** deployed:
+One thing is deliberately **not** production-ready:
 
-- **The CDC gateway.** It reads a read-only mount of the Azure Files share that asmDB Cloud instances write to, so it belongs in `<service-resource-group>` alongside the service, not in the analytics group.
 - **Real support links.** Three still read `REPLACE-ME`, and the three GitHub links resolve only while the repository is private. Neither blocks a tenant-internal install; both block Workload Hub submission.
+
+The CDC gateway **is deployed**, but it is the deliberate exception to the analytics-resource-group split: it lives in `<service-resource-group>` alongside the service because it mounts the same Azure Files share, and it is private to the service VNet.
 
 ## Decisions to make before first upload
 
@@ -207,9 +208,24 @@ az ad app update `
   --identifier-uris "https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1"
 ```
 
-How to know it worked: the Application ID URI begins with `https://asmdb.cloud/` and contains the current workload id.
+How to know it worked: the Application ID URI begins with `https://asmdb.cloud/` and contains the current workload id. The host is exactly the verified domain; `fe` and `be` are path segments, not subdomains.
 
-Failure looks like: an `api://...` URI or an Azure-assigned/default domain remains. That does not satisfy the documented Fabric publishing requirement.
+Failure looks like: an `api://...` URI, an Azure-assigned/default domain, or a subdomain such as `https://workload.asmdb.cloud/...` remains. Those do not satisfy Fabric's publishing requirement.
+
+### 2.3.1 Expose the workload scope and preauthorise Fabric clients
+
+The workload app must expose `FabricWorkloadControl` and preauthorise the Microsoft clients that Fabric/Power BI use to request it:
+
+| Client | App id | Why |
+|---|---|---|
+| Power BI | `871c010f-5e61-4fb1-83ac-98610a7e9110` | Power BI frontend/client path. |
+| Fabric Client for Workloads | `d2450708-699c-41e3-8077-b0c8341509aa` | Current Fabric workload control-plane client. |
+| Power BI Service | `00000009-0000-0000-c000-000000000000` | Legacy/service path still required by Fabric workload authentication guidance. |
+
+Also add and consent delegated Power BI Service permission `Fabric.Extend`. Without it Fabric can upload and load enough of the workload to mislead you, then fail token acquisition.
+
+After running `deploy.ps1 -Only entra`, verify this by hand: inspect **Expose an API** → **Authorized client applications** and **API permissions** → admin consent. If any client or `Fabric.Extend` is missing, add it before packaging; token acquisition failures otherwise look like generic workload auth errors.
+
 
 ### 2.4 Complete publisher verification for Workload Hub only — lead-time item
 
@@ -414,7 +430,7 @@ The generated notebook reads the CDC gateway credential from Azure Key Vault. Th
 
 ### 6.1 Create the vault
 
-No Key Vault exists in the subscription yet, so this is a creation step rather than a prerequisite you already meet.
+In the reference environment the vault already exists. In a new tenant this is a creation step rather than a prerequisite you already meet.
 
 ```powershell
 az keyvault create `
@@ -427,11 +443,13 @@ az keyvault create `
 
 `--enable-rbac-authorization true` is not optional. A vault created in the legacy access-policy mode will ignore the role assignment below, and the failure is a plain 403 that says nothing about the cause.
 
-Then store the gateway token:
+Then store the gateway token for notebooks:
 
 ```powershell
 az keyvault secret set --vault-name "<vault-name>" --name "asmdb-gateway-token" --value "<token>"
 ```
+
+The backend's copy of the same token is intentionally **not** a Key Vault reference in the reference environment. Tenant policy disables public network access on the vault; Fabric reaches it through a managed private endpoint, while App Service cannot. Set `ASMDB_GATEWAY_TOKEN` as an application setting unless/until an App Service private path to the vault is added.
 
 ### 6.2 Find the workspace identity
 
@@ -482,7 +500,7 @@ A Fabric notebook's security context depends entirely on how it was triggered:
 
 Scheduling the notebook directly is the obvious thing to do, and it works — in testing, under your own account. It runs under a **named human identity**, so it keeps working right up until that person's access changes or they leave, at which point the sync stops with a Key Vault permission error that points at nothing.
 
-So the supported production path is a **Data Factory pipeline** containing a **Notebook activity** with **Workspace Identity** selected as the authentication method. Schedule the *pipeline*. Do not schedule the notebook.
+So the supported production path is a **Data Factory pipeline** containing a **Notebook activity** with **Workspace Identity** selected as the authentication method. Schedule the *pipeline*. Do not schedule the notebook for unattended production. The workload UI exposes Fabric native notebook scheduling as a convenience and states this trade-off beside the control; use it only when a named-human identity is acceptable.
 
 ### 7.1 Enable the tenant setting first
 
