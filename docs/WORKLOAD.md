@@ -2,10 +2,13 @@
 
 > **Status: live workload, with remaining planned work called out explicitly.**
 > Convention in this document: **Built** means implemented in this repository and, where
-> stated, deployed in the reference Fabric tenant; **Planned** means not built yet;
-> **Unverified** means code exists but the end-to-end Fabric behaviour has not been proven.
-> The visual target remains [`workload/mockup/index.html`](../workload/mockup/index.html)
-> — open it in a browser.
+> stated, deployed in the reference Fabric tenant; **Planned** means not built yet.
+> Nothing is currently marked *Unverified* — where this document once used that word for
+> code whose end-to-end Fabric behaviour was unproven, the behaviour has since been
+> measured against the live tenant and the claim either stands or has been corrected.
+> The surface is no longer aspirational: [`workload/mockup/index.html`](../workload/mockup/index.html)
+> records the original visual target, and the screenshots in the repository README show
+> what actually runs.
 
 ---
 
@@ -102,12 +105,12 @@ flowchart LR
 
 | Component | Status | Where | Responsibility |
 |---|---|---|---|
-| **Workload frontend** | **Built** | `workload/frontend/` | The Fabric iframe surface. Uses `acquireFrontendAccessToken`, stores link state in the item definition, creates notebooks through the backend, and offers native notebook scheduling with the human-identity warning shown in the UI. |
-| **Workload backend** | **Built** | `workload/backend/` | Validates Fabric tokens, performs OBO to asmDB Cloud and Fabric REST, lists premium databases/lakehouses, creates Notebook items, proxies CDC preview, and carries the private gateway URL/token in app settings. |
-| **Notebook templates** | **Built; Fabric open/run partly unverified** | `workload/notebooks/` | PySpark that reads CDC, merges into Delta, writes the table watermark, and automatically rebuilds only when the retained CDC log can honestly produce a complete table. Generated per link through the backend. |
+| **Workload frontend** | **Built** | `workload/frontend/` | The Fabric iframe surface. Uses `acquireFrontendAccessToken`, stores link state in the item definition, creates a notebook automatically when a link is created, deletes it with the link, and schedules and runs notebooks through the **Fabric REST API** — not the SDK's `itemSchedule` client, which is for custom item types and does not apply to first-party Notebooks (§5d). Link state is computed from real run history read back from Fabric. |
+| **Workload backend** | **Built** | `workload/backend/` | Validates Fabric tokens, performs OBO to asmDB Cloud and Fabric REST, lists premium databases/lakehouses, creates Notebook items, proxies CDC preview, and — because Fabric Spark cannot reach the private gateway (§3.5) — passes the change log and snapshots through to generated notebooks under `/api/sync`. Carries the private gateway URL and token in app settings. |
+| **Notebook templates** | **Built** | `workload/notebooks/` | PySpark that reads CDC, merges into Delta, writes the table watermark, rebuilds from the retained log when it can honestly produce a complete table, and **seeds from the gateway's snapshot** when the source was replaced wholesale. Generated per link through the backend. |
 | **Manifest + packaging** | **Built** | `workload/manifest/`, `workload/build/` | `WorkloadManifest.xml`, `Product.json`, item manifests, `.nuspec`, preflight validation and deployment scripts. |
-| **CDC gateway** | **Built and deployed private** | `workload/cdc-gateway/` | Reads `<db>.cdc` from a read-only Azure Files NFS mount and serves frames. Deployed in `<service-resource-group>` because it mounts the service share, runs as uid `100:101`, and is reachable only through the backend's VNet integration. See §3. |
-| **Watermark acknowledgement / trim registry** | **Planned** | not built in `saas/controlplane/` | The notebook calls an acknowledgement path best-effort, but the gateway has no `/ack` route and no control-plane registry advances `CDCTRIM` yet. Retention is therefore not automated by the workload today. |
+| **CDC gateway** | **Built and deployed private** | `workload/cdc-gateway/` | Reads `<db>.cdc` and `<db>.dat` from a read-only Azure Files NFS mount and serves change frames and point-in-time snapshots. Deployed in `<service-resource-group>` because it mounts the service share, runs as uid `100:101`, and is reachable only from inside the VNet — which is why both the backend and, through it, the notebooks reach it the way they do. See §3. |
+| **Watermark acknowledgement / trim registry** | **Planned** | not built in `saas/controlplane/` | The notebook calls an acknowledgement path best-effort, but the gateway has no `/ack` route and no control-plane registry advances `CDCTRIM` yet. Retention is therefore not automated by the workload today. The notebook prints a warning and continues, because a failed acknowledgement must never fail a sync that already committed its data. |
 | Engine | unchanged | `src/` | Already writes the change log we need. |
 
 ### 2.2 Where state lives
@@ -212,6 +215,9 @@ flowchart LR
 
 ```
 GET /cdc/{instanceId}?from=<seq>&limit=<n>
+GET /cdc/{instanceId}/head
+GET /snapshot/{instanceId}?after=<slot>&limit=<n>
+GET /healthz
 Authorization: Bearer <workload backend credential>
 Accept: application/x-ndjson
 ```
@@ -232,10 +238,31 @@ warehouse silently:
    notebook can reseed. An empty `200` here would read as "nothing changed" and the
    lakehouse would diverge from the database quietly and permanently. **This is the
    single most important line in the design.**
-2. **Never serve a partial frame.** Stop at the last valid trailer.
-3. **`RESET` must reach the consumer.** It means "everything you knew is void".
-4. **Bounded responses.** `limit` is capped server-side at 1000 frames in the built gateway; consumers page by watermark and must not depend on a larger requested value.
-5. **The gateway never writes.** Not to the share, not to the database, not ever.
+2. **`from` is exclusive.** The gateway skips frames whose `commitSeq <= from`, so a
+   consumer pages from *the last sequence it consumed*, never that plus one. This is
+   worth stating because it looks like a matter of taste and is not: asking for
+   `watermark + 1` skips exactly one frame on every call, and the symptom is a run
+   that reports success having silently done nothing.
+3. **Never serve a partial frame.** Stop at the last valid trailer.
+4. **`RESET` must reach the consumer, and the consumer must be able to act on it.**
+   It means "everything you knew is void". Because a `RESET` carries no operations
+   by design (§3.3), the log alone cannot repair the consumer — which is what
+   `GET /snapshot/{instanceId}` exists for.
+5. **A snapshot is pinned or it is worthless.** The snapshot route reads the `.dat`
+   header before and after its scan and returns `X-Asmdb-Snapshot-Seq`, the
+   change-log sequence the image belongs to. If the sequence moved it answers `409
+   snapshot_moved`; if a bulk operation is in flight it answers `503
+   snapshot_unstable`. A torn image served with a plausible sequence is worse than no
+   snapshot at all, because the consumer will resume from a watermark it never
+   actually reached.
+6. **Bounded responses.** `limit` is capped server-side at 1000 frames in the built
+   gateway; consumers page by watermark and must not depend on a larger requested
+   value. The snapshot route is additionally bounded by **slots examined**, not rows
+   found, because the engine reserves the table file up front and writes into it
+   sparsely — a table holding five live rows can sit in a gigabyte of reservation. A
+   snapshot page may therefore legitimately return zero rows with
+   `X-Asmdb-Has-More: true`.
+7. **The gateway never writes.** Not to the share, not to the database, not ever.
 
 ### 3.3 What asmDB already gives us
 
@@ -246,7 +273,17 @@ From [`docs/CDC.md`](CDC.md), and the reason this is tractable at all:
 - Each operation is a fixed 272 bytes carrying **the full 256-byte record image**, so a
   consumer never queries back. The notebook needs no read path into the transactional
   database at all — a real security property, not a convenience.
-- A `RESET` flag for global operations (`TRUNCATE`, `RESTORE`).
+- A `RESET` flag for global operations. **`TRUNCATE`, `RESTORE` and `BENCH` each emit
+  exactly one `RESET` frame carrying no operations**, by deliberate design:
+  `src/cdc.inc:16` and `src/parse.inc:2012` say so in as many words. The consequence
+  is easy to miss and expensive to discover in production: the change log does **not**
+  contain the replacement rows, so no amount of replaying it can reconstruct the
+  table. That is the whole reason `/snapshot` exists.
+- The `.dat` header carries `HDR_SEQ` at offset 88 — *the last commit sequence
+  published to the change log* — which is what lets a snapshot be pinned to an exact
+  point in the log rather than merely taken at roughly the right time. `HDR_BULK` at
+  128 and `HDR_RESETP` at 96 say whether a bulk operation or reset is in flight, and
+  the live row count sits at offset 24.
 - CRC-32 per frame plus a trailer.
 - `CDCTRIM <seq>` for retention, once a watermark is acknowledged.
 
@@ -273,6 +310,60 @@ runs the notebook under a *human* account and D1 then quietly does not hold.
 That also removes the option of putting a *database* token anywhere near a notebook,
 which would have been indefensible: an instance token can write and truncate, and a
 notebook is a shared, editable, printable object.
+
+### 3.5 How a notebook actually reaches the gateway
+
+The gateway is private, and it must stay private: it reads the share the live service
+writes to. The backend reaches it by regional VNet integration, which is available
+because the backend is an App Service we own, sitting in a subnet we created.
+
+**A Fabric notebook has neither of those properties.** It runs on Spark inside
+Microsoft's own managed network, in a different region, and cannot be placed in our
+VNet. No setting on the notebook changes that.
+
+The obvious answer — a Fabric managed private endpoint, the same mechanism that gives
+the notebook its Key Vault access — **does not work for Container Apps, and it fails
+silently.** Private Link is only half a mechanism; the other half is DNS. Fabric
+creates and links private DNS zones automatically for the resource types it supports,
+and Azure Container Apps is not among them. The endpoint provisions, both sides report
+`Succeeded` and `Approved`, and the name still resolves publicly. Measured from inside
+a Spark session after approval:
+
+```
+asmdb-cdc-gateway.<env>.swedencentral.azurecontainerapps.io -> 51.107.183.214
+<env>.privatelink.swedencentral.azurecontainerapps.io       -> 51.107.183.214
+HTTP FAILED: SSLError ... UNEXPECTED_EOF_WHILE_READING
+```
+
+Both names resolve to the **public** address, the connection reaches the public
+Container Apps edge, which serves nothing for an internal environment and drops the
+TLS handshake. The resulting `SSLError` reads like a certificate problem and is a DNS
+one, which is what makes this worth writing down.
+
+So generated notebooks read through the backend, which already has a working path:
+
+```
+GET /api/sync/cdc/{instanceId}?from=<seq>&limit=<n>
+GET /api/sync/snapshot/{instanceId}?after=<slot>&limit=<n>
+```
+
+These mirror the gateway's own contract exactly — same paths, same NDJSON, same
+`x-asmdb-*` headers — so the notebook's parsing, its gap and corruption handling and
+its tests are unchanged; only the base URL differs. `ASMDB_NOTEBOOK_GATEWAY_URL`
+carries that base URL into every generated notebook.
+
+**The caller's bearer token is forwarded untouched.** The gateway remains the only
+authority on who may read a change log; the backend mints, validates and substitutes
+nothing. Consequently `/api/sync` is deliberately **not** behind the Fabric token
+middleware that guards the rest of `/api`: a Spark notebook holds no Fabric token for
+this application, and inventing one would have meant a second, weaker authority.
+
+The trade-off, stated plainly: change-log data now traverses a public endpoint
+protected by the same bearer token that protects the gateway itself. The gateway stays
+unreachable from the internet, and the token is still the only credential that reads a
+change log — but the exposure is a public TLS endpoint rather than a private address,
+and the backend's App Service plan carries sync traffic as well as UI traffic. Revisit
+this if Fabric adds Container Apps to the resource types it integrates DNS for.
 
 [^routes]: `saas/sidecar/http.go` route table as of 1.7.0.
 
@@ -350,8 +441,9 @@ available per link — but it is irreversible, so it is not the default.
 # 1. resolve the watermark from the Delta table itself
 last_seq = spark.sql(f"DESCRIBE DETAIL {table}").select("properties").first() ... or 0
 
-# 2. pull frames
-resp = GET f"{gateway}/cdc/{instance_id}?from={last_seq + 1}&limit=5000"
+# 2. pull frames. `from` is EXCLUSIVE: page from the last sequence consumed,
+#    never that plus one, or exactly one frame is skipped on every call
+resp = GET f"{gateway}/cdc/{instance_id}?from={last_seq}&limit=5000"
 #    the built gateway caps the page at 1000 frames and returns has-more headers
 
 #    a gap/corrupt log means ordinary incremental consumption cannot continue
@@ -360,15 +452,22 @@ if resp.error in ("cdc_gap", "cdc_corrupt"):
         rebuild_table_by_replaying_cdc_from_base(); return
     raise FullReloadUnavailable("retention has trimmed the history needed for a complete rebuild")
 
-#    a RESET frame encountered mid-incremental stream is not papered over: the
-#    log carries no rows for it, so the table is seeded from the gateway's
-#    snapshot of the current state and consumption resumes at the snapshot's
-#    own sequence; RESET during a complete rebuild clears the image
+#    a RESET means the source was replaced wholesale and the log carries no rows
+#    for it, so replaying would empty the table rather than reload it. Seed from
+#    the pinned snapshot instead, then resume at the snapshot's own sequence in
+#    the same run. Reseeds are capped per run, so a source being replaced faster
+#    than it can be followed fails with that explanation rather than looping
+if reset_frame_seen:
+    seq = seed_from_snapshot(f"{gateway}/snapshot/{instance_id}")  # writes data, then watermark
+    from_seq = seq; continue
 
 # 3. collapse to one row per id — the last write in the batch wins
-# 4. MERGE INTO ... WHEN MATCHED UPDATE / WHEN NOT MATCHED INSERT
-# 5. write the new watermark as a table property, after the data
-# 6. best-effort acknowledge; built gateway has no /ack yet, so CDCTRIM is not automated
+# 4. stage with an EXPLICIT schema. Inference fails with CANNOT_DETERMINE_TYPE
+#    when an optional column is null in every row, which is ordinary for a table
+#    that never sets `value` or `tag`, and always true of `_synced_at`
+# 5. MERGE INTO ... WHEN MATCHED UPDATE / WHEN NOT MATCHED INSERT
+# 6. write the new watermark as a table property, after the data
+# 7. best-effort acknowledge; built gateway has no /ack yet, so CDCTRIM is not automated
 ```
 
 ### 4.5 Correctness, stated plainly
@@ -542,6 +641,52 @@ truth.
 
 ---
 
+## 5d. Scheduling a Notebook is not what the SDK suggests
+
+The workload SDK exposes `workloadClient.itemSchedule.*`, and it is the wrong API for
+this job. It serves the **custom item types a workload declares in its own manifest**;
+a Notebook is a first-party Fabric item, and its schedules live in the Fabric REST API.
+The two contracts share no fields, which is the clue that they are unrelated concepts
+rather than two routes to the same place:
+
+| SDK field | REST equivalent |
+|---|---|
+| `scheduleType: "Hourly"` | `configuration.type: "Cron"` with `interval: 60` |
+| `cronPeriod` / `cronUnit` | `configuration.interval`, in minutes |
+| `scheduleHours` | `configuration.times` |
+| `scheduleWeekdays: [{key, selected}]` | `configuration.weekdays: ["Monday", …]` |
+| `jobDefinitionObjectId` | **does not exist** |
+| `localTimeZoneId` (IANA) | `localTimeZoneId` (**Windows** identifier) |
+
+Calls through the SDK client fail without naming this as the reason, so the workload
+calls REST directly with a token acquired for the Fabric audience:
+
+```
+POST   /v1/workspaces/{ws}/items/{nb}/jobs/RunNotebook/schedules      → 201, synchronous
+PATCH  /v1/workspaces/{ws}/items/{nb}/jobs/RunNotebook/schedules/{id}
+GET    /v1/workspaces/{ws}/items/{nb}/jobs/RunNotebook/schedules
+POST   /v1/workspaces/{ws}/items/{nb}/jobs/RunNotebook/instances      → 202, not 200
+GET    /v1/workspaces/{ws}/items/{nb}/jobs/instances                  → run history
+```
+
+Four details decide whether a schedule is accepted, and none is obvious from the
+schema: `localTimeZoneId` must be a Windows identifier (`Romance Standard Time`, not
+`Europe/Paris`); `startDateTime` and `endDateTime` are required in practice though
+marked optional; timestamps carry **no trailing `Z`** despite the documentation showing
+one; and there is no `Hourly` type at all — an hourly cadence is `Cron` with `interval`
+expressed in minutes.
+
+Run-on-demand returns **202 Accepted with an empty body**. Treating only 200 as success
+makes every run report a failure it did not have, and the empty body is also why the
+run list has to be read back afterwards rather than appended to locally.
+
+`GET .../jobs/instances` is what makes the link states in §6 Phase 4 real rather than
+decorative: it returns runs started by a schedule or from the Fabric portal, not only
+those this browser session started, and it carries `failureReason` so a failed sync can
+say why.
+
+---
+
 ## 6. Development plan
 
 Seven workstreams. **Scopes are disjoint by directory** so they can run in parallel
@@ -575,13 +720,20 @@ work, where four agents worked simultaneously without a single collision.
 `saas/sidecar/`.**
 
 - Mount the instance share **read-only**; parse `<db>.cdc` per [`docs/CDC.md`](CDC.md).
-- `GET /cdc/{instanceId}?from=&limit=` serving NDJSON, bounded.
+- `GET /cdc/{instanceId}?from=&limit=` serving NDJSON, bounded. `from` is exclusive.
+- `GET /snapshot/{instanceId}?after=&limit=` serving the current table image from
+  `<db>.dat`, pinned to `HDR_SEQ` and refusing rather than serving a torn image:
+  `503 snapshot_unstable` while a bulk operation is in flight, `409 snapshot_moved` if
+  the sequence changes mid-read. Bounded by slots examined, because the engine reserves
+  the table file up front and writes sparsely.
 - `cdc_gap` when `from` precedes the log's base sequence — never an empty page.
 - Stop at the last complete frame; a torn tail is normal, not an error.
 - Authenticate the workload backend only; refuse everything else.
 - Tests: gap detection, `RESET` propagation, torn-tail handling, pagination, cap
-  enforcement, a log being appended to while it is read, and a log trimmed underneath
-  a reader mid-page.
+  enforcement, a log being appended to while it is read, a log trimmed underneath
+  a reader mid-page, and for snapshots: live/deleted/empty slots, sequence pinning,
+  paging by slot index, a sparse reservation terminating through bounded pages, and
+  content honouring `REC_CLEN` rather than trailing NULs.
 
 **Workstream B — control plane.** Scope: `saas/controlplane/`. **Planned, not built.**
 
@@ -593,16 +745,20 @@ work, where four agents worked simultaneously without a single collision.
 
 *Exit criterion: a plain `curl` against the gateway pages through a live database's change log while that database is being written to, and a trimmed log produces `cdc_gap` rather than an empty page.*
 
-### Phase 2 — the notebook *(depends on Phase 1)*
+### Phase 2 — the notebook *(Built)*
 
 **Workstream E.** Scope: `workload/notebooks/`.
 
 - Parameterised PySpark template: pull, collapse, `MERGE`, watermark, acknowledge.
-- Automatic rebuild path, triggered by `cdc_gap` / `cdc_corrupt` only when the retained CDC log still starts at `baseSeq=0`; otherwise fail loudly rather than pretend a partial tail is a full reload. `RESET` is folded correctly during a complete rebuild but still surfaces as an incident in an incremental stream.
+- Automatic rebuild path, triggered by `cdc_gap` / `cdc_corrupt` only when the retained CDC log still starts at `baseSeq=0`; otherwise fail loudly rather than pretend a partial tail is a full reload.
+- `RESET` seeds from the gateway snapshot and resumes at the snapshot's own sequence.
+  Reseeds are capped per run so a source replaced faster than it can be followed fails
+  with that explanation rather than rewriting the lakehouse table in a loop. The seed
+  stages page by page and swaps once, so driver memory does not scale with table size.
 - Idempotence test: run the same range twice, assert the table is identical.
 - Correctness test against a database under concurrent write.
 
-*Exit criterion: a notebook run by hand syncs a live asmDB database into a Delta table, twice, with the same result.*
+*Exit criterion: a notebook run by hand syncs a live asmDB database into a Delta table, twice, with the same result.* **Met**, verified end to end against the live engine: rows through gateway, backend and Spark into Delta with the correct column types and the watermark property written after the data.
 
 ### Phase 3 — workload skeleton *(parallel with Phase 2)*
 
@@ -617,21 +773,27 @@ work, where four agents worked simultaneously without a single collision.
 - OBO exchange to call asmDB Cloud.
 - OBO exchange to call Fabric REST for lakehouse listing and Notebook creation.
 - CDC token minting/preview endpoints per D1.
+- `/api/sync/cdc` and `/api/sync/snapshot` passthrough for generated notebooks, which
+  cannot reach the private gateway themselves (§3.5). Deliberately outside the Fabric
+  token middleware, forwarding the caller's gateway token untouched.
 - CORS allowing Fabric and Power BI hosts, `trust proxy`, and request limits.
 
 *Exit criterion: an empty workload loads inside Fabric, authenticates, and lists the caller's asmDB databases.*
 
-### Phase 4 — the surface *(Built, except full monitoring/runbook polish)*
+### Phase 4 — the surface *(Built)*
 
 **Workstream C — frontend.** Scope: `workload/frontend/`.
 
 Build in the mockup's order, because that is the order a user meets it:
 
 1. Shell, header, KPI strip.
-2. Create Sync Link — the core flow.
-3. Lineage panel (our own edges — see §5).
-4. Recent Sync Activity, Selected Link Details.
-5. Coverage & Readiness.
+2. Create Sync Link — the core flow. Creating a link creates its notebook; deleting the
+   link deletes the notebook, and says so plainly if that call fails rather than
+   claiming a cascade that did not happen.
+3. Lineage panel (our own edges — see §5), coloured from computed state, not stored state.
+4. Notebooks tab: the generated notebooks with their status, a formatted preview, the
+   five scheduling cadences the Fabric portal itself offers, and run history.
+5. Monitoring tab: recent sync activity and coverage, read back from Fabric.
 
 Non-negotiables carried over from asmDB Cloud, all of which were bugs we have already
 paid for once:
@@ -889,6 +1051,8 @@ Two things to settle before submitting, not after:
 | **The gateway's mount is misconfigured read-write** | A bug in analytics could damage a transactional database | Read-only at the mount, asserted at startup and in a test, not merely intended |
 | A large database's first sync is slow | Bad first impression | **Partly addressed.** The gateway now serves the current table state from the `.dat` file at `GET /snapshot/{instanceId}`, pinned to the `HDR_SEQ` it was read at, so a consumer can seed and then resume incrementally with no gap. It is used to recover from `RESET`; it is not yet used to shorten a first sync. |
 | asmDB free tier is 393,216 rows | Analytics on a free-tier database is not interesting | Position for `premium`; the mockup already says "premium databases" |
+| **A bulk operation replaces the source between syncs** | `TRUNCATE`, `RESTORE` and `BENCH` emit one `RESET` carrying no rows, so the change log cannot reconstruct the table. Before the snapshot path existed this stopped a sync permanently, and — because the notebook asked for `watermark + 1` against an exclusive `from` — it did so while reporting success | Seed from the pinned snapshot and resume at its sequence (§3.5, §4.4). The reseed count is capped per run so a source replaced faster than it can be followed fails loudly instead of rewriting the table in a loop |
+| **A sync reports success having done nothing** | The worst failure mode in the system: the interface shows calm while the lakehouse silently diverges | Two defences. Link state is computed from Fabric's own run history rather than stored at creation, so "Active" means a run actually succeeded. And the paging contract is pinned by tests, because the off-by-one that caused this was invisible to a green suite |
 
 ---
 
@@ -899,7 +1063,10 @@ Two things to settle before submitting, not after:
 - **No transformation layer.** We land the table faithfully. Modelling belongs in the
   lakehouse, where the customer already has tools.
 - **No scheduler of our own.** Fabric has one. Native notebook scheduling is available as a convenience; production unattended scheduling is a pipeline with Workspace Identity.
-- **No public/general data plane.** The private CDC gateway is the deliberate exception: it relays change frames from a read-only mount because no existing HTTP surface serves them. The backend/frontend remain control plane.
+- **No public/general data plane.** The private CDC gateway is the deliberate exception: it relays change frames from a read-only mount because no existing HTTP surface serves them. The backend/frontend remain control plane — with one further exception recorded in §3.5, where the backend passes change frames through to notebooks because Fabric Spark cannot reach the gateway itself.
+- **No snapshot of a database we do not own.** `/snapshot` reads the same read-only
+  mount as the change log and never queries the engine, so a snapshot cannot disturb a
+  running database or contend for its capacity.
 
 ---
 

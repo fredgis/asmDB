@@ -32,12 +32,14 @@ The reference environment is provisioned. These are the real values; substitute 
 | Key Vault grant | workspace identity `<fabric-workspace-name>` / `<workspace-identity-object-id>` → **Key Vault Secrets User** | `az role assignment list --scope <vault>` |
 | Backend | `https://asmdb-analytical-backend.azurewebsites.net` | `/health` returns `{"status":"ok","version":"0.1.0"}` |
 | Frontend | `https://fe.asmdb.cloud` | `/`, `/sync-hub` and `/close` all return 200 over HTTPS |
+| CDC gateway | internal Container App in `<service-resource-group>`, uid `100:101`, read-only NFS mount | `/cdc/{id}` and `/snapshot/{id}` answered through the backend passthrough |
+| Notebook data path | `ASMDB_NOTEBOOK_GATEWAY_URL` = `…/api/sync` | a snapshot of a live instance returns `X-Asmdb-Snapshot-Seq` matching the change log's head |
 
 One thing is deliberately **not** production-ready:
 
 - **Real support links.** Three still read `REPLACE-ME`, and the three GitHub links resolve only while the repository is private. Neither blocks a tenant-internal install; both block Workload Hub submission.
 
-The CDC gateway **is deployed**, but it is the deliberate exception to the analytics-resource-group split: it lives in `<service-resource-group>` alongside the service because it mounts the same Azure Files share, and it is private to the service VNet.
+The CDC gateway **is deployed**, but it is the deliberate exception to the analytics-resource-group split: it lives in `<service-resource-group>` alongside the service because it mounts the same Azure Files share, and it is private to the service VNet. Notebooks therefore read through the backend rather than calling it directly — see §4.2, which also records why the obvious alternative does not work.
 
 ## Decisions to make before first upload
 
@@ -464,7 +466,11 @@ az webapp config appsettings set `
 
 The route mirrors the gateway's own contract — `GET /cdc/{instanceId}?from=&limit=` returning NDJSON with the `x-asmdb-*` headers — so the notebook's parsing, its gap and corruption handling, and its tests all stay as they are. Only the base URL differs.
 
+**Two routes, not one.** `/api/sync/snapshot/{instanceId}?after=&limit=` passes the gateway's snapshot through as well, and it is not optional: without it a notebook cannot recover from `TRUNCATE`, `RESTORE` or `BENCH`, because each of those replaces the table and the engine reports it as a single `RESET` frame carrying no rows. The snapshot's `X-Asmdb-Snapshot-Seq` is what lets the notebook seed and then resume incremental consumption with no gap. Forward that header along with `X-Asmdb-Rows`, `X-Asmdb-Live-Rows`, `X-Asmdb-Has-More` and `X-Asmdb-Next-After` — a header the passthrough drops is a page the notebook cannot follow.
+
 If the setting is absent the notebooks fall back to `ASMDB_GATEWAY_URL`, which is correct only where Spark can route into the VNet. Set it explicitly.
+
+**Do not make the passthrough stricter than the gateway.** The notebook asks for a page of 5000 frames; the gateway caps a page at 1000 and advertises the rest through `x-asmdb-has-more`, so it accepts the larger number and simply returns fewer. The first version of this route validated the limit at 1000 and returned `400`, which broke every sync. Clamp, do not reject.
 
 **Authentication is unchanged and deliberately thin.** The notebook still reads the gateway bearer token from Key Vault, and the backend forwards that token upstream untouched. The gateway remains the only authority on who may read a change log; the backend does not mint, validate or substitute credentials. This route is therefore *not* behind the Fabric token middleware that guards the rest of `/api` — a Spark notebook has no Fabric token for our application, and inventing one would have meant a second, weaker authority.
 
@@ -477,9 +483,10 @@ Invoke-WebRequest -UseBasicParsing `
   -Headers @{ Authorization = "Bearer $token" }
 ```
 
-Expect `200`, an `x-asmdb-last-seq` header, and one JSON object per line. Without the header, expect `401`.
+Expect `200`, an `x-asmdb-last-seq` header, and one JSON object per line. Then check the snapshot route the same way and expect `200` with `x-asmdb-snapshot-seq` matching the change log's head — on an empty table that is a body of zero bytes, which is correct rather than a failure. Without the Authorization header, expect `401`.
 
 **The trade-off, stated plainly.** Change-log data now traverses a public endpoint, protected by the same bearer token that protects the gateway itself. The gateway stays private and unreachable from the internet, and the token remains the only credential that can read a change log — but the exposure is a public TLS endpoint rather than a private address, and the backend's App Service plan now carries sync traffic as well as UI traffic. Revisit this if Fabric adds Container Apps to the resource types it integrates DNS for, or if the gateway is moved behind a resource type that Fabric does support.
+
 ## 5. Enable the workload once in Fabric
 
 What to do after the first package is uploaded:
@@ -554,7 +561,7 @@ Secrets User is read-only, which is all the notebook needs. Do not grant Secrets
 
 **Failure looks like:** a 403 from Key Vault with no indication of which identity was refused. Check first that the vault is in RBAC mode, then that the notebook is genuinely running as the workspace identity rather than as you.
 
-## 7. Schedule syncs through a pipeline, not the notebook
+## 7. Scheduling: the workload's own scheduler, and when not to trust it
 
 This step exists because of a trap that is invisible until it bites, months later.
 
