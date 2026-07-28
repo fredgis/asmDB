@@ -392,3 +392,7 @@ dd { margin: 0; font-weight: 700; }
 .supersededRow td, .supersededRow dd { text-decoration: line-through; }
 .supersededRow td:first-child, .supersededRow .surfaceBadge { text-decoration: none; }
 .cdcCard.supersededRow { border-style: dashed; }
+
+/* The run-state message sits under the stats grid, which is inset by 16px.
+   Without the same inset the badge hangs off the panel's left edge. */
+.monitoringHero .stateMessage { padding: 0 16px 16px; }

@@ -493,7 +493,6 @@ function App() {
     () => notebooks.find((notebook) => notebook.key === selectedNotebookId) ?? notebooks[0] ?? null,
     [notebooks, selectedNotebookId]
   );
-  const lineage = useMemo(() => graphFromLinks(links.data), [links.data]);
   const linkStatus = useMemo(() => {
     const map: Record<string, { status: LinkState; reason: string }> = {};
     for (const link of links.data) {
@@ -501,6 +500,10 @@ function App() {
     }
     return map;
   }, [links.data, runsByLink, scheduledLinks]);
+  const lineage = useMemo(
+    () => graphFromLinks(links.data.map((link) => ({ ...link, status: linkStatus[link.id]?.status ?? link.status }))),
+    [links.data, linkStatus]
+  );
   const statusOf = useCallback((link: SyncLink): LinkState => linkStatus[link.id]?.status ?? link.status, [linkStatus]);
   const activeLinks = links.data.filter((link) => statusOf(link) === "Active").length;
   const plannedLinks = links.data.filter((link) => statusOf(link) === "Planned").length;
@@ -589,9 +592,19 @@ function App() {
   }, [links.data, workloadClient]);
 
   useEffect(() => {
-    if (activeTab !== "monitoring") return;
     void loadRuns();
-  }, [activeTab, loadRuns]);
+  }, [loadRuns]);
+
+  const runInProgress = useMemo(
+    () => Object.values(runsByLink).flat().some((run) => runOutcome(run) === "running"),
+    [runsByLink]
+  );
+
+  useEffect(() => {
+    if (!runInProgress) return;
+    const timer = window.setInterval(() => { void loadRuns(); }, 20000);
+    return () => window.clearInterval(timer);
+  }, [runInProgress, loadRuns]);
 
   useEffect(() => {
     setSelectedNotebookId((current) => current && notebooks.some((notebook) => notebook.key === current) ? current : notebooks[0]?.key ?? "");
@@ -837,9 +850,12 @@ function App() {
         if (!token) throw new DependencyError({ dependency: "identity", code: "fabric_token_unavailable", message: "Could not acquire a Fabric API token to run the notebook." });
         const workspaceId = await resolveWorkspaceId(workloadClient);
         const run = await runNotebookNowViaRest(token, workspaceId, selectedNotebook.notebook.notebookId);
-        setJobHistory((current) => [run, ...current]);
         setNotebookState("ready");
+        setNotebookMessage(`Run accepted by Fabric${run.id ? `: ${run.id}` : ""}. Reading the run list…`);
+        const instances = await listNotebookRuns(token, workspaceId, selectedNotebook.notebook.notebookId);
+        setJobHistory([...instances].sort((a, b) => `${b.startTimeUtc ?? ""}`.localeCompare(`${a.startTimeUtc ?? ""}`)));
         setNotebookMessage(`Run accepted by Fabric${run.id ? `: ${run.id}` : ""}.`);
+        void loadRuns();
       } catch (error) {
         console.error("Run now failed", error);
         const issue = issueFrom(error, { dependency: "fabric", message: "Run now failed." });
@@ -1116,7 +1132,7 @@ function NotebooksView({
         {notebooks.length ? notebooks.map((notebook) => <button type="button" key={notebook.key} className={selected?.key === notebook.key ? "notebookItem selected" : "notebookItem"} onClick={() => onSelect(notebook.key)}>
           <strong>{notebook.displayName}</strong>
           <span>{notebook.link.source} → {notebook.link.target}</span>
-          <small><span className={`compactStatus ${notebook.status === "failed" ? "statusWarning" : notebook.status === "created" || notebook.status === "scheduled" ? "statusActive" : "statusPlanned"}`}>{notebookStatusLabel(notebook.status)}</span>{notebook.notebook ? ` · Created ${new Date(notebook.notebook.createdAt).toLocaleString()}` : ""}</small>
+          <small><span className={`compactStatus ${notebook.status === "failed" ? statusClass("Warning") : notebook.status === "created" || notebook.status === "scheduled" ? statusClass("Active") : statusClass("Planned")}`}>{notebookStatusLabel(notebook.status)}</span>{notebook.notebook ? ` · Created ${new Date(notebook.notebook.createdAt).toLocaleString()}` : ""}</small>
         </button>) : <StateMessage state="no-data" text="No notebooks yet. Create a sync link to create its notebook automatically." />}
       </div>
     </article>
