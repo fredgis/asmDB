@@ -8,7 +8,12 @@ import types
 import pytest
 
 from sync_template import (
+    FIXED_COLUMN_TYPES,
+    row_from_op,
     FullReloadUnavailable,
+    _extra_column_type,
+    _iso_to_datetime,
+    _millis_to_iso,
     ReseedRequired,
     TransientGatewayError,
     acknowledge_watermark,
@@ -298,3 +303,42 @@ def test_fetch_cdc_page_retries_503_with_backoff(monkeypatch):
     assert len(calls) == 2
     assert frames[0]["commitSeq"] == "1"
     assert headers["X-Asmdb-Has-More"] == "false"
+
+
+def test_extra_column_type_falls_back_to_string_when_every_value_is_null():
+    rows = [{"content_note": None}, {"content_note": None}]
+    assert _extra_column_type(rows, "content_note") == "string"
+
+
+def test_extra_column_type_reads_the_first_non_null_value():
+    rows = [{"n": None}, {"n": 7}, {"n": "later"}]
+    assert _extra_column_type(rows, "n") == "long"
+    assert _extra_column_type([{"b": True}], "b") == "boolean"
+    assert _extra_column_type([{"f": 1.5}], "f") == "double"
+
+
+def test_every_fixed_column_has_a_declared_type():
+    """Schema inference fails when an optional column is null in every row.
+
+    A batch from a table that never sets `value` or `tag` is ordinary, and
+    `_synced_at` is null in every row by construction because it is filled in
+    after staging. Relying on inference made Spark raise CANNOT_DETERMINE_TYPE
+    and fail the whole sync, so each column must carry its own declared type.
+    """
+
+    names = [name for name, _, _ in FIXED_COLUMN_TYPES]
+    row = row_from_op({"op": "upsert", "id": "1", "record": {"id": "1", "content": "x"}}, 1)
+    assert set(row) <= set(names)
+    for name in ("value", "tag", "_synced_at", "_decode_error"):
+        assert name in names
+        assert row.get(name) is None
+
+
+def test_iso_to_datetime_accepts_the_form_millis_to_iso_produces():
+    iso = _millis_to_iso(1785243600000)
+    assert iso.endswith("Z")
+    parsed = _iso_to_datetime(iso)
+    assert parsed is not None
+    assert parsed.year >= 2020
+    assert _iso_to_datetime(None) is None
+    assert _iso_to_datetime("not a date") is None

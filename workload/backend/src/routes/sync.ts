@@ -21,9 +21,23 @@ const instanceIdSchema = z
   .regex(/^[A-Za-z0-9_-]+$/, "Instance id must be alphanumeric with underscores or hyphens");
 
 const paramsSchema = z.object({ instanceId: instanceIdSchema });
+
+/**
+ * The gateway caps a page at 1000 frames and advertises the rest through
+ * x-asmdb-has-more, so it accepts a larger limit and simply returns fewer. The
+ * notebook relies on that and asks for PAGE_LIMIT = 5000. Rejecting the request
+ * instead of clamping it would make this route stricter than the gateway it
+ * fronts, which is exactly how the first version of it broke every sync.
+ */
+const GATEWAY_PAGE_LIMIT = 1000;
 const querySchema = z.object({
   from: z.coerce.number().int().min(0).default(0),
-  limit: z.coerce.number().int().min(1).max(1000).default(1000),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .default(GATEWAY_PAGE_LIMIT)
+    .transform((value) => Math.min(value, GATEWAY_PAGE_LIMIT)),
 });
 
 /**

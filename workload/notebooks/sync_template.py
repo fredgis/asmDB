@@ -491,7 +491,7 @@ def apply_incremental_rows(spark_session: Any, table_name: str, rows: Sequence[M
 
     from pyspark.sql import functions as F
 
-    staged = spark_session.createDataFrame([dict(r) for r in rows]).withColumn("_synced_at", F.current_timestamp())
+    staged = changes_dataframe(spark_session, rows).withColumn("_synced_at", F.current_timestamp())
     staged.createOrReplaceTempView("__asmdb_changes")
 
     if not table_exists(spark_session, table_name):
@@ -525,6 +525,112 @@ def apply_incremental_rows(spark_session: Any, table_name: str, rows: Sequence[M
     write_watermark_property(spark_session, table_name, watermark)
 
 
+def _iso_to_datetime(value: Any) -> Optional[datetime]:
+    """Parse the ISO strings produced by _millis_to_iso back into datetimes.
+
+    Spark needs real datetime objects to fill a TimestampType column; handing it
+    the ISO string silently produces a string column instead, which then fails
+    the MERGE against an existing table.
+    """
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value)
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+FIXED_COLUMN_TYPES: Tuple[Tuple[str, str, bool], ...] = (
+    ("id", "long", False),
+    ("value", "long", True),
+    ("tag", "string", True),
+    ("content_raw", "string", True),
+    ("created", "timestamp", True),
+    ("updated", "timestamp", True),
+    ("_commit_seq", "long", True),
+    ("_deleted", "boolean", True),
+    ("_decode_error", "string", True),
+    ("_synced_at", "timestamp", True),
+)
+
+
+def _extra_column_type(rows: Sequence[Mapping[str, Any]], name: str) -> str:
+    """Pick a type for a decoder-added column from its first non-null value."""
+
+    for row in rows:
+        value = row.get(name)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "long"
+        if isinstance(value, float):
+            return "double"
+        return "string"
+    return "string"
+
+
+def changes_schema(rows: Sequence[Mapping[str, Any]]) -> Any:
+    """Build an explicit schema for the staged change rows.
+
+    Schema inference cannot be used here. A batch whose optional columns are
+    null in every row - which is the normal case for a table that never sets
+    `value` or `tag`, and always the case for `_synced_at` - makes Spark raise
+    CANNOT_DETERMINE_TYPE and fails the whole sync.
+    """
+
+    from pyspark.sql.types import (
+        BooleanType,
+        DoubleType,
+        LongType,
+        StringType,
+        StructField,
+        StructType,
+        TimestampType,
+    )
+
+    mapping = {
+        "long": LongType(),
+        "string": StringType(),
+        "boolean": BooleanType(),
+        "double": DoubleType(),
+        "timestamp": TimestampType(),
+    }
+
+    fields = [StructField(name, mapping[kind], nullable) for name, kind, nullable in FIXED_COLUMN_TYPES]
+    known = {name for name, _, _ in FIXED_COLUMN_TYPES}
+
+    extras: List[str] = []
+    for row in rows:
+        for name in row:
+            if name not in known and name not in extras:
+                extras.append(name)
+    for name in extras:
+        fields.append(StructField(name, mapping[_extra_column_type(rows, name)], True))
+
+    return StructType(fields)
+
+
+def changes_dataframe(spark_session: Any, rows: Sequence[Mapping[str, Any]]) -> Any:
+    """Stage change rows with an explicit schema rather than by inference."""
+
+    schema = changes_schema(rows)
+    names = [field.name for field in schema.fields]
+    timestamps = {"created", "updated", "_synced_at"}
+    prepared = [
+        tuple(_iso_to_datetime(row.get(name)) if name in timestamps else row.get(name) for name in names)
+        for row in rows
+    ]
+    return spark_session.createDataFrame(prepared, schema)
+
+
 def apply_rebuild_rows(spark_session: Any, table_name: str, rows: Sequence[Mapping[str, Any]], watermark: int) -> None:
     """Replace the table from a complete CDC replay, then advance watermark."""
 
@@ -535,29 +641,11 @@ def apply_rebuild_rows(spark_session: Any, table_name: str, rows: Sequence[Mappi
     from pyspark.sql import functions as F
 
     if rows:
-        replacement = spark_session.createDataFrame([dict(r) for r in rows])
+        replacement = changes_dataframe(spark_session, rows)
     elif table_exists(spark_session, table_name):
         replacement = spark_session.table(table_name).limit(0)
     else:
-        from pyspark.sql.types import BooleanType, LongType, StringType, StructField, StructType, TimestampType
-
-        replacement = spark_session.createDataFrame(
-            [],
-            StructType(
-                [
-                    StructField("id", LongType(), False),
-                    StructField("value", LongType(), True),
-                    StructField("tag", StringType(), True),
-                    StructField("content_raw", StringType(), True),
-                    StructField("created", TimestampType(), True),
-                    StructField("updated", TimestampType(), True),
-                    StructField("_commit_seq", LongType(), True),
-                    StructField("_deleted", BooleanType(), True),
-                    StructField("_decode_error", StringType(), True),
-                    StructField("_synced_at", TimestampType(), True),
-                ]
-            ),
-        )
+        replacement = spark_session.createDataFrame([], changes_schema([]))
 
     replacement = replacement.withColumn("_synced_at", F.current_timestamp())
     replacement.writeTo(table_name).using("delta").createOrReplace()

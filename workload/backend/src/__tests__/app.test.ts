@@ -600,6 +600,20 @@ describe("asmDB workload API", () => {
     expect(forwarded?.authorization).toBe("Bearer caller-supplied-token");
   });
 
+  it("clamps an oversized page limit instead of refusing it", async () => {
+    state.gatewayStatus = 200;
+    state.gatewayHeaders = { "content-type": "application/x-ndjson" };
+    state.gatewayBody = "";
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .get("/api/sync/cdc/db_test123?from=0&limit=5000")
+      .set("authorization", "Bearer gateway-secret");
+
+    expect(res.status).toBe(200);
+    expect(state.gatewayRequests.at(-1)?.url).toContain("limit=1000");
+  });
+
   it("rate limits per route", async () => {
     const token = await signToken();
     const app = createApp({ config: testConfig(), rateLimits: { cdcToken: 1 } });
