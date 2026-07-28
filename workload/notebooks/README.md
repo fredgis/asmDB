@@ -8,23 +8,32 @@ This directory contains the generated-notebook template for one asmDB sync link:
 
 ## What the notebook does
 
-1. Reads the target Delta table watermark from table property `asmdb.cdc.watermark` (missing means `0`).
-2. Fetches NDJSON CDC frames from `{gateway}/cdc/{instanceId}?from=<watermark+1>&limit=<n>`.
-3. Stops for full reseed on `cdc_gap`, `cdc_corrupt`, or a frame with `flags.reset=true`.
-4. Collapses a batch to one row per `id`, with the last operation in commit order winning.
-5. Keeps `content_raw`, optionally decodes `content`, and marks `_decode_error` without dropping bad rows.
-6. Applies tombstones by default (`_deleted=true`); hard delete is a render option.
-7. Runs an incremental `MERGE INTO`, then advances `asmdb.cdc.watermark`, then acknowledges the watermark.
+1. Reads the target Delta table watermark from table property `asmdb.cdc.watermark` (missing means `0`) and fetches from `watermark + 1`.
+2. Replicates gateway CDC events on the schedule: collapse each batch to one row per `id`, `MERGE INTO`, then advance the watermark.
+3. On `cdc_gap` or `cdc_corrupt`, automatically rebuilds from the retained CDC base when that base is complete.
+4. Still fails loudly on a `reset` frame mid-incremental-stream; that is an alarming event boundary, not an ordinary page.
+5. Collapses a batch to one row per `id`, with the last operation in commit order winning.
+6. Keeps `content_raw`, optionally decodes `content`, and marks `_decode_error` without dropping bad rows.
+7. Applies tombstones by default (`_deleted=true`); hard delete is a render option.
+8. Writes data first, then advances `asmdb.cdc.watermark`, then acknowledges the watermark.
 
 The Spark shell is deliberately thin. Pure functions in `sync_template.py` cover NDJSON parsing, gateway error classification, reset detection, row collapse and content decoding, so they can be tested without Fabric or Spark.
 
 ## Crash and replay guarantee
 
-Incremental sync always writes data before it writes the watermark. The watermark must never be advanced before the data it describes: if Spark crashed in that order, the next run would skip missing rows. With the implemented order, a crash after `MERGE INTO` but before `ALTER TABLE ... SET TBLPROPERTIES` leaves the old watermark in place, so the next run replays the same batch. That replay is harmless because the merge is idempotent on `id` with full row images.
+Sync always writes data before it writes the watermark. The watermark must never be advanced before the data it describes: if Spark crashed in that order, the next run would skip missing rows. With the implemented order, a crash after `MERGE INTO` but before `ALTER TABLE ... SET TBLPROPERTIES` leaves the old watermark in place, so the next run replays the same batch. That replay is harmless because the merge is idempotent on `id` with full row images.
+
+Automatic rebuild follows the same ordering: replace the table first, then write the watermark. A crash before the watermark leaves the next run to repeat the rebuild rather than skip data.
 
 Gateway acknowledgement happens after the local data and watermark are committed. If acknowledgement fails, the notebook logs a warning and still succeeds; asmDB keeps frames longer, but the lakehouse is already correct.
 
-`cdc_gap` and `cdc_corrupt` both stop incremental consumption and require a full reseed, but the notebook preserves the distinct reason for operators: a gap is usually retention tuning, while corruption means a damaged change frame. HTTP 503 from the CDC endpoint is treated as transient share unreadability and retried with exponential backoff.
+`cdc_gap` and `cdc_corrupt` both stop ordinary incremental consumption, but the notebook preserves the distinct reason for operators: a gap is usually retention tuning, while corruption means a damaged change frame. HTTP 503 from the CDC endpoint is treated as transient share unreadability and retried with exponential backoff.
+
+## Automatic rebuild
+
+There is no user-facing sync mode. The notebook normally replicates change events incrementally. If the gateway reports `cdc_gap` or `cdc_corrupt`, the notebook attempts automatic recovery by replaying from the CDC base. If the gateway reports `X-Asmdb-Base-Seq: 0`, it can replay every frame from the base: `upsert` sets the live record for an id, `delete` removes it, and `reset` clears the in-memory image before later frames are applied. The resulting complete image is written with `createOrReplace`, then the watermark is advanced to the last sequence seen.
+
+This works **only while retention covers the whole history**. If the retained base is greater than zero, the early frames needed to rebuild old live rows are gone. In that case automatic rebuild raises a clear error naming `baseSeq` and the requested sequence; it never silently rebuilds from the retained tail and calls that complete. A product that needs guaranteed reseeds needs either retention long enough to cover all history or a snapshot endpoint, which does not exist today.
 
 ## Key Vault credential path
 

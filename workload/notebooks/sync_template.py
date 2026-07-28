@@ -46,6 +46,10 @@ class TransientGatewayError(SyncError):
     """CDC gateway is temporarily unable to read the asmDB share."""
 
 
+class FullReloadUnavailable(SyncError):
+    """The CDC log no longer contains enough history to rebuild the table."""
+
+
 @dataclass(frozen=True)
 class ReseedRequired(SyncError):
     reason: str
@@ -306,16 +310,61 @@ def collapse_frames(frames: Sequence[Mapping[str, Any]], decoder: str = "None", 
     return list(collapsed.values()), watermark
 
 
+def fold_rebuild_frames(
+    frames: Sequence[Mapping[str, Any]],
+    base_seq: int,
+    decoder: str = "None",
+    config: Optional[Mapping[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Rebuild a complete table image by replaying the retained CDC log.
+
+    This is only honest when the log still reaches the beginning of history.
+    If retention has trimmed earlier frames, rebuilding from the retained base
+    would silently omit old live rows.
+    """
+
+    if base_seq > 0:
+        raise FullReloadUnavailable(
+            f"full reload cannot rebuild a complete table because the CDC log starts at baseSeq={base_seq}; "
+            "the early frames have been trimmed"
+        )
+
+    image: Dict[int, Dict[str, Any]] = {}
+    watermark = 0
+    for frame in frames:
+        commit_seq = int(frame["commitSeq"])
+        watermark = max(watermark, commit_seq)
+        flags = frame.get("flags") or {}
+        if bool(flags.get("reset")):
+            image.clear()
+        for op in frame.get("ops") or []:
+            op_type = op.get("op")
+            op_id = int(op["id"])
+            if op_type == "delete":
+                image.pop(op_id, None)
+            elif op_type == "upsert":
+                row = row_from_op(op, commit_seq, decoder=decoder, config=config)
+                row["_deleted"] = False
+                image[int(row["id"])] = row
+            else:
+                raise ValueError(f"unknown CDC op: {op_type}")
+    return list(image.values()), watermark
+
+
 def incremental_write_plan(has_data_changes: bool) -> Tuple[str, ...]:
-    """Return the only safe order for an incremental sync write.
+    """Return the only safe order for sync writes.
 
     The watermark must never be written before the data it describes. If Spark
     crashes after data and before watermark, the stale watermark replays this
-    idempotent MERGE. If it crashes after watermark and before data, the next
-    run skips missing rows, which is silent data loss.
+    idempotent operation. If it crashes after watermark and before data, the
+    next run skips missing rows, which is silent data loss.
     """
 
     return ("merge_data", "write_watermark") if has_data_changes else ("write_watermark",)
+
+
+def rebuild_write_plan() -> Tuple[str, ...]:
+    return ("replace_data", "write_watermark")
 
 
 # %% [markdown]
@@ -409,6 +458,13 @@ def read_watermark(spark_session: Any, table_name: str) -> int:
     return int(value) if value not in (None, "") else 0
 
 
+def _header_int(headers: Mapping[str, str], name: str, default: int = 0) -> int:
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return int(value)
+    return default
+
+
 def _quote_sql_string(value: str) -> str:
     return value.replace("'", "''")
 
@@ -469,11 +525,114 @@ def apply_incremental_rows(spark_session: Any, table_name: str, rows: Sequence[M
     write_watermark_property(spark_session, table_name, watermark)
 
 
-def full_reseed(reason: ReseedRequired) -> None:
-    # The CDC endpoint intentionally cannot invent a snapshot. The workload UI
-    # should surface this incident and run the product's reseed flow, which must
-    # load a fresh snapshot whose source watermark is >= the reset/gap sequence.
-    raise reason
+def apply_rebuild_rows(spark_session: Any, table_name: str, rows: Sequence[Mapping[str, Any]], watermark: int) -> None:
+    """Replace the table from a complete CDC replay, then advance watermark."""
+
+    plan = rebuild_write_plan()
+    if plan != ("replace_data", "write_watermark"):
+        raise AssertionError("rebuild must replace data before writing watermark")
+
+    from pyspark.sql import functions as F
+
+    if rows:
+        replacement = spark_session.createDataFrame([dict(r) for r in rows])
+    elif table_exists(spark_session, table_name):
+        replacement = spark_session.table(table_name).limit(0)
+    else:
+        from pyspark.sql.types import BooleanType, LongType, StringType, StructField, StructType, TimestampType
+
+        replacement = spark_session.createDataFrame(
+            [],
+            StructType(
+                [
+                    StructField("id", LongType(), False),
+                    StructField("value", LongType(), True),
+                    StructField("tag", StringType(), True),
+                    StructField("content_raw", StringType(), True),
+                    StructField("created", TimestampType(), True),
+                    StructField("updated", TimestampType(), True),
+                    StructField("_commit_seq", LongType(), True),
+                    StructField("_deleted", BooleanType(), True),
+                    StructField("_decode_error", StringType(), True),
+                    StructField("_synced_at", TimestampType(), True),
+                ]
+            ),
+        )
+
+    replacement = replacement.withColumn("_synced_at", F.current_timestamp())
+    replacement.writeTo(table_name).using("delta").createOrReplace()
+    write_watermark_property(spark_session, table_name, watermark)
+
+
+def _base_seq_from_reseed(reason: ReseedRequired) -> int:
+    try:
+        return int(reason.detail.get("baseSeq", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _requested_seq_from_reseed(reason: ReseedRequired, fallback: int) -> int:
+    for key in ("requestedFrom", "failedAt"):
+        value = reason.detail.get(key)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    return fallback
+
+
+def _unavailable_rebuild(reason: ReseedRequired, requested_seq: int) -> FullReloadUnavailable:
+    base_seq = _base_seq_from_reseed(reason)
+    return FullReloadUnavailable(
+        f"automatic rebuild cannot produce a complete table after {reason.reason}: "
+        f"CDC baseSeq={base_seq}, requested sequence={requested_seq}. "
+        "The log no longer reaches back far enough; increase retention or provide a snapshot source."
+    )
+
+
+def rebuild_from_cdc_base(
+    spark_session: Any,
+    gateway_url: str,
+    instance_id: str,
+    token: str,
+    table_name: str,
+    reason: ReseedRequired,
+    requested_seq: int,
+) -> int:
+    base_seq = _base_seq_from_reseed(reason)
+    if base_seq > 0:
+        raise _unavailable_rebuild(reason, requested_seq)
+
+    print(f"WARNING: incremental CDC stopped because {reason.reason}; rebuilding table from CDC baseSeq={base_seq}")
+    from_seq = base_seq
+    frames_for_rebuild: List[Dict[str, Any]] = []
+    while True:
+        try:
+            frames, headers = fetch_cdc_page(gateway_url, instance_id, token, from_seq, PAGE_LIMIT)
+        except ReseedRequired as replay_error:
+            raise _unavailable_rebuild(replay_error, requested_seq) from replay_error
+
+        header_base_seq = _header_int(headers, "X-Asmdb-Base-Seq", base_seq)
+        if header_base_seq > 0:
+            raise FullReloadUnavailable(
+                f"automatic rebuild cannot produce a complete table after {reason.reason}: "
+                f"CDC baseSeq={header_base_seq}, requested sequence={requested_seq}. "
+                "The log no longer reaches back far enough; increase retention or provide a snapshot source."
+            )
+        if not frames:
+            break
+        frames_for_rebuild.extend(frames)
+        last_in_page = max(int(f["commitSeq"]) for f in frames)
+        has_more = str(headers.get("X-Asmdb-Has-More", "false")).lower() == "true"
+        if not has_more:
+            break
+        from_seq = last_in_page + 1
+
+    rows, new_watermark = fold_rebuild_frames(frames_for_rebuild, base_seq=base_seq, decoder=DECODER, config=DECODER_CONFIG)
+    apply_rebuild_rows(spark_session, table_name, rows, new_watermark)
+    print(f"WARNING: automatic rebuild completed after {reason.reason}; watermark={new_watermark}")
+    return new_watermark
 
 
 def run_sync() -> None:
@@ -487,7 +646,12 @@ def run_sync() -> None:
             frames, headers = fetch_cdc_page(GATEWAY_URL, INSTANCE_ID, token, from_seq, PAGE_LIMIT)
             require_incremental_frames(frames)
         except ReseedRequired as reseed:
-            full_reseed(reseed)
+            if reseed.reason in ("cdc_gap", "cdc_corrupt"):
+                requested_seq = _requested_seq_from_reseed(reseed, from_seq)
+                new_watermark = rebuild_from_cdc_base(spark, GATEWAY_URL, INSTANCE_ID, token, TARGET_TABLE, reseed, requested_seq)  # noqa: F821
+                acknowledge_watermark(GATEWAY_URL, INSTANCE_ID, token, new_watermark)
+                return
+            raise
             return
 
         if not frames:

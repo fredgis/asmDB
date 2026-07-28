@@ -8,6 +8,7 @@ import types
 import pytest
 
 from sync_template import (
+    FullReloadUnavailable,
     ReseedRequired,
     TransientGatewayError,
     acknowledge_watermark,
@@ -15,9 +16,12 @@ from sync_template import (
     collapse_frames,
     decode_content,
     fetch_cdc_page,
+    fold_rebuild_frames,
     get_gateway_token,
     incremental_write_plan,
     parse_ndjson,
+    rebuild_from_cdc_base,
+    rebuild_write_plan,
 )
 
 
@@ -100,6 +104,38 @@ def test_reset_frame_triggers_reseed():
     assert exc.value.detail["commitSeq"] == "42"
 
 
+def test_rebuild_fold_from_base_reconstructs_current_image():
+    rows, watermark = fold_rebuild_frames(
+        [
+            frame(1, [], reset=True),
+            frame(2, [upsert(1, 10), upsert(2, 20)]),
+            frame(3, [upsert(1, 11), delete(2), upsert(3, 30)]),
+            frame(4, [delete(99)]),
+        ],
+        base_seq=0,
+    )
+
+    by_id = {row["id"]: row for row in rows}
+    assert watermark == 4
+    assert set(by_id) == {1, 3}
+    assert by_id[1]["value"] == 11
+    assert by_id[3]["value"] == 30
+
+
+def test_rebuild_fold_allows_reset_frame_at_base():
+    rows, watermark = fold_rebuild_frames([frame(1, [], reset=True), frame(2, [upsert(7, 70)])], base_seq=0)
+    assert watermark == 2
+    assert rows[0]["id"] == 7
+
+
+def test_rebuild_fold_rejects_trimmed_base():
+    with pytest.raises(FullReloadUnavailable) as exc:
+        fold_rebuild_frames([frame(6, [upsert(7, 70)])], base_seq=5)
+
+    assert "baseSeq=5" in str(exc.value)
+    assert "early frames have been trimmed" in str(exc.value)
+
+
 @pytest.mark.parametrize(
     "decoder,raw,expected",
     [
@@ -149,6 +185,51 @@ def test_incremental_write_plan_writes_data_before_watermark():
     plan = incremental_write_plan(has_data_changes=True)
     assert plan == ("merge_data", "write_watermark")
     assert plan.index("merge_data") < plan.index("write_watermark")
+
+
+def test_rebuild_write_plan_writes_data_before_watermark():
+    plan = rebuild_write_plan()
+    assert plan == ("replace_data", "write_watermark")
+    assert plan.index("replace_data") < plan.index("write_watermark")
+
+
+def test_gap_with_reachable_base_rebuilds(monkeypatch):
+    applied = {}
+
+    def fake_fetch(gateway, instance, token, from_seq, limit):
+        assert from_seq == 0
+        return (
+            [frame(1, [], reset=True), frame(2, [upsert(1, 10), upsert(2, 20)]), frame(3, [delete(2)])],
+            {"X-Asmdb-Base-Seq": "0", "X-Asmdb-Has-More": "false"},
+        )
+
+    def fake_apply(spark, table, rows, watermark):
+        applied["spark"] = spark
+        applied["table"] = table
+        applied["rows"] = rows
+        applied["watermark"] = watermark
+
+    monkeypatch.setattr("sync_template.fetch_cdc_page", fake_fetch)
+    monkeypatch.setattr("sync_template.apply_rebuild_rows", fake_apply)
+
+    reason = ReseedRequired("cdc_gap", {"baseSeq": "0", "requestedFrom": "120"})
+    watermark = rebuild_from_cdc_base("spark", "gateway", "instance", "token", "target", reason, requested_seq=120)
+
+    assert watermark == 3
+    assert applied["table"] == "target"
+    assert applied["watermark"] == 3
+    assert [row["id"] for row in applied["rows"]] == [1]
+
+
+def test_gap_with_unreachable_base_raises_with_sequence_numbers():
+    reason = ReseedRequired("cdc_gap", {"baseSeq": "5000", "requestedFrom": "120"})
+
+    with pytest.raises(FullReloadUnavailable) as exc:
+        rebuild_from_cdc_base("spark", "gateway", "instance", "token", "target", reason, requested_seq=120)
+
+    message = str(exc.value)
+    assert "baseSeq=5000" in message
+    assert "requested sequence=120" in message
 
 
 def test_acknowledge_failure_logs_and_does_not_fail(monkeypatch, capsys):
