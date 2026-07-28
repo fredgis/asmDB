@@ -154,6 +154,65 @@ old process must exit before the replacement can open the database; if the
 replacement does not become healthy, the control plane rolls back to the previous
 token and revision.
 
+## Where authentication is enforced, and where it is not
+
+Defender for Cloud reports the API Management operations as anonymous, at
+Critical for the catch-all GET routes. The report is accurate about the
+mechanism and needs stating precisely, because the conclusion is not the obvious
+one.
+
+API Management runs **no policy**: `subscriptionRequired` is false on both APIs
+and neither carries an API-level policy document. It is a pass-through. Every
+credential is checked behind it — the control plane validates an Entra token, and
+the instance data plane validates an instance token — so the gateway forwards
+anonymous requests and the thing behind it refuses them.
+
+Measured against the live service with no credential at all:
+
+| Request | Response |
+|---|---|
+| `GET /api/v1/databases` | `401` |
+| `GET /db/{id}/v1/rows` | `401` |
+| `GET /db/{id}/v1/count`, `/v1/stats` | `401` |
+| `GET /api/v1/version` | `200`, deliberately public |
+
+So there is no anonymous read of anyone's data, and the finding is about defence
+in depth rather than an open door. It is nonetheless a real observation: a bug in
+one downstream handler's auth check is currently the only thing between an
+anonymous caller and that route, because nothing rejects the request earlier.
+
+**Why the obvious remediation is not applied.** Requiring an API Management
+subscription key would break every existing client, which authenticates with an
+Entra or instance token and sends no key. A `validate-jwt` policy would work for
+the management API, whose callers all present Entra tokens, but not for the
+instance data plane, whose callers present instance tokens that are not JWTs and
+are validated against a per-instance hash the gateway cannot see. Adding
+`validate-jwt` to the management API only is the defensible improvement and is
+recorded here as **not yet done**, because it changes the request path for the
+browser console and deserves its own verification rather than being folded into
+an unrelated change.
+
+## Dependency posture
+
+`npm audit --omit=dev` reports no vulnerabilities in anything the hosted service
+or the workload backend actually runs. The advisories Defender surfaces against
+`asmdb-analytical-backend` are **development dependencies**: an esbuild issue
+reachable only through a running dev server
+([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)),
+pulled in transitively by the test runner. Deployment installs with
+`npm ci --omit=dev`, so none of it reaches the App Service.
+
+The backend's test runner has been moved past that advisory. The frontend's
+build tool has not: the fix is a three-major-version jump in Vite, it changes the
+emitted bundle, and the surface it would ship to is a live Fabric workload that
+cannot be functionally verified outside Fabric. Shipping an untested build change
+to close a development-server advisory is the wrong trade, so it is deferred
+rather than done quietly.
+
+One advisory has no remedy available: `uuid` below 11.1.1, reached through
+`@ms-fabric/workload-client`. It is Microsoft's own SDK and there is no fixed
+version to move to.
+
 ## Hosted durability and isolation
 
 Each instance mounts a durable volume at `/data`. A Container App's local
