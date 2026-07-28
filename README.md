@@ -142,7 +142,7 @@ database into a Delta table in a Fabric lakehouse and keeps it current from the
 [change log](#change-data-capture) the engine already writes.
 
 <p align="center">
-  <img src="docs/assets/asmdb-workload.png" alt="asmDB Analytical Capabilities running inside Fabric: connected status, counts of premium databases, workspace lakehouses and sync links, a sync-link builder with a live CDC content sample, and a lineage graph from two asmdb databases to a Fabric lakehouse" width="90%">
+  <img src="docs/assets/asmdb-workload.png" alt="asmDB Analytical Capabilities running inside Fabric: connected status, counts of premium databases, workspace lakehouses and sync links, a sync-link builder, and a lineage graph from one asmdb database to two Fabric lakehouses whose edges are coloured Active and Planned from real notebook run history" width="90%">
 </p>
 
 The design decision that shapes it: **Fabric Spark writes the Delta tables, we do
@@ -155,6 +155,14 @@ Rows do pass through one component we operate — the CDC gateway, which reads t
 change log from a **read-only** mount of the share the instances write to and
 serves it to the customer's notebook. It stores nothing, and refuses to start if
 that mount is writable. Everything downstream of it is the customer's own.
+
+A link is **Active**, **Planned** or **Warning** according to what its notebook
+actually did, read back from Fabric's own job history, and each state carries the
+sentence that justifies it rather than leaving the reader to guess:
+
+<p align="center">
+  <img src="docs/assets/asmdb-workload-monitoring.png" alt="The Monitoring tab in light theme: three runs read from Fabric with three successful and none failed, recent sync activity listing completed runs with their timestamps, and coverage showing one Active link explained as scheduled with its last run not failing, and one Planned link explained as having a notebook that nothing runs yet" width="90%">
+</p>
 
 Four components are built and tested, and the engine and the hosted service are
 untouched:
