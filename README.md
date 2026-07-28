@@ -142,7 +142,7 @@ database into a Delta table in a Fabric lakehouse and keeps it current from the
 [change log](#change-data-capture) the engine already writes.
 
 <p align="center">
-  <img src="docs/assets/asmdb-workload-mockup.png" alt="asmDB Analytical Capabilities: a Fabric workload showing connected databases, a sync-link builder, lineage between asmdb databases and Fabric lakehouses, recent sync activity and coverage" width="90%">
+  <img src="docs/assets/asmdb-workload.png" alt="asmDB Analytical Capabilities running inside Fabric: connected status, counts of premium databases, workspace lakehouses and sync links, a sync-link builder with a live CDC content sample, and a lineage graph from two asmdb databases to a Fabric lakehouse" width="90%">
 </p>
 
 The design decision that shapes it: **Fabric Spark writes the Delta tables, we do
