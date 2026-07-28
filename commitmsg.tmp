@@ -1,0 +1,32 @@
+Route notebook change-log reads through the backend
+
+Fabric Spark cannot reach the CDC gateway, and a managed private endpoint
+does not fix it. Private Link is only half a mechanism; the other half is
+DNS, and Fabric integrates private DNS zones only for the resource types
+it supports. Container Apps is not among them.
+
+Measured from inside a Spark session, after the endpoint reported
+Succeeded and Approved on both sides, both the app hostname and the
+privatelink hostname still resolved to the public address. The connection
+then reached the public Container Apps edge, which serves nothing for an
+internal environment and drops the TLS handshake - an SSL error rather
+than a refused connection, which is what made this look like a
+certificate problem rather than a DNS one.
+
+The backend already reaches the gateway over VNet integration, so
+generated notebooks now read through it. The route mirrors the gateway's
+own contract, so the notebook's parsing, its gap and corruption handling,
+and its tests are unchanged; only the base URL differs.
+
+The caller's bearer token is forwarded untouched. The gateway stays the
+only authority on who may read a change log, and this route is therefore
+not behind the Fabric token middleware that guards the rest of /api: a
+Spark notebook holds no Fabric token for this application, and inventing
+one would have meant a second, weaker authority.
+
+The install guide previously recommended the private endpoint. That
+advice was wrong and is now corrected in place, with the measurement that
+disproves it, so the experiment is not repeated.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: ab8ae5e0-e62f-4539-823d-70570d7062e3

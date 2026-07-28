@@ -24,6 +24,7 @@ interface MockState {
   fabricOperationStates: unknown[];
   fabricOperationResult: unknown;
   fabricRequests: unknown[];
+  gatewayRequests: { url: string; authorization: string }[];
 }
 
 let publicJwk: JWK;
@@ -82,6 +83,7 @@ function resetState(): void {
       displayName: "asmDB sync",
     },
     fabricRequests: [],
+    gatewayRequests: [],
   };
 }
 
@@ -119,6 +121,7 @@ function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     requestBodyLimit: "16kb",
     upstreamJsonBytes: 1024 * 1024,
     upstreamCdcBytes: 256 * 1024,
+    notebookCdcBytes: 4 * 1024 * 1024,
     upstreamTimeoutMs: 1000,
     fabricOperationTimeoutMs: 100,
     fabricOperationPollMs: 1,
@@ -176,6 +179,7 @@ beforeAll(async () => {
         return;
       }
       if (req.url?.startsWith("/cdc/")) {
+        state.gatewayRequests.push({ url: req.url, authorization: req.headers.authorization ?? "" });
         res.writeHead(state.gatewayStatus, state.gatewayHeaders);
         res.end(state.gatewayBody);
         return;
@@ -549,6 +553,51 @@ describe("asmDB workload API", () => {
 
     expect(res.status).toBe(502);
     expect(res.body.error.code).toBe("upstream_too_large");
+  });
+
+  it("passes the change log through to notebooks without a Fabric token", async () => {
+    state.gatewayStatus = 200;
+    state.gatewayHeaders = {
+      "content-type": "application/x-ndjson",
+      "x-asmdb-base-seq": "0",
+      "x-asmdb-last-seq": "6",
+      "x-asmdb-has-more": "true",
+    };
+    state.gatewayBody = '{"commitSeq":"1","flags":{"reset":false},"ops":[]}\n';
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .get("/api/sync/cdc/db_test123?from=0&limit=1000")
+      .set("authorization", "Bearer gateway-secret");
+
+    expect(res.status).toBe(200);
+    expect(res.headers["x-asmdb-base-seq"]).toBe("0");
+    expect(res.headers["x-asmdb-last-seq"]).toBe("6");
+    expect(res.headers["x-asmdb-has-more"]).toBe("true");
+    expect(res.text).toBe(state.gatewayBody);
+  });
+
+  it("refuses a notebook change-log read that carries no bearer token", async () => {
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app).get("/api/sync/cdc/db_test123?from=0&limit=10");
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("unauthorized");
+  });
+
+  it("forwards the caller's token rather than substituting its own", async () => {
+    state.gatewayStatus = 200;
+    state.gatewayHeaders = { "content-type": "application/x-ndjson" };
+    state.gatewayBody = "";
+    const app = createApp({ config: testConfig() });
+
+    await request(app)
+      .get("/api/sync/cdc/db_test123?from=0&limit=10")
+      .set("authorization", "Bearer caller-supplied-token");
+
+    const forwarded = state.gatewayRequests.at(-1);
+    expect(forwarded?.authorization).toBe("Bearer caller-supplied-token");
   });
 
   it("rate limits per route", async () => {

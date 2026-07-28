@@ -4,6 +4,7 @@ import rateLimit from "express-rate-limit";
 import type { AppConfig } from "./config.js";
 import { loadConfig } from "./config.js";
 import { fabricAuthMiddleware } from "./middleware/fabric-auth.js";
+import { syncRouter } from "./routes/sync.js";
 import { OboTokenBroker, type ClientAssertionProvider } from "./services/obo.js";
 import { CloudDatabaseService } from "./services/cloud-databases.js";
 import { CdcGatewayService } from "./services/cdc-gateway.js";
@@ -20,6 +21,7 @@ export interface RateLimitOverrides {
   databases?: number;
   notebooks?: number;
   cdcPreview?: number;
+  cdcSync?: number;
   cdcToken?: number;
 }
 
@@ -88,10 +90,12 @@ export function createApp(options: CreateAppOptions = {}) {
     databases: options.rateLimits?.databases ?? 60,
     notebooks: options.rateLimits?.notebooks ?? 20,
     cdcPreview: options.rateLimits?.cdcPreview ?? 30,
+    cdcSync: options.rateLimits?.cdcSync ?? 240,
     cdcToken: options.rateLimits?.cdcToken ?? 20,
   };
 
   app.use("/health", healthRouter(VERSION));
+  app.use("/api/sync", rateLimiter(limits.cdcSync), syncRouter(services));
   app.use("/api/databases", rateLimiter(limits.databases), auth);
   app.use("/api/lakehouses", rateLimiter(limits.databases), auth);
   app.use("/api/notebooks", rateLimiter(limits.notebooks), auth);

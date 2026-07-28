@@ -98,7 +98,7 @@ function renderSyncNotebook(config: AppConfig, request: CreateNotebookRequest): 
   const targetTable = `${tablePrefix}${sanitizeIdentifier(request.sourceDatabaseName, "asmdb_table")}`;
   let rendered = ASMDB_SYNC_TEMPLATE;
   const replacements: Record<string, string> = {
-    __ASMDB_GATEWAY_URL__: config.gatewayUrl,
+    __ASMDB_GATEWAY_URL__: config.notebookGatewayUrl ?? config.gatewayUrl,
     __ASMDB_INSTANCE_ID__: request.sourceDatabaseId,
     __ASMDB_TARGET_TABLE__: targetTable,
     __ASMDB_KEY_VAULT_URL__: config.keyVaultUrl,

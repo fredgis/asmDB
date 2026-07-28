@@ -65,6 +65,39 @@ function bodySnippet(text: string): string | undefined {
 export class CdcGatewayService {
   constructor(private readonly config: AppConfig) {}
 
+  async passthrough(
+    instanceId: string,
+    from: string,
+    limit: number,
+    authorization: string
+  ): Promise<{ status: number; body: string; headers: Record<string, string> }> {
+    const url = new URL(joinUrl(this.config.gatewayUrl, `/cdc/${encodeURIComponent(instanceId)}`));
+    url.searchParams.set("from", from);
+    url.searchParams.set("limit", String(limit));
+
+    const response = await fetchTextCapped(
+      url.toString(),
+      {
+        method: "GET",
+        headers: {
+          accept: "application/x-ndjson, application/json",
+          authorization,
+        },
+      },
+      this.config.notebookCdcBytes,
+      this.config.upstreamTimeoutMs
+    );
+
+    const headers: Record<string, string> = {};
+    for (const name of ["x-asmdb-base-seq", "x-asmdb-last-seq", "x-asmdb-has-more"]) {
+      const value = response.headers.get(name);
+      if (value !== null) headers[name] = value;
+    }
+    const contentType = response.headers.get("content-type");
+    headers["content-type"] = contentType ?? "application/x-ndjson";
+    return { status: response.status, body: response.text, headers };
+  }
+
   async preview(instanceId: string, from: string, limit: number): Promise<CdcPreview> {
     const url = new URL(joinUrl(this.config.gatewayUrl, `/cdc/${encodeURIComponent(instanceId)}`));
     url.searchParams.set("from", from);

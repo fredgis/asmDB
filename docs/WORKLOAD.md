@@ -725,7 +725,7 @@ does the Entra registration by hand. Where they differ, SkyNav is the better mod
 | A **verified custom domain** resolving to the Static Web App | The manifest's `ServiceEndpoint/Url` must resolve **at upload time**, or the upload is rejected |
 | Fabric **tenant admin** | Only an admin can upload a workload and enable it |
 | Entra privileges to register an app and **grant admin consent** | Consent is not something a normal user can give |
-| A Fabric **managed private endpoint** to the Container Apps environment, approved | The gateway is internal and has no public DNS; without this the sync notebooks fail on name resolution, reported only as a cancelled Spark session |
+| A Fabric **managed private endpoint** to the Container Apps environment, approved | Required for Key Vault. **Not** a solution for the gateway: Fabric does not integrate private DNS for Container Apps, so the endpoint provisions and stays unreachable — generated notebooks read the change log through the backend instead |
 
 ### 7.2 The order, and why it is not negotiable
 

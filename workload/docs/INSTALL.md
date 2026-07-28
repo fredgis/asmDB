@@ -417,59 +417,69 @@ Expect `{"status":"ok"}` and `HTTP=200`. Resolving the hostname to a `10.20.*` a
 
 The backend is an App Service we own, sitting in a subnet we created, so outbound VNet integration is available to it. A Fabric notebook is not ours: it runs on Spark inside Microsoft's own managed network, in a different region from the gateway. It cannot be placed in `asmdb-vnet`, and no setting on the notebook will change that.
 
-Left alone, the sync notebook fails on its first HTTP call with a DNS error, and Fabric reports it as:
+Left alone, the sync notebook fails on its first HTTP call, and Fabric reports it as:
 
 ```
 System cancelled the Spark session due to statement execution failures
 Code: System_Cancelled_Session_Statements_Failed
 ```
 
-That message names the symptom and not the cause, which is why this section exists. The gateway's hostname has no public DNS record at all — the environment is internal, with a `10.20.*` address — so from outside the VNet the failure is *name resolution*, not a refused connection.
+That message names the symptom and not the cause, which is why this section exists.
 
-**The mechanism is a Fabric managed private endpoint**, the same one already used for Key Vault. Fabric creates a private endpoint inside its own managed VNet, pointed at our resource; we approve it on the resource; Fabric then resolves the private DNS name for every Spark session in the workspace.
+#### A managed private endpoint does not solve this, and it is worth knowing why
 
-The Container Apps environment supports this because it is a workload-profiles environment. Confirm the target before creating anything:
+The obvious move is the mechanism already used for Key Vault: a Fabric managed private endpoint. It can be created against the Container Apps environment, Azure will approve it, and both sides will report success:
 
 ```powershell
 az network private-link-resource list --id "<managedEnvironmentId>" -o json
-# groupId must be managedEnvironments
+# groupId: managedEnvironments
 # requiredZoneNames: privatelink.<region>.azurecontainerapps.io
 ```
 
-Create it against the **environment**, not the container app — a private endpoint on Container Apps targets the environment, and every app in it becomes reachable:
+**It still does not work, and it fails silently.** Private Link is only half a mechanism; the other half is DNS. Fabric creates and links private DNS zones automatically for the resource types it supports — Storage, SQL, Key Vault, Cosmos DB and their siblings — and Container Apps is not among them. The endpoint is provisioned, approved, and unreachable.
 
-```powershell
-$tok = az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv
-$body = @{
-  name                        = "asmdbCdcGateway"
-  targetPrivateLinkResourceId = "<managedEnvironmentId>"
-  targetSubresourceType       = "managedEnvironments"
-  requestMessage              = "asmDB sync notebooks need the CDC gateway"
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -ContentType "application/json" -Body $body `
-  -Uri "https://api.fabric.microsoft.com/v1/workspaces/<workspaceId>/managedPrivateEndpoints" `
-  -Headers @{ Authorization = "******" }
+Measured from inside a Spark session, after the endpoint reported `Succeeded` and `Approved` on both sides:
+
+```
+asmdb-cdc-gateway.<env>.swedencentral.azurecontainerapps.io -> 51.107.183.214
+<env>.privatelink.swedencentral.azurecontainerapps.io       -> 51.107.183.214
+HTTP FAILED: SSLError ... UNEXPECTED_EOF_WHILE_READING
 ```
 
-Then approve it on the Azure side. The connection appears a minute or two after the call returns, and an approval attempted before it exists fails with `PrivateEndpointConnectionLockConflict` — retry rather than treating that as an error:
+Both names resolve to the **public** address, so no private DNS zone is in effect. The connection then reaches the public Container Apps edge, which serves nothing for an internal environment and drops the TLS handshake — hence an SSL error rather than a connection refusal, which is what makes this so easy to misdiagnose as a certificate problem.
+
+Do not spend time on this path. It is documented here so that the next person does not repeat the experiment.
+
+#### What actually works: the notebooks read through the backend
+
+The backend already reaches the gateway, over the VNet integration of §4.1, and it is publicly reachable. So generated notebooks read their change log through it rather than calling the gateway directly.
+
+`ASMDB_NOTEBOOK_GATEWAY_URL` is the base URL baked into every generated notebook. Point it at the backend's passthrough:
 
 ```powershell
-az network private-endpoint-connection list --id "<managedEnvironmentId>" -o table
-az network private-endpoint-connection approve --id "<connectionId>" --description "Approved for asmDB sync notebooks"
+az webapp config appsettings set `
+  --resource-group <analytics-resource-group> --name asmdb-analytical-backend `
+  --settings ASMDB_NOTEBOOK_GATEWAY_URL="https://asmdb-analytical-backend.azurewebsites.net/api/sync"
 ```
 
-**Both sides must agree before it works, and they do not agree immediately.** Azure reports the connection `Pending` for a while after a successful approval, and Fabric reports `provisioningState: Provisioning` for longer still. Check the Fabric side, which is the one Spark actually consults:
+The route mirrors the gateway's own contract — `GET /cdc/{instanceId}?from=&limit=` returning NDJSON with the `x-asmdb-*` headers — so the notebook's parsing, its gap and corruption handling, and its tests all stay as they are. Only the base URL differs.
+
+If the setting is absent the notebooks fall back to `ASMDB_GATEWAY_URL`, which is correct only where Spark can route into the VNet. Set it explicitly.
+
+**Authentication is unchanged and deliberately thin.** The notebook still reads the gateway bearer token from Key Vault, and the backend forwards that token upstream untouched. The gateway remains the only authority on who may read a change log; the backend does not mint, validate or substitute credentials. This route is therefore *not* behind the Fabric token middleware that guards the rest of `/api` — a Spark notebook has no Fabric token for our application, and inventing one would have meant a second, weaker authority.
+
+**How to know it worked:**
 
 ```powershell
-Invoke-RestMethod -Uri "https://api.fabric.microsoft.com/v1/workspaces/<workspaceId>/managedPrivateEndpoints" `
-  -Headers @{ Authorization = "******" }
-# wait for provisioningState = Succeeded and connectionState.status = Approved
+$token = "<the gateway bearer token>"
+Invoke-WebRequest -UseBasicParsing `
+  -Uri "https://asmdb-analytical-backend.azurewebsites.net/api/sync/cdc/<instanceId>?from=0&limit=5" `
+  -Headers @{ Authorization = "Bearer $token" }
 ```
 
-Sessions started before it reaches `Succeeded` keep the old, failing DNS view. Start a fresh session rather than re-running an existing one.
+Expect `200`, an `x-asmdb-last-seq` header, and one JSON object per line. Without the header, expect `401`.
 
-**Two consequences worth knowing in advance.** Spark sessions in a workspace with managed private endpoints take noticeably longer to start, because the session is placed in the managed VNet. And the endpoint is per workspace: a second workspace syncing from the same gateway needs its own, approved separately.
-
+**The trade-off, stated plainly.** Change-log data now traverses a public endpoint, protected by the same bearer token that protects the gateway itself. The gateway stays private and unreachable from the internet, and the token remains the only credential that can read a change log — but the exposure is a public TLS endpoint rather than a private address, and the backend's App Service plan now carries sync traffic as well as UI traffic. Revisit this if Fabric adds Container Apps to the resource types it integrates DNS for, or if the gateway is moved behind a resource type that Fabric does support.
 ## 5. Enable the workload once in Fabric
 
 What to do after the first package is uploaded:
