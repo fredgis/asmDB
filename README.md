@@ -846,6 +846,105 @@ Ready-to-run examples live in [`clients/`](clients/) (Python, C#, C), along with
 notes on adding a proper `--json` batch mode or a TCP server for a real driver.
 For AI agents, the [`mcp/`](mcp/) server is the turnkey path — no piping required.
 
+## Connect a web application to a hosted database
+
+A database on [asmdb Cloud](#asmdb-cloud) has a REST API, so a web application
+needs no driver and no piping. It does need one rule respected.
+
+**The browser must never hold the instance token.** That token is the whole
+authorisation: it can read every row, write, delete, and run `TRUNCATE`. Anything
+shipped to a browser is readable by anyone who opens the developer tools, so a
+token in front-end code is a public token. The platform enforces this rather than
+trusting you to remember it — **the instance API has no CORS policy at all**, so
+a browser calling it directly is refused by the browser itself before the request
+is sent.
+
+So the shape is always this:
+
+```
+browser  ──►  your server  ──►  https://www.asmdb.cloud/db/<instance>/v1/...
+   no token      holds the token            Authorization: Bearer <instance token>
+```
+
+Your server holds the token in its own configuration — an environment variable,
+Key Vault, whatever your host provides — and exposes only the operations your
+application actually needs.
+
+### What to give a coding agent
+
+Four facts, and the contract below:
+
+| | |
+|---|---|
+| Base URL | `https://www.asmdb.cloud/db/<24-character instance suffix>` |
+| Auth | `Authorization: Bearer <instance token>` on every route except `/health` |
+| Token | returned **once**, at creation. If it is lost, rotate it from the console or the management API — it cannot be read back |
+| Direct browser calls | impossible by design; the API sends no CORS headers |
+
+The record shape is fixed, and this is the constraint most worth stating up front
+because it decides how the application models its data. There is **one table per
+database** and **one record shape**, so an application stores rows of this shape
+or it stores nothing:
+
+```json
+{
+  "id": "1001",              // u64, >= 1, chosen by you, unique
+  "value": "-5",             // i64, signed
+  "tag": "project",          // up to 39 bytes of ASCII
+  "content": "free text",    // up to 175 bytes of ASCII
+  "created": "1785001293764", // unix epoch ms, engine-assigned
+  "updated": "1785001293764"
+}
+```
+
+Integers travel as **strings** in JSON, because a u64 id does not survive a
+JavaScript `number`. Do not let a client parse them into numbers.
+
+| Route | Body | Success |
+|---|---|---|
+| `GET /health` | — | `200` — the only unauthenticated route |
+| `GET /v1/rows?limit=&offset=` | — | `200 {"rows":[…],"count":n,"hasMore":bool,"nextOffset":n}` |
+| `GET /v1/rows/{id}` | — | `200 {"row":…}` / `404` |
+| `POST /v1/rows` | row without timestamps | `201 {"row":…}` |
+| `PUT /v1/rows/{id}` | `{value,tag,content}` | `200 {"row":…}` |
+| `DELETE /v1/rows/{id}` | — | `204` |
+| `GET /v1/count` | — | `200 {"count":n}` |
+| `GET /v1/find?q=&limit=&offset=` | — | rows whose tag or content match `q` |
+| `GET /v1/range?lo=&hi=&limit=&offset=` | — | rows with `lo <= value <= hi` |
+
+`limit` defaults to 100 and caps at 1000; `offset` defaults to 0. Page with
+`nextOffset` rather than computing offsets yourself.
+
+### A minimal server-side route
+
+```js
+// Node/Express. The token lives here, never in anything you serve.
+const BASE = `https://www.asmdb.cloud/db/${process.env.ASMDB_INSTANCE}`;
+const auth = { Authorization: `Bearer ${process.env.ASMDB_TOKEN}` };
+
+app.post("/api/notes", async (req, res) => {
+  const upstream = await fetch(`${BASE}/v1/rows`, {
+    method: "POST",
+    headers: { ...auth, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: String(req.body.id),
+      value: String(req.body.value ?? 0),
+      tag: req.body.tag ?? "note",
+      content: req.body.content ?? "",
+    }),
+  });
+  res.status(upstream.status).json(await upstream.json());
+});
+```
+
+Three things that will otherwise be discovered the hard way. **You choose the
+id**, and inserting one that exists returns an error rather than overwriting —
+there is no auto-increment, so derive it from something you control. **A `tag` or
+`content` that exceeds its length is rejected, not truncated**, so validate
+lengths before sending rather than assuming the row landed. And on the `free` and
+`standard` tiers the instance **scales to zero**, so the first request after an
+idle period waits for a container to start; `premium` stays warm.
+
 ## Engine specification
 
 For the precise, byte-level technical reference — PE64 layout, calling
