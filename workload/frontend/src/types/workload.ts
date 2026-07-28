@@ -64,6 +64,7 @@ export interface LoadIssue {
   dependency: Dependency;
   message: string;
   code?: string;
+  raw?: unknown;
 }
 
 export interface Loadable<T> {

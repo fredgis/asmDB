@@ -10,22 +10,44 @@ export class DependencyError extends Error {
   }
 }
 
+type ValidationError = { path?: unknown; message?: unknown };
+type ErrorPayload = {
+  errorCode?: string;
+  code?: string;
+  message?: string;
+  dependency?: string;
+  validationErrors?: ValidationError[];
+  error?: {
+    errorCode?: string;
+    code?: string;
+    message?: string;
+    dependency?: string;
+    validationErrors?: ValidationError[];
+  };
+};
+
 function url(path: string) {
   return `${API_BASE}${path}`;
 }
 
 async function parseFailure(response: Response, fallback: string): Promise<LoadIssue> {
-  let payload: { errorCode?: string; code?: string; message?: string; dependency?: string } | null = null;
+  let payload: ErrorPayload | null = null;
   try {
     payload = await response.json();
   } catch {
     payload = null;
   }
   if (response.status === 401) invalidateFabricToken();
+  console.error("Backend request failed", { status: response.status, url: response.url, payload });
 
-  const code = payload?.errorCode ?? payload?.code ?? String(response.status);
-  const message = payload?.message ?? fallback;
-  const lowered = `${payload?.dependency ?? ""} ${code}`.toLowerCase();
+  const error = payload?.error ?? payload ?? undefined;
+  const code = error?.errorCode ?? error?.code ?? String(response.status);
+  const validationErrors = Array.isArray(error?.validationErrors) ? error.validationErrors : [];
+  const validationMessage = validationErrors
+    .map((entry) => `${String(entry.path ?? "value")}: ${String(entry.message ?? "invalid value")}`)
+    .join("; ");
+  const message = validationMessage || error?.message || fallback;
+  const lowered = `${error?.dependency ?? ""} ${code} ${message}`.toLowerCase();
   const dependency = lowered.includes("asmdb") || lowered.includes("cloud")
     ? "asmdb-cloud"
     : lowered.includes("fabric")
@@ -33,7 +55,7 @@ async function parseFailure(response: Response, fallback: string): Promise<LoadI
       : lowered.includes("identity") || lowered.includes("obo") || lowered.includes("consent") || response.status === 401
         ? "identity"
         : "backend";
-  return { dependency, code, message };
+  return { dependency, code, message, raw: payload };
 }
 
 export async function fetchHealth(token: string): Promise<{ status: string; version?: string }> {

@@ -488,6 +488,13 @@ function App() {
         const token = await getFabricToken(workloadClient);
         if (!token) throw new DependencyError({ dependency: "identity", code: "token_unavailable", message: "Could not acquire the workload token." });
         const workspaceId = await resolveWorkspaceId(workloadClient);
+        if (!decoderOptions.some((option) => option.value === resolvedLink.decoder)) {
+          throw new DependencyError({
+            dependency: "backend",
+            code: "invalid_decoder",
+            message: `decoder: "${String(resolvedLink.decoder)}" is not supported by this frontend.`,
+          });
+        }
         const notebook = await createNotebookArtifact(token, {
           workspaceId,
           displayName: notebookNameFor(resolvedLink),
