@@ -312,8 +312,21 @@ function App() {
   const selectedSource = databases.data.find((database) => database.id === sourceId) ?? null;
   const selectedTarget = lakehouses.data.find((lakehouse) => lakehouse.id === targetId) ?? null;
   const selectedLink = links.data.find((link) => link.id === selectedId) ?? null;
-  const notebooks = links.data.flatMap((link) => link.notebook ? [{ ...link.notebook, link }] : []);
-  const selectedNotebook = notebooks.find((notebook) => notebook.notebookId === selectedNotebookId) ?? notebooks[0] ?? null;
+  // Both of these must be memoised. They are rebuilt from links.data with a
+  // spread, so without useMemo every render produces new object identities,
+  // and the effects below that depend on them re-run on every render: each run
+  // sets state, which re-renders, which rebuilds these, which re-runs the
+  // effects. Fabric's own rate limiter caught it - 100 requests per second to
+  // getItemJobHistory - and showed the user a "this workload has an issue"
+  // dialog, which is the worst possible way to discover a dependency bug.
+  const notebooks = useMemo(
+    () => links.data.flatMap((link) => (link.notebook ? [{ ...link.notebook, link }] : [])),
+    [links.data]
+  );
+  const selectedNotebook = useMemo(
+    () => notebooks.find((notebook) => notebook.notebookId === selectedNotebookId) ?? notebooks[0] ?? null,
+    [notebooks, selectedNotebookId]
+  );
   const lineage = useMemo(() => graphFromLinks(links.data), [links.data]);
   const activeLinks = links.data.filter((link) => link.status === "Active").length;
   const plannedLinks = links.data.filter((link) => link.status === "Planned").length;
@@ -347,16 +360,22 @@ function App() {
     setSelectedNotebookId((current) => current && notebooks.some((notebook) => notebook.notebookId === current) ? current : notebooks[0]?.notebookId ?? "");
   }, [notebooks]);
 
+  const selectedNotebookKey = selectedNotebook?.notebookId ?? "";
+
   useEffect(() => {
-    if (!selectedNotebook || !workloadClient?.itemSchedule) {
+    // Depend on the id, not the object. Even memoised, the notebook object
+    // changes identity whenever links.data does - a save, a refresh - and
+    // re-fetching the schedule and history on every such change is both
+    // wasteful and how the request storm started.
+    if (!selectedNotebookKey || !workloadClient?.itemSchedule) {
       setSchedule(null);
       setJobHistory([]);
       return;
     }
     let cancelled = false;
     void Promise.allSettled([
-      workloadClient.itemSchedule.listItemSchedules({ itemObjectId: selectedNotebook.notebookId }),
-      workloadClient.itemSchedule.getItemJobHistory({ objectId: selectedNotebook.notebookId }),
+      workloadClient.itemSchedule.listItemSchedules({ itemObjectId: selectedNotebookKey }),
+      workloadClient.itemSchedule.getItemJobHistory({ objectId: selectedNotebookKey }),
     ]).then(([schedules, history]) => {
       if (cancelled) return;
       if (schedules.status === "fulfilled") {
@@ -375,7 +394,7 @@ function App() {
       }
     });
     return () => { cancelled = true; };
-  }, [selectedNotebook, workloadClient]);
+  }, [selectedNotebookKey, workloadClient]);
 
   function onSelect(setter: (value: string) => void) {
     return (_event: SelectionEvents, data: OptionOnSelectData) => {
