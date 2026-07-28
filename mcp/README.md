@@ -5,8 +5,8 @@ the **asmdb** transactional engine as a **generic CRUD store** over MCP. Any MCP
 client can insert, update, get, delete, search, list and count rows — all backed
 by the WAL-durable x86-64 assembly engine.
 
-Current engine: **1.7.0**, storage format **2**. The binaries are 43,749 bytes
-(PE64) and 52,221 bytes (ELF64), and downloads are published at
+Current engine: **1.7.0**, storage format **2**. The binaries are 43,741 bytes
+(PE64) and 52,205 bytes (ELF64), and downloads are published at
 <https://www.asmdb.cloud/downloads/> with SHA-256 hashes in the manifest.
 
 **Agent memory is one example use case** (address each memory by a string key,
@@ -105,6 +105,9 @@ bounded: `limit` defaults to 100, is capped at 1000, and responses include
 `hasMore` plus `nextOffset` when another page may exist.
 
 ## Install & run
+
+Prerequisites: Node.js 18 or newer, npm, and a built asmdb engine. On Windows
+the engine build requires NASM (`winget install --id NASM.NASM -e`).
 
 ```bash
 cd mcp

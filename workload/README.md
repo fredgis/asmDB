@@ -4,32 +4,25 @@ A custom [Microsoft Fabric](https://learn.microsoft.com/fabric/) workload that
 synchronises asmDB databases into Fabric lakehouses using the change log the engine
 already writes, and shows the resulting links, lag and coverage.
 
-**Nothing here is built yet.** This directory currently holds the design target and
-the future home of the implementation. The architecture and the development plan are
-in **[`docs/WORKLOAD.md`](../docs/WORKLOAD.md)** — read that first.
+The workload is built and deployed. The architecture and the reasoning behind it
+are in **[`docs/WORKLOAD.md`](../docs/WORKLOAD.md)**; the install and release
+runbook is in **[`docs/INSTALL.md`](docs/INSTALL.md)**.
 
 ## What is here
 
 | Path | Contents |
 |---|---|
-| `mockup/index.html` | The design target. Open it directly in a browser; it is self-contained, with no build step and no server. |
+| `cdc-gateway/` | Go HTTP service. Reads `<db>.cdc` (and `<db>.dat` for `/head` and `/snapshot`) from a read-only mount and serves change frames and snapshots as NDJSON. Deliberately **not** part of the asmdb.cloud public API. |
+| `frontend/` | React + Fluent UI v9 surface, running in a Fabric iframe. |
+| `backend/` | Node token broker: Fabric JWT in, scoped asmDB credentials out. Also fronts the private gateway for Fabric Spark through `/api/sync/*`. |
+| `notebooks/` | The PySpark template that reads change frames, seeds from the snapshot on `RESET`, and merges into Delta. |
+| `manifest/` | `WorkloadManifest.xml`, `Product.json`, item manifests. |
+| `build/` | `.nuspec`, packaging and deployment scripts. |
+| `docs/` | Install runbook and operational notes. |
+| `mockup/index.html` | The original design target. Open it directly in a browser; it is self-contained, with no build step and no server. |
 | `mockup/assets/asmdb-logo.png` | The asmdb mark, copied from `site/assets/logo.png`. |
 
-## What will be here
-
-Per the plan, and created only when its phase begins:
-
-| Path | Workstream |
-|---|---|
-| `cdc-gateway/` | A — reads `<db>.cdc` from a read-only mount and serves change frames. Deliberately **not** part of the asmdb.cloud public API. |
-| `frontend/` | C — React + Fluent UI v9 surface, running in a Fabric iframe |
-| `backend/` | D — token broker; Fabric JWT in, scoped asmDB credentials out |
-| `notebooks/` | E — the PySpark template that reads change frames and merges into Delta |
-| `manifest/` | F — `WorkloadManifest.xml`, `Product.json`, item manifests |
-| `build/` | F — `.nuspec`, packaging and deployment scripts |
-| `docs/` | G — runbook and operational notes |
-
-## The one thing to understand before reading the plan
+## The one thing to understand
 
 **Fabric Spark writes the Delta tables; we do not — and we do not touch the SaaS core.** The workload generates a notebook
 in the customer's workspace and lets Fabric schedule and run it. No customer row passes

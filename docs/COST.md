@@ -201,7 +201,11 @@ and reclaimable-cache signal, not private memory pressure. A 4 194 304-slot
 table is exactly 1 GiB of addressable table, which is why every tier used to
 allocate 1 GiB and why `free`, with 0.5 GiB, was provisioned below the engine's
 own table. Each tier now gets the largest table its memory can safely carry, and
-the usable row count is that slot count capped by the engine's 0.75 load factor:
+the usable row count is that slot count taken at three quarters. That ratio is a
+service decision, not an engine behaviour: it keeps probe distance short in an
+open-addressed table, but the engine does not enforce it and neither does the
+control plane, so a customer who ignores the published ceiling will keep
+inserting until the table is genuinely full.
 
 | Tier | Memory | Slots | Table | Usable rows |
 |---|---:|---:|---:|---:|

@@ -70,8 +70,8 @@ The live platform is in resource group `<service-resource-group>`, region `swede
 
 | Resource | Deployed name | Notes |
 |---|---|---|
-| API Management | `asmdb-apim` | Developer SKU, External VNet mode, gateway `https://asmdb-apim.azure-api.net`, public IP `4.223.65.58`. This is the only public address. |
-| Container Apps environment | `asmdb-env` | Internal environment, static IP `10.20.1.197`, domain `<container-apps-env>.swedencentral.azurecontainerapps.io`. That domain does not resolve from the public internet. |
+| API Management | `asmdb-apim` | Developer SKU, External VNet mode, gateway `https://asmdb-apim.azure-api.net`, public IP `4.223.65.58`. This is the only public application front door; the registry still has public network access for builds. |
+| Container Apps environment | `asmdb-env` | Internal environment, static IP `10.20.1.197`, domain `<container-apps-env>.swedencentral.azurecontainerapps.io`. Inside the VNet, a private DNS wildcard maps that domain to the internal environment address. |
 | Virtual network | `asmdb-vnet` | `10.20.0.0/16`, with subnets for Container Apps, APIM and private endpoints. |
 | Blob storage | `asmdbstosmwggii` | Control-plane metadata. `publicNetworkAccess: Disabled`, `allowSharedKeyAccess: false`; access is through managed identity. |
 | File storage | `asmdbfsosmwggii3rfc4` | Premium FileStorage, NFS 4.1 share `instances`, 100 GiB provisioned. Instance directories are separated by mount sub-path. |
@@ -152,10 +152,17 @@ A customer receives this base endpoint:
 https://www.asmdb.cloud/db/<instance>
 ```
 
-The data-plane paths sit beneath it:
+The data-plane paths sit beneath it. The main public routes are:
 
 ```text
 https://www.asmdb.cloud/db/<instance>/v1/rows
+https://www.asmdb.cloud/db/<instance>/v1/count
+https://www.asmdb.cloud/db/<instance>/v1/find
+https://www.asmdb.cloud/db/<instance>/v1/range
+https://www.asmdb.cloud/db/<instance>/v1/verify
+https://www.asmdb.cloud/db/<instance>/v1/exec
+https://www.asmdb.cloud/db/<instance>/v1/stats
+https://www.asmdb.cloud/db/<instance>/v1/prepare-upgrade
 https://www.asmdb.cloud/db/<instance>/mcp
 https://www.asmdb.cloud/db/<instance>/health
 ```
@@ -164,9 +171,12 @@ The instance API deliberately has no CORS policy. A browser calling an instance
 directly would put the instance bearer token in front-end code. The browser
 terminal goes through the control plane instead.
 
-TLS is present on every request hop described here. APIM is HTTPS, APIM forwards
-to HTTPS backends, and Container Apps ingress defaults to redirecting HTTP to
-HTTPS because `allowInsecure` is not set.
+The published endpoints are HTTPS. APIM forwards to HTTPS backends, and
+Container Apps ingress defaults to redirecting HTTP to HTTPS because
+`allowInsecure` is not set. The control-plane APIM policy redirects plain HTTP
+to HTTPS before it reaches the backend. The data-plane APIM API is still
+configured for both `http` and `https` and has no matching redirect policy, so
+clients must use the documented HTTPS URLs.
 
 ---
 
@@ -179,7 +189,7 @@ exposes:
 
 | Endpoint | Purpose |
 |---|---|
-| REST CRUD under `/v1/rows` | Data-plane row operations. |
+| REST row routes under `/v1/rows`, `/v1/count`, `/v1/find`, `/v1/range` and `/v1/verify` | Data-plane row operations. |
 | `/mcp` | MCP over HTTP. |
 | `POST /v1/exec` | Browser terminal execution path. |
 | `POST /v1/prepare-upgrade` | Narrow pre-upgrade backup path used by the control plane. |
@@ -192,9 +202,12 @@ exposes:
 HMAC-SHA256(master secret, instance id)
 ```
 
-That token is accepted only on `/v1/stats`, never on mutating routes. The sidecar
-reads the engine version and `storageFormat` from the engine itself, so `/health`
-does not depend on a duplicated constant.
+That token is accepted only on `/v1/stats` and `/v1/prepare-upgrade`. The
+prepare-upgrade route is deliberately narrow: it ignores caller input and runs
+one pre-upgrade backup chosen by the sidecar. The platform token is not accepted
+for CRUD, `/v1/exec`, `/v1/verify` or `/mcp`. The sidecar reads the engine
+version and `storageFormat` from the engine itself, so `/health` does not depend
+on a duplicated constant.
 
 ### 4.2 Control plane
 
@@ -203,14 +216,18 @@ The control plane exposes:
 | Endpoint | Purpose |
 |---|---|
 | `GET /healthz` | Control-plane health. |
+| `GET /api/v1/version` | Current engine version and instance image. |
 | `GET /api/v1/config` | Browser configuration for Entra sign-in. |
 | `GET /api/v1/databases` | List databases. |
 | `POST /api/v1/databases` | Create a database and return endpoint + token once. |
+| `GET /api/v1/databases/{id}` | Get one database object without its token. |
 | `DELETE /api/v1/databases/{id}` | Delete a database. |
 | `POST /api/v1/databases/{id}/exec` | Proxy browser terminal commands using the instance token. |
 | `POST /api/v1/databases/{id}/wake` | Trigger activation and return promptly while a cold instance starts. |
-| `POST /api/v1/databases/{id}/rotate-token` | Rotate the instance token. |
-| `POST /api/v1/databases/{id}/upgrade` | Backup, stop, update, start and confirm an instance; the asynchronous shape is still being settled. |
+| `GET /api/v1/databases/{id}/stats` | Fetch sidecar stats with the platform token, without waking a stopped instance. |
+| `POST /api/v1/databases/{id}/rotate-token` | Prepare a new instance token and return it once. |
+| `POST /api/v1/databases/{id}/rotate-token/commit` | Apply the prepared token with the stop-then-start sequence. |
+| `POST /api/v1/databases/{id}/upgrade` | Start the asynchronous backup, stop, update, start and health-confirm operation. |
 | `GET /api/v1/costs` | Estimated cost view. |
 
 The control-plane image also serves downloadable engine binaries as static
@@ -260,20 +277,31 @@ bearer token. The endpoint and token are returned together once from
 `POST /api/v1/databases`. The token is stored by the control plane only as a
 hash and is compared in constant time.
 
+The exception is token rotation while it is pending. Rotation is two-phase so a
+client that times out after prepare can call prepare again and recover the same
+new token before committing it. The pending token is stored as
+`pendingTokenEncrypted`, encrypted with AES-GCM using a key derived from
+`ASMDB_PLATFORM_SECRET` and the database id as associated data, with a short
+expiry. It is not serialised in database or operation responses. After commit,
+the control plane stores only the new token hash and replaces the operation with
+a token-free `done` record.
+
 Rotation is available at:
 
 ```text
 POST /api/v1/databases/{id}/rotate-token
+POST /api/v1/databases/{id}/rotate-token/commit
 ```
 
 Rotation is authenticated with Entra, not with the instance token. That is
-intentional: rotation is needed when the instance token has been lost. Rotation
-stops the instance, applies the new token, starts it again and confirms health.
-The new token arrives as an environment variable, which creates a new container
+intentional: rotation is needed when the instance token has been lost. The first
+call prepares and returns the new token; the commit call stops the instance,
+applies the new token, starts it again and confirms health asynchronously. The
+new token arrives as an environment variable, which creates a new container
 revision. A rolling update cannot work here: the engine holds an exclusive lock,
 so a new revision cannot open the database while the old one is still alive. If
 the replacement does not become healthy, the control plane rolls back to the
-previous token and revision.
+previous app spec and the old token remains the working token.
 
 ---
 
@@ -308,8 +336,10 @@ therefore stop-then-start, not rolling.
 Log Analytics is deployed as `asmdb-logs`.
 
 The sidecar's `/v1/stats` endpoint reports rows and capacity from the engine,
-plus CPU and memory from the container cgroups. It is protected by the
-per-instance platform token described in [§4.1](#41-sidecar).
+plus CPU and memory from the container cgroups. The control-plane
+`GET /api/v1/databases/{id}/stats` route calls it with the per-instance
+platform token described in [§4.1](#41-sidecar) and deliberately checks Azure
+state first so a stopped instance is not woken just to draw a chart.
 
 Read the memory numbers as hosted-container counters, not as the engine's local
 private-RAM footprint. The store is mapped copy-on-write, and cgroup working set
@@ -685,18 +715,20 @@ files. Backup shipping, PITR and invoice-grade usage metering are not deployed.
 
 Upgrade is deliberately conservative. The control plane asks the sidecar to
 prepare a backup through `POST /v1/prepare-upgrade` before changing anything and
-aborts if that fails. The operation is stop-then-start, not rolling: active
-connections are interrupted, the old process exits and releases the lock, and
-only then can the new revision open the database. If the replacement does not
-become healthy, the control plane rolls back to the previous image. The public
-upgrade API is expected to become asynchronous; its final response shape is still
-being settled.
+aborts if that fails. The operation is asynchronous and stop-then-start, not
+rolling: active connections are interrupted, the old process exits and releases
+the lock, and only then can the new revision open the database. If the
+replacement does not become healthy, the control plane rolls back to the
+previous image. `POST /api/v1/databases/{id}/upgrade` returns `202` with an
+operation object, and the console polls `GET /api/v1/databases/{id}` until the
+operation reaches `done` or `failed`.
 
 ---
 
 ## 10. Limits and non-goals
 
-- There is no public address except APIM.
+- There is no public application front door except APIM. The registry public
+  endpoint remains enabled for workstation-triggered ACR Tasks.
 - There is no direct browser access to an instance API, by design.
 - There is no CORS policy on `asmdb-instances`, by design.
 - There is no build agent pool inside the VNet; ACR public access remains enabled
@@ -711,13 +743,17 @@ being settled.
 
 ## 11. Verified smoke checks
 
-The following have been proven through `https://www.asmdb.cloud`:
+The following read-only checks have been proven through `https://www.asmdb.cloud`
+or its plain-HTTP redirect path:
 
 | Request | Result |
 |---|---|
 | `GET /healthz` | `200 ok` |
-| `GET /` | site returned |
-| `GET /api/v1/databases` | `200 {"databases":[]}` |
+| `GET /api/v1/version` | `200 {"engine":"1.7.0","image":"<registry>.azurecr.io/asmdb-instance:1.7.0"}` |
+| `GET /api/v1/config` | `200`, with public Entra tenant, client and scope values |
+| unauthenticated `GET /api/v1/databases` | `401`, as expected for a management route |
+| plain-HTTP `GET /healthz` | `301` to the HTTPS URL |
+| plain-HTTP `GET /db/notreal/health` | `404`, not a redirect; the data-plane APIM API still accepts HTTP |
 
 ---
 
@@ -757,11 +793,11 @@ flowchart TB
 |---|---|
 | Contracts | Landed. The control-plane and sidecar surfaces exist. |
 | Sidecar | Landed: REST CRUD, MCP over HTTP, browser `exec`, prepare-upgrade, health with engine version and `storageFormat`, stats from engine + cgroups. |
-| Control plane | Landed: health, config, database create/list/delete, wake, exec proxy, rotate, upgrade with rollback, costs. |
+| Control plane | Landed: health, config, database create/list/delete, wake, exec proxy, two-phase rotate, asynchronous upgrade with rollback, costs. |
 | Infrastructure | Landed: resource group, VNet, internal Container Apps environment, APIM, managed identity, Log Analytics. |
 | Private network and gateway | Landed: APIM is public; Container Apps, Blob, NFS and runtime pulls are private. |
 | Site | Landed through `GET /` on the APIM gateway. |
-| Authentication | Landed: Entra access-token verification with `ASMDB_ADMIN`, PKCE browser flow, hashed instance tokens. |
+| Authentication | Landed: Entra access-token verification with `ASMDB_ADMIN`, PKCE browser flow, hashed instance tokens and encrypted pending rotation tokens. |
 | Browser terminal | Landed through the control-plane proxy. |
 | Stats and cost view | Landed as stats endpoint and Azure Monitor `Replicas` estimate. |
 | Metering beyond estimate | Not landed. There is no invoice-grade usage pipeline. |
@@ -829,10 +865,12 @@ reclaimable file-backed cache from the mapping. Sizing it per tier is what stops
 `free`, which has 0.5 GiB, from carrying a table larger than its own memory
 budget. The tier selects the table at creation (`ASMDB_CAPACITY`), the size is
 recorded in the file header, and the header wins on every later open — so the
-variable can never reshape an existing database. Usable rows are the slot count
-under the engine's 0.75 load factor: 2^19 → 393 216, 2^21 → 1 572 864,
-2^22 → 3 145 728. Upgrading a tier grows the table through the engine's
-migration path.
+variable can never reshape an existing database. Published usable rows are three
+quarters of the slot count: 2^19 → 393 216, 2^21 → 1 572 864, 2^22 → 3 145 728.
+That ratio is a published ceiling rather than an enforced one — `MaxRows` in
+`provisioner.go` is never sent to the container and never checked on insert, and
+the engine applies no load-factor guard. Upgrading a tier grows the table through
+the engine's migration path.
 
 The sizes are not free choices. Container Apps Consumption accepts only fixed
 vCPU/memory pairs at a 1:2 ratio and **0.25 vCPU / 0.5 GiB is the floor**, so

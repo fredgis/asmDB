@@ -7,8 +7,8 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). The 1.7.0 PE64 build is 43,749 bytes;
-    the 1.7.0 ELF64 build is 52,221 bytes. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). The 1.7.0 PE64 build is 43,741 bytes;
+    the 1.7.0 ELF64 build is 52,205 bytes. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -18,7 +18,7 @@
     <a href="#"><img src="https://img.shields.io/badge/arch-x86--64-1f6feb" alt="arch"></a>
     <a href="#"><img src="https://img.shields.io/badge/build-nasm%20--f%20bin-0b3d91" alt="build"></a>
     <a href="#"><img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-bf8700" alt="platforms"></a>
-    <a href="#"><img src="https://img.shields.io/badge/binary-43%2C013%20B%20PE%20%2F%2051%2C485%20B%20ELF-1a7f37" alt="size"></a>
+    <a href="#"><img src="https://img.shields.io/badge/binary-43%2C741%20B%20PE%20%2F%2052%2C205%20B%20ELF-1a7f37" alt="size"></a>
     <a href="#"><img src="https://img.shields.io/badge/interface-MCP%20%2B%20CLI-6e4aa0" alt="mcp"></a>
     <a href="#"><img src="https://img.shields.io/badge/dependencies-0-2da44e" alt="deps"></a>
   </p>
@@ -75,7 +75,7 @@ silently trimmed.
 
 | | |
 |---|---|
-| **Rows per table** | default/large: 4 194 304 slots, 3 145 728 usable rows (0.75 load factor) |
+| **Rows per table** | default/large: 4 194 304 slots. The hosted tiers publish 3 145 728 usable rows, three quarters of the slot table — a service ceiling, not one the engine enforces |
 | **Row size** | 256 bytes, fixed — seven columns, no more |
 | **`tag`** | 39 bytes max, one token, no spaces |
 | **`content`** | 175 bytes max, rest of line |
@@ -107,9 +107,11 @@ asmdb Cloud is the same engine run as a managed service. The public hostname is
 registrar. You create a database and get a real isolated asmdb instance,
 reachable through the REST data API, an MCP endpoint for AI agents and
 a CLI. The endpoint and the instance access token are returned together once at
-creation; the token is then stored only as a hash — except during a rotation,
-which is a known gap described in [`docs/SECURITY.md`](docs/SECURITY.md) — and can be rotated from the
-management API.
+creation; the token is then stored only as a hash. Rotation is two-phase so a
+client that times out does not lose a token that was in fact issued: preparing a
+rotation returns the new token directly and keeps only an AES-GCM-sealed copy in
+metadata, which expires after fifteen minutes if it is never committed. The
+details are in [`docs/SECURITY.md`](docs/SECURITY.md).
 
 <p align="center">
   <img src="docs/assets/asmdb-cloud-home.png" alt="asmdb Cloud homepage" width="90%">
@@ -305,8 +307,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 43,749 bytes</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · 52,221 bytes</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 43,741 bytes</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · 52,205 bytes</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -524,7 +526,7 @@ flowchart LR
 
 ### The deep dive
 
-How a 43,749-byte PE64 and a 52,221-byte ELF64 become a durable database.
+How a 43,741-byte PE64 and a 52,205-byte ELF64 become a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -537,8 +539,8 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the PE64 binary is 43,749 bytes at 1.7.0 and the 1.7.0
-ELF64 binary is 52,221 bytes — and why a million-row database needs only a few
+which is why the PE64 binary is 43,741 bytes at 1.7.0 and the 1.7.0
+ELF64 binary is 52,205 bytes — and why a million-row database needs only a few
 MB of RAM.
 
 #### The record store — four cache lines per row
@@ -833,9 +835,11 @@ disabled automatically when the output is redirected, so you get clean ASCII bac
 
 ```python
 from asmdb_client import Asmdb
-db = Asmdb(r".\build\asmdb.exe", "SalesDB", "SalesTransactions")
+db = Asmdb("SalesDB", "SalesTransactions", exe=r".\build\asmdb.exe")
 db.run("BEGIN", "INSERT 1 500 customer Contoso Ltd - key account", "COMMIT")
-print(db.select_all())     # [{'id': 1, 'tag': 'customer', 'value': 500, 'content': 'Contoso Ltd - key account'}]
+print(db.select_all())
+# [Row(id=1, value=500, created='1700000000000', updated='1700000000000',
+#      tag='customer', content='Contoso Ltd - key account')]
 ```
 
 Ready-to-run examples live in [`clients/`](clients/) (Python, C#, C), along with
@@ -1099,10 +1103,12 @@ Newest first — click a version to expand it.
   loaded mask and a variable shift, not a branch or a call.
 
   **What the hosted service advertised was the slot count, not the row count.**
-  The engine refuses inserts past a 0.75 load factor — that is what keeps
-  lookups constant-time in an open-addressed table — so `4,194,304` was a
-  ceiling no customer could ever reach. Every published figure is now the number
-  the engine actually refuses to exceed: 393,216 · 1,572,864 · 3,145,728.
+  The published figures are the service's own ceiling — 393,216 · 1,572,864 ·
+  3,145,728 — chosen as three quarters of the slot table, because probe distance
+  in an open-addressed table climbs sharply as it fills. Note that this is a
+  published limit rather than an enforced one: `INSERT` refuses only when a full
+  probe finds no free slot, and nothing between the customer and the engine caps
+  a database at its tier's row count. See [`docs/ENGINE.md`](docs/ENGINE.md).
 
   **Reservation is no longer reported as consumption.** A database holding five
   rows reported `1,023.96 MiB working set / 1 GiB`, which reads as full. It was

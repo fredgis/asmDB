@@ -84,15 +84,16 @@ flowchart LR
   BE -->|"list premium databases"| CP
   BE -->|"OBO to Fabric REST:<br/>lakehouses + create notebook"| NB
   UI -->|"itemCrud.updateItemDefinition"| ITEM
-  UI -->|"optional itemSchedule"| NS
+  UI -->|"Fabric REST:<br/>schedule + run"| NS
   NS --> NB
   SCH --> NB
   NB -->|"notebookutils.credentials.getSecret<br/>as workspace identity"| KV[["Private Azure Key Vault"]]
-  NB -->|"GET /cdc/{id}?from=seq"| GW
+  NB -->|"GET /api/sync/cdc or snapshot"| BE
+  BE -->|"GET /cdc or /snapshot"| GW
   GW -.->|"read-only NFS"| ENG
   SC --- ENG
   NB -->|"MERGE / createOrReplace"| LH
-  NB -.->|"best-effort ack currently unserved"| GW
+  NB -.->|"best-effort ack currently unserved"| BE
   UI -->|"read status"| BE
 
   classDef ours fill:#0e1726,stroke:#3ABB9F,color:#dfe7f5
@@ -218,9 +219,11 @@ GET /cdc/{instanceId}?from=<seq>&limit=<n>
 GET /cdc/{instanceId}/head
 GET /snapshot/{instanceId}?after=<slot>&limit=<n>
 GET /healthz
-Authorization: Bearer <workload backend credential>
-Accept: application/x-ndjson
 ```
+
+`/healthz` is unauthenticated and returns JSON. The other three routes require
+`Authorization: Bearer <gateway token>`. `/cdc` and `/snapshot` return
+`application/x-ndjson`; `/head` returns JSON.
 
 ```json
 {"commitSeq":"4211","flags":{"reset":false},"ops":[
@@ -263,6 +266,17 @@ warehouse silently:
    snapshot page may therefore legitimately return zero rows with
    `X-Asmdb-Has-More: true`.
 7. **The gateway never writes.** Not to the share, not to the database, not ever.
+
+The response headers are part of the contract. CDC pages carry
+`X-Asmdb-Base-Seq`, `X-Asmdb-Last-Seq` and `X-Asmdb-Has-More`. Snapshot pages carry
+`X-Asmdb-Snapshot-Seq`, `X-Asmdb-Live-Rows`, `X-Asmdb-Rows`,
+`X-Asmdb-Has-More` and `X-Asmdb-Next-After`. The named failures are JSON:
+`400 invalid_request` for malformed path or query values, `401 unauthorized` for a
+missing or invalid bearer token, `404 not_found` for an unknown instance,
+`409 cdc_gap` or `cdc_corrupt` for an unusable CDC position or log,
+`409 snapshot_moved` for a snapshot whose sequence changed, and
+`503 share_unreadable` or `snapshot_unstable` when the share or table image cannot
+be read safely.
 
 ### 3.3 What asmDB already gives us
 
@@ -347,10 +361,12 @@ GET /api/sync/cdc/{instanceId}?from=<seq>&limit=<n>
 GET /api/sync/snapshot/{instanceId}?after=<slot>&limit=<n>
 ```
 
-These mirror the gateway's own contract exactly — same paths, same NDJSON, same
-`x-asmdb-*` headers — so the notebook's parsing, its gap and corruption handling and
-its tests are unchanged; only the base URL differs. `ASMDB_NOTEBOOK_GATEWAY_URL`
-carries that base URL into every generated notebook.
+These mirror the gateway's own contract — same CDC and snapshot resources, same NDJSON,
+same `x-asmdb-*` headers — so the notebook's parsing, its gap and corruption handling
+and its tests are unchanged; only the base URL differs. The backend adds the
+`/api/sync` prefix, clamps `limit` to the gateway maximum instead of rejecting a larger
+page request, and validates generated instance ids as alphanumeric plus `_` and `-`.
+`ASMDB_NOTEBOOK_GATEWAY_URL` carries that base URL into every generated notebook.
 
 **The caller's bearer token is forwarded untouched.** The gateway remains the only
 authority on who may read a change log; the backend mints, validates and substitutes
@@ -574,7 +590,7 @@ listed as uncertainties**; they should be resolved before the phase that depends
 | Backend optional; toolkit default is frontend-only | **Built, but backend required by this workload** | The backend is no longer token-only: it brokers Fabric REST calls too, because the frontend token has the workload audience. |
 | Create a Notebook item | **Built through backend Fabric REST** | `POST /api/notebooks` calls the Fabric REST notebooks API on behalf of the user and polls the long-running operation to completion. The generated item exists only after our endpoint returns 201. |
 | List lakehouses | **Built through backend Fabric REST** | The frontend cannot call Fabric REST directly with its workload-audience token; `/api/lakehouses` performs OBO to `https://api.fabric.microsoft.com/.default`. |
-| Run a notebook on demand / native schedule | **Built in UI as convenience** | The UI uses `itemSchedule` and states the trade-off: direct notebook schedules run as the user who created or last updated the schedule. |
+| Run a notebook on demand / native schedule | **Built in UI as convenience** | The UI uses the Fabric REST job and schedule endpoints directly, not `itemSchedule`, and states the trade-off: direct notebook schedules run as the user who created or last updated the schedule. |
 | Production unattended cadence | **Documented, manual** | Use a Data Factory pipeline Notebook activity with Workspace Identity. The workload does not create that pipeline today. |
 | Persist workload state | **Built via item definition** | `links.json` and `lineage/graph.json` are definition parts written with `itemCrud.updateItemDefinition`, not OneLake files. |
 | Write `Tables/` (Delta) from the workload | **Not supported by the toolkit** | Confirms §1 — Spark writes. |
@@ -770,7 +786,7 @@ work, where four agents worked simultaneously without a single collision.
 |---|---|---|---|
 | D1 | How the notebook gets a credential | **Azure Key Vault, read by the workspace identity via `notebookutils`** | No secret is stored in a notebook or in OneLake. Requires a pipeline with Workspace Identity for production — see §7.6. Backend uses an app setting for its gateway token because the vault is private to Fabric. |
 | D2 | Distribution | **Workload Hub publication**, with a custom domain and a manifest upload | Fabric UX compliance now genuinely applies — see the warning below. |
-| D3 | Cadence | **Analytics, not real time.** Minutes, not seconds | The mockup's lag figures are minutes. Do not promise seconds; §7 explains why the number in a screenshot becomes a commitment. |
+| D3 | Cadence | **Analytics, not real time.** Minutes, not seconds | The mockup's lag figures are minutes. Do not promise seconds; §5b explains why the number in a screenshot becomes a commitment. |
 | D4 | Deleted rows | **Tombstone by default**, hard delete per link | `_deleted` is carried; history and time travel survive. |
 
 > ⚠️ **D2 makes the palette a real risk, not a theoretical one.** Publishing to the
@@ -908,21 +924,23 @@ was not working at all.
 - Cost model, in the manner of [`COST.md`](COST.md): whose capacity pays for what, measured rather than estimated.
 - Update `README.md`, `CONTRACTS.md` (new endpoint, new scope), `SECURITY.md` (new credential class).
 
-### Phase 6 — publication *(Planned)*
+### Phase 6 — publication *(Partly built; public Workload Hub publication Planned)*
 
 - Fabric UX compliance review. **Do this at the start of Phase 4, not here** — by this point the surface is built and a compliance failure is expensive.
-- Tenant settings, capacity enablement, `.nupkg` upload.
+- Tenant `.nupkg` upload and enablement are built and have been exercised for the
+  reference tenant. Public Workload Hub submission, certification evidence and real
+  listing pages are still planned; see §8.
 
 ### Dependency graph
 
 ```mermaid
 flowchart TD
   P0["Phase 0 · decisions"] --> A["A · CDC gateway"]
-  P0 --> B["B · watermarks"]
+  P0 --> B["B · watermark registry"]
   A --> E["E · notebook"]
-  B --> E
+  B -.-> E
   A --> D["D · backend"]
-  B --> D
+  B -.-> D
   P0 --> F["F · manifest"]
   F --> D
   D --> C["C · frontend"]
@@ -931,9 +949,9 @@ flowchart TD
   G --> PUB["Phase 6 · publication"]
 ```
 
-Phases 2 and 3 overlap. Phase 4 is the long pole and cannot start before the backend
-answers, so **do not let Workstream C wait on a finished backend** — agree the
-contract first and let the frontend build against it.
+Phases 2, 3 and 4 have now landed. The dotted watermark-registry edges remain future
+retention automation: the notebook can warn after a failed acknowledgement, but no
+control-plane path advances `CDCTRIM` yet.
 
 ---
 
@@ -958,7 +976,7 @@ does the Entra registration by hand. Where they differ, SkyNav is the better mod
 | A **verified custom domain** resolving to the Static Web App | The manifest's `ServiceEndpoint/Url` must resolve **at upload time**, or the upload is rejected |
 | Fabric **tenant admin** | Only an admin can upload a workload and enable it |
 | Entra privileges to register an app and **grant admin consent** | Consent is not something a normal user can give |
-| A Fabric **managed private endpoint** to the Container Apps environment, approved | Required for Key Vault. **Not** a solution for the gateway: Fabric does not integrate private DNS for Container Apps, so the endpoint provisions and stays unreachable — generated notebooks read the change log through the backend instead |
+| A Fabric **managed private endpoint** to the Key Vault, approved | Required for the notebook to read the gateway token. A managed private endpoint to the Container Apps environment is **not** a solution for the gateway: Fabric does not integrate private DNS for Container Apps, so the endpoint provisions and stays unreachable — generated notebooks read the change log through the backend instead |
 
 ### 7.2 The order, and why it is not negotiable
 
@@ -1065,7 +1083,7 @@ So this step is ours to prove, and researching it changed the design twice:
   which needs no package and no import — so the two Azure SDK dependencies we were
   originally going to ask the installer to provision were never needed;
 - **only a pipeline activity with Workspace Identity actually runs as that identity.**
-  See §6. A direct notebook schedule borrows a human account;
+  See §5d. A direct notebook schedule borrows a human account;
 - the vault must be created with **RBAC authorisation enabled**. In legacy access-policy
   mode the role assignment is silently ignored and the notebook gets a 403 that says
   nothing about why;
@@ -1080,7 +1098,7 @@ So this step is ours to prove, and researching it changed the design twice:
 - it must be verified end to end before Phase 2 is called done, not assumed.
 
 Treat this as the highest-risk item in the whole installation, because it is the only one
-with no working precedent. Two of the five points above were wrong in our first
+with no working precedent. Several of the points above were wrong in our first
 implementation and were caught by reading Microsoft's documentation rather than by any
 test we could have written.
 

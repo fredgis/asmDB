@@ -44,7 +44,7 @@
 | Assembler | **NASM**, Intel syntax |
 | Linking | **None** — `nasm -f bin` emits the PE64 / ELF64 directly |
 | Runtime | **No CRT** — raw **Win32** (`kernel32.dll`) on Windows, raw **syscalls** on Linux |
-| Portability | One source; a thin **`os_*`** layer is the only per-OS code (§2.4) |
+| Portability | One source; per-OS code is confined to the **`os_*`** layer (§2.4) plus the hand-written executable header (PE64 in `main.asm`, ELF64 in `elf.inc`) |
 | Data model | **Fixed-size** records, 256 B (four cache lines) |
 | Index | **Open-addressing** hash table (the store IS the index) |
 | Transactions | **WAL** (write-ahead log) → atomicity, durability, recovery |
@@ -109,9 +109,11 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **43,749-byte PE64** at 1.7.0 whose only
-  dependency is `kernel32.dll`. The configured record region (sparse on disk) is
-  **not** in the exe — it is obtained from `VirtualAlloc` at startup.
+- The result is a single self-contained **43,741-byte PE64** at 1.7.0 whose only
+  dependency is `kernel32.dll` (`nasm -f bin -i src\ src\main.asm`; the Linux
+  ELF64 from the same source is 52,205 bytes). The configured record region is
+  **not** in the exe — it is a copy-on-write mapping of the `.dat` established at
+  startup (§6.1), not a `VirtualAlloc` block.
 
 #### kernel32 imports
 
@@ -183,7 +185,7 @@ os_pread/os_pwrite  positioned slot I/O        (SetFilePointerEx+ReadFile / prea
 os_alloc         small runtime buffers         (VirtualAlloc / mmap anon)
 os_map_cow       map the store copy-on-write   (CreateFileMapping+MapViewOfFile / mmap MAP_PRIVATE)
 os_filesize      file length, for validation   (GetFileSizeEx / lseek SEEK_END)
-os_flush         force durability              (FlushFileBuffers / fsync)
+os_fsync         force durability              (FlushFileBuffers / fsync)
 os_truncate      shrink a file (WAL checkpoint)(SetEndOfFile / ftruncate)
 os_now_ms        wall-clock epoch ms           (GetSystemTimeAsFileTime / clock_gettime)
 os_exit          terminate                     (ExitProcess / exit_group)
@@ -207,10 +209,10 @@ callers never see the difference.
 | `os_alloc` | `VirtualAlloc` | `mmap` anon (9) |
 | `os_map_cow` | `CreateFileMappingA` + `MapViewOfFile` | `mmap` `MAP_PRIVATE` (9) |
 | `os_filesize` | `GetFileSizeEx` | `lseek` `SEEK_END` (8) |
-| `os_flush` | `FlushFileBuffers` | `fsync` (74) |
+| `os_fsync` | `FlushFileBuffers` | `fsync` (74) |
 | `os_truncate` | `SetEndOfFile` | `ftruncate` (77) |
 | `os_now_ms` | `GetSystemTimeAsFileTime` | `clock_gettime` (228) |
-| `os_isatty` | `GetConsoleMode` | `ioctl(TCGETS)` (16) |
+| `os_init_std` (TTY probe) | `GetConsoleMode` | `ioctl(TCGETS)` (16) |
 | `os_exit` | `ExitProcess` | `exit_group` (231) |
 
 Build/run helpers live in `scripts/build.ps1` (`-Run` launches the REPL;
@@ -299,14 +301,19 @@ The `SCHEMA` command prints this exact table at runtime.
   sequential ids scatter uniformly across the table with a single `imul`:
 
   ```asm
-  ; src/store.inc — store_hash(rcx = id) -> rax = slot in [0, CAPACITY)
+  ; src/store.inc — store_hash(rcx = id) -> rax = slot in [0, capacity)
   store_hash:
       mov  rax, rcx
       mov  rdx, GOLDEN          ; 0x9E3779B97F4A7C15  = floor(2^64 / phi)
       imul rax, rdx             ; low 64 bits of id * golden ratio
-      shr  rax, CAP_SHIFT       ; CAP_SHIFT = 64 - log2(CAPACITY) = 64 - 22 = 42
-      ret                       ; -> keep the top 22 bits
+      mov  cl, [rel g_cap_shift]; runtime = 64 - log2(capacity); 42 for `large`
+      shr  rax, cl              ; -> keep the top log2(capacity) bits
+      ret
   ```
+
+  The shift is a **runtime** value (`g_cap_shift`), not a compile-time constant:
+  capacity is chosen per database (`small`/`medium`/`large` → shift 45/43/42), so
+  the same binary hashes correctly against any of the three table sizes.
 
 - **Collision resolution — linear probing.** Walk contiguous slots
   `(h + i) mod CAPACITY` until the key, an empty slot, or a reusable tombstone is
@@ -330,17 +337,27 @@ The `SCHEMA` command prints this exact table at runtime.
       je   .found
   .cont:
       inc  rsi
-      and  rsi, CAPACITY-1      ; wrap: power-of-two modulo is one AND
+      and  rsi, [rel g_cap_mask]  ; wrap: power-of-two modulo is one AND
       inc  r8
-      cmp  r8, CAPACITY
+      cmp  r8, [rel g_capacity]
       jb   .probe               ; bounded: never loops forever
   ```
 
+  (`CAPACITY-1`/`CAPACITY` are shown as `g_cap_mask`/`g_capacity` above because
+  both are runtime values loaded from the header, not assembled constants.)
+
 - **Deletion:** tombstone (`status = 2`) so probe chains stay intact; a later
   INSERT may reuse a tombstoned slot (the `.deleted` branch above).
-- **Load factor** is capped at `0.75`; INSERT that would exceed
-  `(capacity * 3) / 4` returns an explicit `table full` error before every slot
-  is occupied (resizing is [future work](#12-roadmap)).
+- **Load factor.** There is **no** 0.75 cap on interactive `INSERT`. `INSERT`
+  fails with `table full` only when a full probe of the table finds neither an
+  empty slot nor a reusable tombstone — i.e. when live rows plus tombstones
+  occupy **every** slot (`store_locate` returns a null insertion point, so
+  `cmd_insert` takes the `.full` branch: `store.inc:59-66`, `parse.inc:468-471`).
+  Near-full tables therefore degrade to O(capacity) probes rather than being
+  refused early. The `(capacity * 3) / 4` load-factor bound *is* applied, but
+  only to the synthetic row count of the `BENCH` command (`parse.inc:2003-2007`);
+  it does not govern ordinary writes. Automatic resizing is
+  [future work](#12-roadmap).
 - `SELECT <id>`, `UPDATE`, `DELETE` are all O(1) average (hash + short probe).
   `SELECT *`, `FIND` and `COUNT` are O(capacity) linear scans over the region.
 
@@ -498,16 +515,23 @@ The WAL is a **single staging frame** that mirrors the in-memory buffer
 (`g_walbuf`) to disk:
 
 ```
-+0    8              magic  'ASMWAL03'
++0    8              magic  'ASMWAL04'
 +8    8              N      entry count (only slots that actually changed)
 +16   8              count  live-row count to publish into the header on apply
 +24   8              commit_seq  the change-log sequence this commit takes
 +32   8              flags  bit 0 = RESET
-+40   N * (8+8+8+256) entries: { u64 slot index ; u64 prev_id ;
++40   16             lineage  128-bit database identity this log belongs to
++56   N * (8+8+8+256) entries: { u64 slot index ; u64 prev_id ;
                                  u64 prev_status ; 256-byte after-image }
 +M    8              marker 'COMMIT01'   ┐ written and flushed LAST,
 +M+8  8              crc32  of [0, M)    ┘ together, in one write
 ```
+
+- The current writer emits `'ASMWAL04'`. Its header is `WAL_HDR_V4 = 56` bytes
+  (`asmdb.inc:209-216`), so the entries begin at offset **56**, not 40 — the
+  extra 16 bytes at `+40` are the **database lineage** (`wal.inc:590-593`), which
+  is what stops a stray `<db>.wal` from being replayed into a different, or a
+  brand-new, database and importing its rows and row count.
 
 - Each entry is `WAL_ENT_V3 = 280` bytes. The after-image makes replay an
   idempotent redo; `prev_id` and `prev_status` describe what the slot held
@@ -525,9 +549,12 @@ The WAL is a **single staging frame** that mirrors the in-memory buffer
   never be "committed but unchecksummed". A table-driven implementation
   (`crc32_init` builds 256 dwords once at startup) keeps the cost proportional
   to the bytes actually staged, not to the 2 MiB buffer.
-- Frames carrying the older `'ASMWAL01'` (no checksum) or `'ASMWAL02'` (no
-  sequence) magic are still replayed, so upgrading the binary never discards a
-  transaction that was already acknowledged.
+- Frames carrying the older `'ASMWAL01'` (no checksum), `'ASMWAL02'` (no commit
+  sequence) or `'ASMWAL03'` (no database lineage) magic are still replayed, so
+  upgrading the binary never discards a transaction that was already
+  acknowledged (`wal.inc:171-215`). A frame with no lineage (`ASMWAL01`–`03`)
+  cannot name its database, so recovery trusts it only next to a database that
+  already existed, never one this process just created (`wal.inc:249-276`).
 
 ---
 
@@ -627,16 +654,18 @@ written and flushed **only after** the data is already durable in the log:
 (§6.1), so a corrupt data file is never mutated by recovery — and *before* the
 table is read into RAM:
 
-1. Read the WAL frame. If it is unreadable, shorter than the 24-byte header, or
-   the magic mismatches, or `N > UNDO_MAX`, or the `'COMMIT01'` marker is
-   missing at `24 + N*264` → **discard** (truncate) the WAL. An incomplete
+1. Read the WAL frame. If it is unreadable, shorter than the minimum 24-byte
+   header, or the magic matches none of `ASMWAL01`–`04`, or `N > UNDO_MAX`, or
+   the `'COMMIT01'` marker is missing at its computed offset — `entry_base +
+   N*entry_stride`, which for the current `ASMWAL04` frame is `56 + N*280`
+   (`wal.inc:216-234`) — → **discard** (truncate) the WAL. An incomplete
    transaction simply never existed.
 2. Validate the frame's *contents* before touching disk: every entry's slot
    index must be `< CAPACITY` and the stored `count` must be `<= CAPACITY`.
    Otherwise redo would write a 256-byte record at an arbitrary file offset and
    grow the `.dat` past its region, so the whole frame is discarded instead.
-3. Verify the **CRC-32** stored next to the marker (`'ASMWAL02'`/`'ASMWAL03'`
-   frames). Three
+3. Verify the **CRC-32** stored next to the marker (`'ASMWAL02'`, `'ASMWAL03'`
+   and `'ASMWAL04'` frames; legacy `'ASMWAL01'` carries none). Three
    outcomes, and the distinction matters:
    - *checksum absent because the frame is short* → the final 16-byte write was
      torn, so the commit never completed → **discard**;
@@ -713,6 +742,174 @@ validates the snapshot completely (magic, format fields, count, and a probe for
 the **last byte** of the record region) *before* overwriting a single byte of
 the live table, so a truncated or foreign snapshot leaves both RAM and disk
 exactly as they were.
+
+### 7.6 Why asmdb is ACID — earned from the source
+
+ACID is the most scrutinised claim a database makes, so this section takes each
+letter in turn, points at the mechanism in the assembly, names what would break
+it, and states the boundary of the guarantee plainly. Where a letter is only
+partly satisfied, that is said outright rather than softened.
+
+The whole write path — where atomicity and durability are actually established —
+is one sequence (`txn_flush`, `wal.inc:519-690`):
+
+```mermaid
+flowchart TD
+    CMD["INSERT / UPDATE / DELETE<br/>or COMMIT"] --> STAGE["Stage changed slots in g_walbuf<br/>(after-image + prev id/status)"]
+    STAGE --> W1["write frame to the .wal"]
+    W1 --> F1["os_fsync (first): entries<br/>now durable in the log"]
+    F1 --> MARK["write 'COMMIT01' + CRC-32<br/>in one 16-byte write"]
+    MARK --> F2["os_fsync (second)"]
+    F2 --> POINT{{"COMMIT POINT — atomicity and<br/>durability are established here"}}
+    POINT --> CDC["append change frame to the .cdc, flush"]
+    CDC --> APPLY["redo after-images into the .dat<br/>(write_at, one slot at a time)"]
+    APPLY --> HDR["db_write_header (count, seq) then db_flush"]
+    HDR --> TRUNC["wal_truncate: checkpoint, empty the WAL"]
+
+    classDef pre fill:#0e1726,stroke:#3ABB9F,color:#dfe7f5
+    classDef post fill:#0b1a2e,stroke:#38bdf8,color:#dfe7f5
+    classDef mark fill:#2a1116,stroke:#f43f5e,color:#ffe4e9
+    class CMD,STAGE,W1,F1,MARK,F2 pre
+    class CDC,APPLY,HDR,TRUNC post
+    class POINT mark
+```
+
+Everything **above** the commit point is discardable: a crash there truncates
+the WAL and the transaction never happened. Everything **below** it is redo: a
+crash there replays the marked frame on next open.
+
+#### Atomicity — all-or-nothing per transaction
+
+- **Guarantee.** Each transaction — an explicit `BEGIN…COMMIT`, or a single
+  autocommitted statement (`auto_begin`/`auto_commit`, `wal.inc:669-695`) —
+  becomes visible on disk in full or not at all.
+- **Mechanism.** The `'COMMIT01'` marker is the atomicity point. `txn_flush`
+  writes the frame and flushes it, then writes the marker **and** its CRC-32 in a
+  single 16-byte write and flushes again (`wal.inc:601-615`); only *after* that
+  second flush are the after-images applied to `<db>.dat` (`wal.inc:624-644`).
+  Recovery reproduces the same decision: a frame whose marker is absent or whose
+  final write was torn is discarded (`wal.inc:216-234`), and a frame with a valid
+  marker is redone idempotently by after-image (`wal.inc:316-345`).
+- **What would break it, and why it does not.** Applying to the `.dat` before the
+  marker is durable would expose a partial transaction after a crash; the strict
+  flush-before-marker-before-apply order forbids that. A marker that landed
+  without its checksum would let a torn frame masquerade as committed; writing
+  marker and CRC in the *same* flush closes that window. A leftover `'COMMIT01'`
+  from an earlier, longer frame is prevented by flushing the truncation at
+  checkpoint (`wal_truncate`, `wal.inc:130-151`).
+- **Boundary.** Atomicity is **per transaction, single writer**. Whole-table
+  commands (`TRUNCATE`, `RESTORE`, `BENCH`) are *not* WAL frames — they would
+  need up to four million after-images — so they get a different but real
+  crash-safety mechanism: the operation is announced in the header (`HDR_BULK`,
+  `asmdb.inc:145`) and flushed before it starts, then finished or redone on the
+  next open (`bulk_recover`, `db.inc:1356`). Their atomicity rests on that
+  announce/resume protocol, not on the WAL.
+
+#### Consistency — the engine's own invariants, and only those
+
+- **Guarantee (stated narrowly).** asmdb has **no user-defined constraints** — no
+  foreign keys, no uniqueness beyond the primary key, no typed columns, no
+  `CHECK` beyond `id ≥ 1`. "Consistency" here means the file always remains a
+  structurally valid asmdb table; it is **not** the relational, application-level
+  consistency of a system with a schema and constraints, and the document does
+  not borrow that credibility.
+- **Invariants actually enforced.** Fixed 256-byte record shape (every write is
+  full-width, `parse.inc` copies `TAG_MAX`/`CONTENT_MAX` regardless of input);
+  `id ≥ 1` and duplicate-key rejection on `INSERT` (`parse.inc:445-471`); header
+  validation on open — magic, `DB_VERSION`, `REC_SIZE`, capacity, and
+  `count ≤ capacity` (`db.inc:566-596`); WAL CRC-32 plus the pre-redo checks that
+  every slot index is `< capacity` and the stored count is `≤ capacity`
+  (`wal.inc:277-301`); self-consistent reset/bulk state on open (`db.inc:596-620`);
+  and the 128-bit lineage tying a `.dat` to its `.wal`/`.cdc`.
+- **What is *not* enforced (honestly).** The 0.75 load factor is **not** applied
+  to `INSERT` (§5) — a table can be driven to 100% occupancy. The `TYPES` view is
+  advisory: `value` stores raw bits and the engine never checks their
+  interpretation. So "consistency" excludes both a healthy fill factor and any
+  notion of column-domain validity.
+- **Boundary.** Consistency = "the database still parses and every record is
+  well-formed with `count ≤ capacity`." Nothing about application meaning.
+
+#### Isolation — serialisable by serial execution; readers get per-command snapshots
+
+- **Writers.** asmdb is **single-writer**. Exclusion is a byte-range lock far past
+  the data region — `LockFileEx(EXCLUSIVE|FAIL_IMMEDIATELY)` on `WRITER_LOCK_OFFSET`
+  (`os_win.inc:166-186`, `asmdb.inc:96-99`) / `flock(LOCK_EX|LOCK_NB)`
+  (`os_linux.inc:349-360`). A second writer cannot open the database at all, so
+  write transactions execute **serially**. Serial execution is a legitimate route
+  to serialisability, and that is the isolation writers get — not MVCC, not
+  row-locking.
+- **Readers (`--reader`).** A reader takes no lock, creates nothing, and never
+  touches the WAL or CDC. It maps the `.dat` **shared, read-only**
+  (`os_map_read` → `mmap(MAP_SHARED|PROT_READ)`, `os_linux.inc:704-720`;
+  `db.inc:1168-1218`) and is refused every mutating command by a whitelist
+  (`ro_allowed`, `parse.inc:2527-2620`).
+- **What a reader actually sees — the uncomfortable part, stated plainly.** The
+  writer applies after-images to the `.dat` **one slot at a time** and bumps the
+  header's `last_commit_seq` only afterwards (`wal.inc:624-650`). Because the
+  reader's mapping is *shared*, during its scan it **can** read pages a commit is
+  in the middle of applying — a genuinely torn, half-applied state. What saves it
+  is a fence, not locking: the reader reads `last_commit_seq`, runs the command
+  into a buffer, and reads the sequence again (`main.asm:194-216`, `snap_refresh`
+  `db.inc:1141-1166`). Equal → nothing committed in between and the buffered
+  output belongs to one committed state, so it is flushed. Changed → the output
+  is discarded and the command is **replayed** (up to `SNAP_RETRIES = 8`). If the
+  result was too large for the 4 MiB capture buffer, the reader cannot replay and
+  **refuses to present it**, reporting the result as mixed rather than as a
+  snapshot (`main.asm:205-227`, `s_snap_moved`/`s_snap_busy`, `data.inc:206-207`).
+  So a reader never *presents* a half-applied transaction, but only because it
+  detects the change and retries or fails — it does not hold a stable view while
+  it reads.
+- **Boundary.** The reader guarantee is **per command, not per session**: two
+  consecutive `SELECT`s may legitimately see two different committed states, and a
+  single command over a result larger than the buffer degrades to an explicit
+  "run it again" rather than a snapshot. It also assumes single-host page-cache
+  coherence between the writer's `pwrite`s and the reader's mapped reads; across a
+  network filesystem that ordering is the platform's to honour, not asmdb's.
+  Session-level snapshots and concurrent writers both require MVCC — roadmap.
+
+#### Durability — flush before acknowledge, per transaction
+
+- **Guarantee.** Once a command returns `[ OK ]` / `transaction committed`, its
+  effect survives a crash.
+- **Mechanism.** Durability is established in the **log**, before the data file is
+  touched. `txn_flush` flushes the entries, then flushes the marker+CRC
+  (`wal.inc:601-615`); `os_fsync` is `FlushFileBuffers` on Windows
+  (`os_win.inc:470-476`) and `fsync` on Linux (`os_linux.inc:602-622`). Only past
+  the second flush does the `.dat` get its redo writes and the header its new
+  `count`/`seq`. Every autocommitted statement runs this same protocol, so
+  durability is **per transaction**, not deferred or batched.
+- **What would break it, and why it does not.** Acknowledging before the flush
+  would lose a "committed" transaction on power loss; the acknowledgement text is
+  only printed after the second flush returns. A durable write that fails
+  (`ENOSPC`, I/O error) could leave RAM and disk disagreeing; every durable write
+  is checked and any failure calls `io_fatal`, which prints an error and exits —
+  the engine **never prints `[ OK ]` after a failed write** (§7.5).
+- **Boundary.** Durability is only as strong as `fsync`/`FlushFileBuffers` on the
+  underlying stack: a drive or filesystem that lies about flushing (volatile write
+  cache, some network filesystems) weakens it, and that is outside the engine.
+  There is **no** replication and **no** point-in-time recovery — the WAL is
+  truncated at each checkpoint; the `.cdc` log is the only retained history and it
+  is a change feed, not a redo archive.
+
+### 7.7 The limits of the claim
+
+A document that names its own boundaries is trusted; one that does not is
+checked. asmdb does **not** offer, and a reader should not assume:
+
+- **Multiple writers** — a single byte-range lock makes the second writer fail to
+  open. There is no shared-writer protocol.
+- **Multi-statement concurrency / session snapshots** — reader isolation is
+  per-command; there is no serializable multi-statement read view. MVCC is
+  roadmap.
+- **User-defined constraints** — no foreign keys, no `UNIQUE` beyond the primary
+  key, no typed/domain-checked columns, no triggers. Consistency is structural
+  only.
+- **Automatic resizing or a load-factor guard on `INSERT`** — capacity is fixed
+  at creation and `INSERT` fills to 100% before it reports `table full`.
+- **Replication, point-in-time recovery, log archiving** — the WAL is a single
+  staging frame truncated at checkpoint, not a retained redo stream.
+- **Cross-host durability guarantees** — correctness assumes local, coherent
+  `fsync` semantics.
 
 ---
 

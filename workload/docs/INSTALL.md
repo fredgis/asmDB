@@ -26,6 +26,7 @@ The reference environment is provisioned. These are the real values; substitute 
 | Verified Entra domain | `asmdb.cloud` | `az rest --url https://graph.microsoft.com/v1.0/domains` |
 | Entra app (multitenant) | `<workload-app-id>` | `az ad app show --id …` |
 | Application ID URI | `https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1` | same |
+| Package version | `1.0.1` | `workload/manifest/WorkloadManifest.xml`, `workload/build/Workload.nuspec`, and `pack.ps1 -Version 1.0.1` |
 | Exposed scope | `FabricWorkloadControl`; preauthorise Power BI `871c010f-5e61-4fb1-83ac-98610a7e9110`, Fabric Client for Workloads `d2450708-699c-41e3-8077-b0c8341509aa`, and Power BI Service `00000009-0000-0000-c000-000000000000`; delegated `Fabric.Extend` consented | same |
 | Federated credential | subject `<backend-mi-principal-id>` (backend managed identity), audience `api://AzureADTokenExchange` | `…/federatedIdentityCredentials` |
 | Key Vault | `<key-vault-name>`, **RBAC authorisation enabled**, public network access disabled | `az keyvault show` |
@@ -39,7 +40,7 @@ One thing is deliberately **not** production-ready:
 
 - **Real support links.** Three still read `REPLACE-ME`, and the three GitHub links resolve only while the repository is private. Neither blocks a tenant-internal install; both block Workload Hub submission.
 
-The CDC gateway **is deployed**, but it is the deliberate exception to the analytics-resource-group split: it lives in `<service-resource-group>` alongside the service because it mounts the same Azure Files share, and it is private to the service VNet. Notebooks therefore read through the backend rather than calling it directly — see §4.2, which also records why the obvious alternative does not work.
+The CDC gateway **is deployed**, but it is the deliberate exception to the analytics-resource-group split: it lives in `<service-resource-group>` alongside the service because it mounts the same Azure Files share, and it is private to the service VNet. Notebooks therefore read through the backend rather than calling it directly — see §4.3, which also records why the obvious alternative does not work.
 
 ## Decisions to make before first upload
 
@@ -99,10 +100,11 @@ Required versions/tools:
 - PowerShell 7+.
 - Azure CLI.
 - PowerShell/.NET runtime capable of creating zip packages. PowerShell 7 supplies this.
+- Python 3 with Pillow, only when regenerating Workload Hub artwork with `workload/build/gen_hub_assets.py`.
 
-How to know it worked: every command prints a version, and Node is 20 or higher.
+How to know it worked: every command prints a version, Node is 20 or higher, and `python -c "import PIL"` succeeds before you regenerate Hub artwork.
 
-Failure looks like: `not recognized`, `command not found`, or Node lower than 20. Install Node from `https://nodejs.org/`, PowerShell from `https://learn.microsoft.com/powershell/`, and Azure CLI from `https://learn.microsoft.com/cli/azure/install-azure-cli`.
+Failure looks like: `not recognized`, `command not found`, Node lower than 20, or `ModuleNotFoundError: No module named 'PIL'`. Install Node from `https://nodejs.org/`, PowerShell from `https://learn.microsoft.com/powershell/`, Azure CLI from `https://learn.microsoft.com/cli/azure/install-azure-cli`, and Pillow with `python -m pip install Pillow` if you need to regenerate artwork.
 
 ## 2. Verify the Entra domain and publishing identity
 
@@ -226,7 +228,7 @@ The workload app must expose `FabricWorkloadControl` and preauthorise the Micros
 
 Also add and consent delegated Power BI Service permission `Fabric.Extend`. Without it Fabric can upload and load enough of the workload to mislead you, then fail token acquisition.
 
-After running `deploy.ps1 -Only entra`, verify this by hand: inspect **Expose an API** → **Authorized client applications** and **API permissions** → admin consent. If any client or `Fabric.Extend` is missing, add it before packaging; token acquisition failures otherwise look like generic workload auth errors.
+After running `deploy.ps1 -Only entra`, verify this by hand: inspect **Expose an API** → **Authorized client applications** and **API permissions** → admin consent. The checked-in script patches the redirect URIs, Application ID URI, Power BI workspace/item permissions, the workload scope, and the Power BI client preauthorisation. The reference app also has `Fabric.Extend` and the two additional preauthorised clients above. If any client or `Fabric.Extend` is missing, add it before packaging; token acquisition failures otherwise look like generic workload auth errors.
 
 
 ### 2.4 Complete publisher verification for Workload Hub only — lead-time item
@@ -361,7 +363,57 @@ How to know it worked: the backend App Service and Static Web App are in `<analy
 
 Failure looks like: the script says the resource group is missing or an isolation violation occurred. Stop and fix the subscription/resource-group parameters.
 
-### 4.1 Reaching the CDC gateway, which is private
+### 4.1 Configure the backend application settings
+
+`deploy.ps1 -Only infrastructure` creates the App Service, and `deploy.ps1 -Only backend` deploys code. Neither phase supplies the runtime settings the backend reads from `workload/backend/src/config.ts`; set them before judging whether the backend works.
+
+For the reference environment:
+
+```powershell
+az webapp config appsettings set `
+  --subscription <subscription-id> `
+  --resource-group <analytics-resource-group> `
+  --name asmdb-analytical-backend `
+  --settings `
+    PORT=5010 `
+    WEBSITES_PORT=5010 `
+    WEBSITE_DNS_SERVER=168.63.129.16 `
+    ASMDB_WL_ENTRA_TENANT_ID="<tenant-id>" `
+    ASMDB_WL_ENTRA_CLIENT_ID="<workload-app-id>" `
+    ASMDB_WL_USE_MANAGED_IDENTITY=true `
+    ASMDB_WL_APP_ID_URI="https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1" `
+    ASMDB_ALLOWED_ORIGINS="https://fe.asmdb.cloud" `
+    ASMDB_CLOUD_API="https://www.asmdb.cloud/api/v1" `
+    ASMDB_GATEWAY_URL="https://<internal-gateway-fqdn>" `
+    ASMDB_GATEWAY_TOKEN="<raw gateway token>" `
+    ASMDB_KEY_VAULT_URL="https://<key-vault-name>.vault.azure.net" `
+    ASMDB_KEY_VAULT_SECRET_NAME="asmdb-gateway-token" `
+    ASMDB_NOTEBOOK_GATEWAY_URL="https://asmdb-analytical-backend.azurewebsites.net/api/sync"
+```
+
+`ASMDB_WL_ENTRA_CLIENT_SECRET` is the local-development alternative to `ASMDB_WL_USE_MANAGED_IDENTITY=true`; do not set both in Azure. `ASMDB_WL_MANAGED_IDENTITY_CLIENT_ID` is only for a user-assigned identity. `ASMDB_CLOUD_SCOPE`, `ASMDB_FABRIC_API`, `ASMDB_WL_JWKS_URI`, `ASMDB_WL_TOKEN_ENDPOINT`, and the size/timeout settings are optional overrides; omit them unless you have a specific reason to change the defaults.
+
+How to know it worked:
+
+```powershell
+az webapp config appsettings list `
+  --subscription <subscription-id> `
+  --resource-group <analytics-resource-group> `
+  --name asmdb-analytical-backend `
+  --query "[].name" -o table
+```
+
+The output includes every required `ASMDB_...` name above. Then:
+
+```powershell
+Invoke-RestMethod "https://asmdb-analytical-backend.azurewebsites.net/health"
+```
+
+Expect `{"status":"ok","version":"0.1.0"}`.
+
+Failure looks like: the process never starts because `ASMDB_GATEWAY_URL`, `ASMDB_GATEWAY_TOKEN`, `ASMDB_KEY_VAULT_URL`, `ASMDB_WL_ENTRA_TENANT_ID`, or `ASMDB_WL_ENTRA_CLIENT_ID` is missing; authenticated calls return 401 because `ASMDB_WL_APP_ID_URI` is absent and the backend rejects tokens whose audience is the verified-domain Application ID URI; browser calls fail with CORS errors because `ASMDB_ALLOWED_ORIGINS` does not include the frontend origin.
+
+### 4.2 Reaching the CDC gateway, which is private
 
 The CDC gateway is the one component that does **not** live in the analytics resource group. It reads the change log from a read-only mount of the Azure Files share the asmDB Cloud instances write to, and that share is in `<service-resource-group>` — so the gateway is there too, in an **internal** Container Apps environment, on a private address inside `asmdb-vnet` with no public DNS.
 
@@ -389,17 +441,27 @@ az webapp config set `
   --vnet-route-all-enabled true
 ```
 
-Then set `ASMDB_GATEWAY_URL` to the gateway's internal FQDN and `ASMDB_GATEWAY_TOKEN` to its bearer token, and restart.
+Then confirm `ASMDB_GATEWAY_URL` is the gateway's internal FQDN, `ASMDB_GATEWAY_TOKEN` is the raw bearer token value, and restart.
 
 Name resolution needs no work: Azure already links the Container Apps environment's private DNS zone to `asmdb-vnet`, so once the app routes through the VNet it resolves the gateway to its private IP.
 
-**How to know it worked** — verify from inside the App Service rather than trusting the configuration:
+**How to know it worked** — verify from inside the App Service rather than trusting the configuration. The Kudu command API uses publishing credentials, not an ARM bearer token:
 
 ```powershell
-$tok = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+$profiles = [xml](az webapp deployment list-publishing-profiles `
+  --subscription <subscription-id> `
+  --resource-group <analytics-resource-group> `
+  --name asmdb-analytical-backend `
+  --xml)
+$profile = $profiles.publishData.publishProfile |
+  Where-Object { $_.publishMethod -eq "MSDeploy" } |
+  Select-Object -First 1
+$basic = [Convert]::ToBase64String(
+  [Text.Encoding]::ASCII.GetBytes("$($profile.userName):$($profile.userPWD)")
+)
 $cmd = 'curl -s -w "\nHTTP=%{http_code}\n" --max-time 20 https://<gateway-fqdn>/healthz'
 Invoke-RestMethod -Uri "https://asmdb-analytical-backend.scm.azurewebsites.net/api/command" -Method Post `
-  -Headers @{ Authorization = "Bearer $tok"; "Content-Type" = "application/json" } `
+  -Headers @{ Authorization = "Basic $basic"; "Content-Type" = "application/json" } `
   -Body (@{ command = $cmd; dir = "/home" } | ConvertTo-Json)
 ```
 
@@ -413,9 +475,9 @@ Expect `{"status":"ok"}` and `HTTP=200`. Resolving the hostname to a `10.20.*` a
 
 **A note on the token.** It is set as an application setting rather than a Key Vault reference. The vault has public network access disabled by tenant policy and is reachable only through the Fabric managed private endpoint, so App Service cannot read it. A Key Vault reference would fail at startup. This is a deliberate trade-off, not an oversight: revisit it if a private endpoint for App Service is added to the vault.
 
-### 4.2 Letting the Spark notebooks reach the gateway, which is a different path entirely
+### 4.3 Letting the Spark notebooks reach the gateway, which is a different path entirely
 
-§4.1 solves the **backend's** route to the gateway. It does nothing for the notebooks, and the distinction is easy to miss because both are "our code calling the gateway".
+§4.2 solves the **backend's** route to the gateway. It does nothing for the notebooks, and the distinction is easy to miss because both are "our code calling the gateway".
 
 The backend is an App Service we own, sitting in a subnet we created, so outbound VNet integration is available to it. A Fabric notebook is not ours: it runs on Spark inside Microsoft's own managed network, in a different region from the gateway. It cannot be placed in `asmdb-vnet`, and no setting on the notebook will change that.
 
@@ -454,12 +516,13 @@ Do not spend time on this path. It is documented here so that the next person do
 
 #### What actually works: the notebooks read through the backend
 
-The backend already reaches the gateway, over the VNet integration of §4.1, and it is publicly reachable. So generated notebooks read their change log through it rather than calling the gateway directly.
+The backend already reaches the gateway, over the VNet integration of §4.2, and it is publicly reachable. So generated notebooks read their change log through it rather than calling the gateway directly.
 
 `ASMDB_NOTEBOOK_GATEWAY_URL` is the base URL baked into every generated notebook. Point it at the backend's passthrough:
 
 ```powershell
 az webapp config appsettings set `
+  --subscription <subscription-id> `
   --resource-group <analytics-resource-group> --name asmdb-analytical-backend `
   --settings ASMDB_NOTEBOOK_GATEWAY_URL="https://asmdb-analytical-backend.azurewebsites.net/api/sync"
 ```
@@ -477,7 +540,7 @@ If the setting is absent the notebooks fall back to `ASMDB_GATEWAY_URL`, which i
 **How to know it worked:**
 
 ```powershell
-$token = "<the gateway bearer token>"
+$token = "<raw gateway token>"
 Invoke-WebRequest -UseBasicParsing `
   -Uri "https://asmdb-analytical-backend.azurewebsites.net/api/sync/cdc/<instanceId>?from=0&limit=5" `
   -Headers @{ Authorization = "Bearer $token" }
@@ -522,7 +585,11 @@ az keyvault create `
 Then store the gateway token for notebooks:
 
 ```powershell
-az keyvault secret set --vault-name "<vault-name>" --name "asmdb-gateway-token" --value "<token>"
+az keyvault secret set `
+  --subscription "<subscription-id>" `
+  --vault-name "<vault-name>" `
+  --name "asmdb-gateway-token" `
+  --value "<raw gateway token>"
 ```
 
 The backend's copy of the same token is intentionally **not** a Key Vault reference in the reference environment. Tenant policy disables public network access on the vault; Fabric reaches it through a managed private endpoint, while App Service cannot. Set `ASMDB_GATEWAY_TOKEN` as an application setting unless/until an App Service private path to the vault is added.
@@ -639,7 +706,7 @@ Only one size is validated at upload — the banner, at **exactly 1920×240** ([
 | `homePage.learningMaterials[].image` | **320×180** | Contained with padding, never edge-to-edge |
 | `icon`, `favicon` | ≥ 240×240 square | Rendered anywhere from 16 to 64 px, so supply something larger and let it downsample |
 
-Limits enforced on the `Assets` folder: `.png`/`.jpg`/`.jpeg` only, **1.5 MB per file**, **15 files**, and `Product.json` itself under 50 KB.
+`pack.ps1` enforces the rules it can check locally: every referenced `assets/*` file exists, extensions are `.png`/`.jpg`/`.jpeg`, each asset is at most **1.5 MB**, and video entries are YouTube or Vimeo embed URLs. Fabric upload also enforces the Hub-specific rules the script does not check today: at most **15 files** in `Assets`, `Product.json` under 50 KB, and the banner at **exactly 1920×240**.
 
 Regenerate from the checked-in logo and the README screenshots:
 
@@ -666,19 +733,43 @@ How to know it worked: the packaging preflight reports `[PASS] No placeholder va
 
 Failure looks like: `pack.ps1` lists every placeholder by file and field and produces no package.
 
-## 2. Build, validate, and package with one command
+## 2. Deploy changed backend or frontend code
+
+`pack.ps1` validates that the frontend still builds, but it does **not** deploy the backend App Service or the Static Web App. If a release changes only manifest metadata, skip this section. If it changes `workload/backend` or `workload/frontend`, deploy the service code before uploading the new workload package.
+
+```powershell
+pwsh .\workload\build\deploy.ps1 `
+  -Only build `
+  -BackendUrl "https://asmdb-analytical-backend.azurewebsites.net"
+
+pwsh .\workload\build\deploy.ps1 `
+  -Only backend
+
+pwsh .\workload\build\deploy.ps1 `
+  -Only frontend `
+  -AppId "<workload-app-id>" `
+  -FrontendUrl "https://fe.asmdb.cloud"
+```
+
+Do not omit `-AppId` on the frontend phase. That phase patches `WorkloadManifest.xml`; without the real app id it writes the all-zero placeholder.
+
+How to know it worked: `/health` still returns 200 from the backend, and `https://fe.asmdb.cloud/`, `/sync-hub`, and `/close` all return 200 after the frontend deploy.
+
+Failure looks like: backend deployment fails because `workload/backend/dist` is missing — run the build phase first; frontend deployment fails because the Static Web Apps deployment token cannot be read; later packaging fails because the frontend phase was run without `-AppId` and the manifest now contains the all-zero GUID.
+
+## 3. Build, validate, and package with one command
 
 What to do from the repository root:
 
 ```powershell
-pwsh .\workload\build\pack.ps1 -Version 1.0.0
+pwsh .\workload\build\pack.ps1 -Version 1.0.1
 ```
 
 This command:
 
 1. checks local prerequisites with plain-language fixes;
 2. installs frontend dependencies if `node_modules` is missing;
-3. builds the frontend production bundle;
+3. builds the frontend production bundle for validation only;
 4. validates placeholders, workload id duplication, editor path, frontend output, versions, URLs, assets, and video URLs;
 5. assembles the Fabric manifest package;
 6. emits exactly one `.nupkg` under `workload\build\out\`.
@@ -690,12 +781,14 @@ Failure looks like: the checklist ends with `VERDICT: FAIL`. Fix every `[FAIL]` 
 Development-only packaging test:
 
 ```powershell
-pwsh .\workload\build\pack.ps1 -Version 1.0.0 -AllowPlaceholders
+pwsh .\workload\build\pack.ps1 -Version 1.0.1 -AllowPlaceholders
 ```
 
 Use this only to test package assembly. Do not upload a package built while placeholders remain.
 
-## 3. Upload the package
+If you use `deploy.ps1 -Only pack` instead of calling `pack.ps1` directly, pass `-NuGetVersion 1.0.1`; the deployment script's current default is older than this release.
+
+## 4. Upload the package
 
 What to do: upload the file printed on the final `UPLOAD:` line.
 
@@ -711,7 +804,7 @@ Failure looks like:
 - unresolved frontend URL: upload or iframe load fails; verify the custom domain and `WorkloadManifest.xml` URL;
 - placeholder marketplace links: marketplace submission fails late; `pack.ps1` blocks these unless `-AllowPlaceholders` was used.
 
-## 4. Smoke-check after upload
+## 5. Smoke-check after upload
 
 What to do:
 

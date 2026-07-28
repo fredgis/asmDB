@@ -46,7 +46,10 @@ confirmation against the real Azure Files read-only mount.
 - `GET /cdc/{instanceId}/head` returns `baseSeq`, `lastSeq`, and `rows`.
 - `GET /cdc/{instanceId}?from=<seq>&limit=<n>` returns one JSON object per
   complete CDC frame, with `X-Asmdb-Base-Seq`, `X-Asmdb-Last-Seq`, and
-  `X-Asmdb-Has-More` headers.
+  `X-Asmdb-Has-More` headers. `from` is **exclusive**: the first frame returned
+  is the one after `from` (`commitSeq > from`), so a consumer pages by passing
+  the last `commitSeq` it consumed. `from` is required; a missing `from` is
+  `400 invalid_request`.
 - `GET /snapshot/{instanceId}?after=<slot>&limit=<n>` returns one upsert-shaped
   JSON object per live row from the current `.dat` image, pinned to
   `X-Asmdb-Snapshot-Seq`. Paging is by slot index using `X-Asmdb-Next-After`;

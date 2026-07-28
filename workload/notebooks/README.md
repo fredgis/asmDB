@@ -4,14 +4,14 @@ This directory contains the generated-notebook template for one asmDB sync link:
 
 - `sync_template.py` — PySpark notebook source with clean `# %%` cell boundaries.
 - `render.py` — substitutes per-link values into the template.
-- `test_sync.py` — plain Python tests for CDC parsing, collapse, decoder and reseed semantics.
+- `test_sync.py` — plain Python tests for CDC parsing, collapse, decoder, reseed and snapshot-seeding semantics.
 
 ## What the notebook does
 
 1. Reads the target Delta table watermark from table property `asmdb.cdc.watermark` (missing means `0`) and fetches from `watermark + 1`.
 2. Replicates gateway CDC events on the schedule: collapse each batch to one row per `id`, `MERGE INTO`, then advance the watermark.
 3. On `cdc_gap` or `cdc_corrupt`, automatically rebuilds from the retained CDC base when that base is complete.
-4. Still fails loudly on a `reset` frame mid-incremental-stream; that is an alarming event boundary, not an ordinary page.
+4. On a `reset` frame, seeds the target from the gateway snapshot and then resumes incremental consumption from the snapshot's sequence. `TRUNCATE`, `RESTORE` and `BENCH` each emit exactly one `RESET` frame carrying no operations, so the change log cannot rebuild the table and the snapshot is the only honest source. Reseeds are capped at `MAX_RESEEDS_PER_RUN` (3) per run; a source replaced faster than that fails loudly with the last seeded image left intact.
 5. Collapses a batch to one row per `id`, with the last operation in commit order winning.
 6. Keeps `content_raw`, optionally decodes `content`, and marks `_decode_error` without dropping bad rows.
 7. Applies tombstones by default (`_deleted=true`); hard delete is a render option.
@@ -33,7 +33,13 @@ Gateway acknowledgement happens after the local data and watermark are committed
 
 There is no user-facing sync mode. The notebook normally replicates change events incrementally. If the gateway reports `cdc_gap` or `cdc_corrupt`, the notebook attempts automatic recovery by replaying from the CDC base. If the gateway reports `X-Asmdb-Base-Seq: 0`, it can replay every frame from the base: `upsert` sets the live record for an id, `delete` removes it, and `reset` clears the in-memory image before later frames are applied. The resulting complete image is written with `createOrReplace`, then the watermark is advanced to the last sequence seen.
 
-This works **only while retention covers the whole history**. If the retained base is greater than zero, the early frames needed to rebuild old live rows are gone. In that case automatic rebuild raises a clear error naming `baseSeq` and the requested sequence; it never silently rebuilds from the retained tail and calls that complete. A product that needs guaranteed reseeds needs either retention long enough to cover all history or a snapshot endpoint, which does not exist today.
+This works **only while retention covers the whole history**. If the retained base is greater than zero, the early frames needed to rebuild old live rows are gone. In that case automatic rebuild raises a clear error naming `baseSeq` and the requested sequence; it never silently rebuilds from the retained tail and calls that complete. `cdc_gap` and `cdc_corrupt` do not fall back to the snapshot — only a `reset` frame does.
+
+## Snapshot reseed on RESET
+
+`TRUNCATE`, `RESTORE` and `BENCH` replace the whole table and the engine reports each as a single operation-less `RESET` frame. The change log cannot replay that, so on a `reset` frame the notebook seeds from the gateway snapshot instead.
+
+The seed pages `GET /snapshot/{instanceId}?after=&limit=` and stages each page into a temporary Delta table rather than accumulating every row in driver memory. The snapshot is pinned to `X-Asmdb-Snapshot-Seq`; if the sequence changes between pages the notebook discards the stage and restarts from the first page, up to `max_restarts`. `snapshot_unstable` (HTTP 503) leaves the existing lakehouse table untouched and fails the run. When all pages are staged, the notebook replaces the target from the stage, writes the watermark to the snapshot sequence, then resumes incremental consumption from that sequence — so the seeded rows and the resume point share one sequence and no frame is skipped or double-applied. Reseeds are capped at `MAX_RESEEDS_PER_RUN` per run.
 
 ## Key Vault credential path
 

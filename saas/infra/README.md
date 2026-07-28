@@ -45,10 +45,15 @@ Options:
 - `-WhatIf` runs Azure what-if only and stops.
 
 The script is the deployment path and is run from a workstation; there is no CI deployment. It requires Azure CLI login to tenant `<tenant-id>` and subscription `<subscription-id>`.
+The target resource group `<service-resource-group>` must already exist in `swedencentral`.
+For a full deploy, Azure CLI must be on `PATH` and support `az deployment
+group` and `az acr build`; the deployment uses ACR Tasks rather than a local
+Docker daemon.
 
 APIM Developer SKU creation commonly takes 30-45 minutes. The deploy script starts the Azure deployment asynchronously, waits up to 90 minutes, and prints progress while APIM is being created.
 
-The custom domain uses the Let's Encrypt certificate found in the local Posh-ACME store. The renewal path is automated by `renew-certificate.ps1`; the current `www.asmdb.cloud` certificate expires 2026-10-23.
+The custom domain uses the Let's Encrypt certificate found in the local
+Posh-ACME store. The renewal path is automated by `renew-certificate.ps1`.
 
 ## TLS certificate renewal
 
@@ -102,4 +107,10 @@ The durable instance volume is one shared Premium Azure Files NFS 4.1 share with
 .\teardown.ps1
 ```
 
-Use `-Force` to skip the prompt. The teardown deletes the platform resources and every `db-*` Container App, but never deletes the `<service-resource-group>` resource group.
+Use `-Force` to skip the prompt. The teardown deletes `asmdb-cp`, every `db-*`
+Container App, `asmdbacr*` registries, `asmdbst*` storage accounts, the
+resource-group role assignments for `asmdb-mi`, `asmdb-env`, `asmdb-mi`, and
+`asmdb-logs`. It never deletes the `<service-resource-group>` resource group. It does not
+currently delete APIM, the VNet, private endpoints, DNS zones, the public IP,
+the NSG, or `asmdbfs*` Premium Files accounts; remove those separately if the
+whole platform is being dismantled.

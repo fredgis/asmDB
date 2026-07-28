@@ -18,8 +18,8 @@ here instead of inlining the list.
 - **Data:** [`INSERT`](#insert) · [`SELECT`](#select) · [`UPDATE`](#update) · [`DELETE`](#delete) · [`TRUNCATE`](#truncate) · [`FIND`](#find) · [`RANGE`](#range) · [`COUNT`](#count)
 - **Transactions:** [`BEGIN`](#begin) · [`COMMIT`](#commit) · [`ROLLBACK`](#rollback)
 - **Catalog:** [`TABLES`](#tables) · [`DATABASES`](#databases) · [`SCHEMA`](#schema) · [`TYPES`](#types) · [`VERSION`](#version) · [`BENCH`](#bench)
-- **Backup:** [`BACKUP`](#backup) · [`RESTORE`](#restore)
-- **Session:** [`HELP`](#help) · [`EXIT` / `QUIT`](#exit--quit)
+- **Backup:** [`BACKUP`](#backup) · [`RESTORE`](#restore) · [`VERIFY`](#verify) · [`CDCTRIM`](#cdctrim)
+- **Session:** [`FORMAT`](#format) · [`PAGE`](#page) · [`HELP`](#help) · [`EXIT` / `QUIT`](#exit--quit)
 - **[Why there is no `CREATE TABLE` / `DROP` / `ALTER`](#why-there-is-no-create-table--drop--alter)**
 - **[Error reference](#error-reference)**
 
@@ -64,7 +64,7 @@ asmdb <db> --upgrade  # migrate a database written in an older storage format
 A `--reader` session takes no lock and creates nothing. It refuses every command
 that would modify the database — `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
 `BEGIN`/`COMMIT`/`ROLLBACK`, `BACKUP`, `RESTORE`, `BENCH` — with
-`[ERR] read-only session (--reader) …`.
+`[ERR] read-only session (--reader) - this command would modify the database`.
 
 Each reader command is executed between two reads of the database's commit
 sequence. If a commit lands while the command runs, the command is replayed
@@ -93,7 +93,8 @@ see different states, but neither will ever see half of one.
 | [`SCHEMA`](#schema) | show the fixed record layout |
 | [`TYPES`](#types) | supported logical column types |
 | [`VERSION`](#version) | engine build, storage format, and the writing engine's stamp |
-| [`BENCH <n>`](#bench) | insert *n* synthetic rows and report engine rows/sec || [`BACKUP <file>`](#backup) | snapshot this database to `<file>` |
+| [`BENCH <n>`](#bench) | insert *n* synthetic rows and report engine rows/sec |
+| [`BACKUP <file>`](#backup) | snapshot this database to `<file>` |
 | [`RESTORE <file>`](#restore) | reload this database from a snapshot |
 | [`VERIFY`](#verify) | full logical integrity scan of the store |
 | [`CDCTRIM <seq>`](#cdctrim) | drop change frames up to and including `<seq>` |
@@ -124,7 +125,9 @@ asmdb> INSERT 1001 5 project asmdb is written in x86-64 assembly
 [ OK ] 1 row inserted
 ```
 
-Errors: `[ERR] id already exists`, `[ERR] id must be >= 1`, `[ERR] table full`.
+Errors: `[ERR] key already exists`, `[ERR] constraint: id must be >= 1 (0 is reserved)`,
+`[ERR] table full`, and `[ERR] tag exceeds 39 bytes or content exceeds 175 bytes - nothing stored`
+when a field is over-long.
 
 ---
 
@@ -141,19 +144,22 @@ truncated to fit.
 
 ```text
 asmdb> SELECT 1001
+
   id       : 1001
   tag      : project
   value    : 5
-  created  : 1718900000123
-  updated  : 1718900000123
+  created  : 1718900000123 ms
+  updated  : 1718900000123 ms
   content  : asmdb is written in x86-64 assembly
 
+[ OK ] 1 row(s)
+
 asmdb> SELECT *
-+----------+------------------+------------+------------------------------------------+
-| id       | tag              | value      | content                                  |
-+----------+------------------+------------+------------------------------------------+
-| 1001     | project          | 5          | asmdb is written in x86-64 assembly      |
-+----------+------------------+------------+------------------------------------------+
++----------+------------------+--------------+------------------------------------------+
+| id       | tag              | value        | content                                  |
++----------+------------------+--------------+------------------------------------------+
+| 1001     | project          | 5            | asmdb is written in x86-64 assembly      |
++----------+------------------+--------------+------------------------------------------+
 [ OK ] 1 row(s)
 ```
 
@@ -219,9 +225,14 @@ asmdb> TRUNCATE
 [ OK ] table truncated - 3 row(s) removed
 ```
 
+`TRUNCATE` emits exactly **one CDC `RESET` frame carrying no operations** — not a
+per-row delete stream. A change-log consumer therefore sees only that the table
+was cleared and **cannot rebuild the pre-truncate rows from the log**; it must
+re-bootstrap from a `BACKUP`.
+
 If a transaction is open and clearing the table would exceed the undo capacity,
-it is refused with `[ERR] transaction too large` — split it or `TRUNCATE` in
-autocommit mode.
+it is refused with `[ERR] transaction too large - COMMIT or ROLLBACK` — split it
+or `TRUNCATE` in autocommit mode.
 
 ---
 
@@ -236,12 +247,12 @@ row. Matches are printed as a table (same shape as `SELECT *`).
 
 ```text
 asmdb> FIND assembly
-+----------+------------------+------------+------------------------------------------+
-| id       | tag              | value      | content                                  |
-+----------+------------------+------------+------------------------------------------+
-| 1001     | project          | 9          | asmdb now targets Windows and Linux      |
-+----------+------------------+------------+------------------------------------------+
-[ OK ] 1 match
++----------+------------------+--------------+------------------------------------------+
+| id       | tag              | value        | content                                  |
++----------+------------------+--------------+------------------------------------------+
+| 1001     | project          | 9            | asmdb now targets Windows and Linux      |
++----------+------------------+--------------+------------------------------------------+
+[ OK ] 1 row(s)
 ```
 
 `[ OK ] no matching rows` when nothing matches.
@@ -260,13 +271,15 @@ roadmap.
 
 ```text
 asmdb> RANGE 200 260
-+----------+------------------+------------+------------------------------------------+
-| id       | tag              | value      | content                                  |
-+----------+------------------+------------+------------------------------------------+
-| 42       | metric           | 250        | yy                                       |
-+----------+------------------+------------+------------------------------------------+
++----------+------------------+--------------+------------------------------------------+
+| id       | tag              | value        | content                                  |
++----------+------------------+--------------+------------------------------------------+
+| 42       | metric           | 250          | yy                                       |
++----------+------------------+--------------+------------------------------------------+
 [ OK ] 1 row(s)
 ```
+
+`[ OK ] no rows in range` when nothing falls inside `[lo, hi]`.
 
 ---
 
@@ -306,12 +319,13 @@ BEGIN
 
 Start a transaction: snapshots the live row count and clears the undo log.
 Subsequent mutations are applied in RAM but **not** written to `.dat` until
-`COMMIT`. Nesting is not supported — a second `BEGIN` is an error.
+`COMMIT`. Nesting is not supported — a second `BEGIN` fails with
+`[ERR] transaction already active`.
 
 **A transaction may touch at most 4096 distinct rows.** The undo log has one
 entry per *slot*, not per statement, so updating the same row a thousand times
 costs one entry, while touching 4097 different rows fails the offending
-statement with `[ERR] transaction too large`. Nothing is applied and nothing is
+statement with `[ERR] transaction too large - COMMIT or ROLLBACK`. Nothing is applied and nothing is
 half-captured — the transaction is left exactly as it was, so `COMMIT` still
 commits only what succeeded. A bulk load must therefore be split into batches of
 at most 4096 rows, or run as autocommit statements.
@@ -338,7 +352,7 @@ asmdb> COMMIT
 [ OK ] transaction committed
 ```
 
-Error: `[ERR] no transaction` if none is open.
+Error: `[ERR] no active transaction` if none is open.
 
 ---
 
@@ -357,7 +371,7 @@ asmdb> ROLLBACK
 [ OK ] transaction rolled back
 ```
 
-Error: `[ERR] no transaction` if none is open.
+Error: `[ERR] no active transaction` if none is open.
 
 ---
 
@@ -374,8 +388,14 @@ Show the single logical table held in this database (its name lives in the
 
 ```text
 asmdb> TABLES
-  SalesTransactions
-[ OK ] 1 table
+
+  tables in database SalesDB
+
+    table                        rows
+    -------------------------    ----------
+    SalesTransactions            1
+
+[ OK ] 1 table(s)
 ```
 
 ---
@@ -386,12 +406,19 @@ asmdb> TABLES
 DATABASES
 ```
 
-List the `*.dat` databases in the current working folder.
+List the `*.dat` databases in the current working folder, with each file's size
+in bytes; the currently open database is marked `*` in the `current` column.
 
 ```text
 asmdb> DATABASES
-  SalesDB.dat
-  Bench2M.dat
+
+  databases in this folder
+
+    database                     size (bytes)   current
+    -------------------------    ------------   -------
+    SalesDB.dat                  1073741824     *
+    Bench2M.dat                  536870912
+
 [ OK ] 2 database(s)
 ```
 
@@ -418,8 +445,8 @@ asmdb> SCHEMA
     16      8     created  i64   unix epoch ms (auto)
     24      8     updated  i64   unix epoch ms (auto)
     32      8     value    i64   numeric score / payload
-    40      40    tag      char[40]  category, 39 usable + NUL
-    80      176   content  char[176] free text, 175 usable + NUL
+    40      40    tag      char[40]  category, NUL-padded
+    80      176   content  char[176] free text, NUL-padded
 [ OK ] schema shown
 ```
 
@@ -448,8 +475,14 @@ asmdb> TYPES
     bool            8  0 = false / 1 = true        value
     f64            64  IEEE-754 double (raw bits)  value
     timestamp      64  unix epoch ms               created, updated
-    char[40]      320  text, <= 39 B + NUL        tag
-    char[176]    1408  text, <= 175 B + NUL       content
+    char[40]      320  fixed ASCII text, <= 40 B   tag
+    char[176]    1408  fixed ASCII text, <=176 B   content
+
+    A row carries a numeric value cell plus two auto timestamps, a
+    short tag (category / namespace) and a free-text content field.
+    Narrow ints, bool, f64 and timestamps all live in the 64-bit
+    value cell - asmdb keeps the raw bits and your app (or an agent
+    via the MCP server) picks the interpretation.
 [ OK ] types shown
 ```
 
@@ -494,23 +527,31 @@ BENCH <n>
 Insert *n* synthetic rows in a tight in-RAM loop (no text protocol, no per-row
 disk I/O), timed internally with a high-resolution counter, then checkpoint once
 and report throughput. This is how the [Performance](../README.md#performance)
-numbers are produced. `n` is capped at 75 % of the configured slot table, the
-same load-factor limit enforced for normal inserts.
+numbers are produced. `n` defaults to `100000` when omitted (or given as `0`),
+and is capped at 75 % of the configured slot table. That cap exists **only** in
+`BENCH`: ordinary `INSERT` has no load-factor guard and fills to the last free
+slot ([`parse.inc:2004`](../src/parse.inc) is the sole 0.75 computation in the
+engine).
 
 ```text
 asmdb> BENCH 1000000
-  in-RAM insert  :  18342105 rows/sec
-  fsync total    :        just over one second for the durable checkpoint
-[ OK ] benchmark complete
+[ OK ] BENCH inserted 1000000 rows
+  in-RAM insert            : 18342105 rows/sec  (engine only, no I/O)
+  checkpoint + fsync total : 1050 ms  (full-table durable write)
 ```
 
-The rows/sec value is machine-specific. Published README benchmark numbers are
+The status line is printed **first**; the two timing lines follow it. The
+rows/sec and millisecond values are machine-specific. Published README benchmark numbers are
 from one workstation core, not from an asmdb Cloud tier; hosted users should run
 `BENCH` on their own instance when they need a tier-specific measurement.
 
 > `BENCH` mutates the open database (it replaces its contents with synthetic
 > rows). Run it against a scratch database name, or `TRUNCATE` afterwards.
 > It is **refused inside a transaction** — `COMMIT` or `ROLLBACK` first.
+>
+> Like `TRUNCATE` and `RESTORE`, `BENCH` emits exactly **one CDC `RESET` frame
+> carrying no operations**: it replaces the whole table, so a change-log consumer
+> sees only the reset and cannot reconstruct the synthetic rows from the log.
 
 ---
 
@@ -568,8 +609,13 @@ the current database is left exactly as it was, in memory and on disk.
 
 ```text
 asmdb> RESTORE salesdb.bak
-[ OK ] database restored - 10 row(s)
+[ OK ] database restored from backup
 ```
+
+Like `TRUNCATE` and `BENCH`, `RESTORE` emits exactly **one CDC `RESET` frame
+carrying no operations** — it replaces the whole table, so a change-log consumer
+sees only the reset and **cannot rebuild the restored rows from the log**; it
+must re-bootstrap from the same `BACKUP`.
 
 ---
 
@@ -680,7 +726,9 @@ PAGE <limit> <offset>
 ```
 
 Bound `SELECT *`, `FIND` and `RANGE`. The setting persists until changed;
-`PAGE 0 0` restores the unlimited default. A client that receives exactly
+`PAGE 0 0` restores the unlimited default. `<limit>` may not exceed 1000000 and
+`<offset>` may not exceed the slot capacity; a larger value, or a non-numeric
+argument, is a `[ERR] syntax error - type HELP`. A client that receives exactly
 `limit` rows should assume there are more and ask for the next page.
 
 ```text
@@ -756,7 +804,8 @@ engine never prints `[ OK ]` after a failed write.
 | `constraint: id must be >= 1 (0 is reserved)` | id `0` is not a usable key |
 | `key already exists` | [`INSERT`](#insert) on a live key — use [`UPDATE`](#update) |
 | `key not found` | [`UPDATE`](#update) / [`DELETE`](#delete) / [`SELECT`](#select) on a missing key |
-| `table full` | the configured table has reached its 0.75 load-factor cap |
+| `tag exceeds 39 bytes or content exceeds 175 bytes - nothing stored` | [`INSERT`](#insert)/[`UPDATE`](#update) with an over-long `tag` or `content` |
+| `table full` | a probe of the whole slot table found no free or tombstoned slot |
 | `no active transaction` | [`COMMIT`](#commit) / [`ROLLBACK`](#rollback) outside a transaction |
 | `transaction already active` | nested [`BEGIN`](#begin) |
 | `transaction too large - COMMIT or ROLLBACK` | more than 4096 **distinct rows** touched in one transaction (for `TRUNCATE`, the whole live table must fit — it fails having changed nothing) |

@@ -43,12 +43,14 @@ Base: `https://www.asmdb.cloud/api/v1`. All JSON. All errors use §5.
   "endpoint": "https://www.asmdb.cloud/db/7k2m9x4qp1va8ne03wjr5tzy",
   "token": "<shown once, never again>",
   "created_at": "2026-07-25T19:40:00Z",
-  "engineSource": "image",
-  "upgradeAvailable": false,
-  "availableEngine": "1.5.3",
-  "availableImage": "<registry>.azurecr.io/asmdb-instance:1.5.3"
+  "upgradeAvailable": false
 }
 ```
+
+The create response is the freshly-recorded object: `engineSource`,
+`availableEngine` and `availableImage` are `omitempty` and are not set on this
+path, so they are absent here. They appear once `GET /databases/{id}` recomputes
+them. `upgradeAvailable` has no `omitempty` and is always present.
 
 ### `GET /version` → `200 {"engine":"1.5.3","image":"<current instance image>"}`
 ### `GET /config` → `200 {"tenantId","clientId","scope"}`
@@ -156,27 +158,64 @@ per-instance platform token. It does not wake stopped instances.
 or
 
 ```json
-{ "available": false, "reason": "stopped|instance_starting|unavailable|timeout|platform_token_unconfigured" }
+{ "available": false, "reason": "stopped|instance_starting|unavailable|timeout|state_unavailable|platform_token_unconfigured" }
 ```
 
 `instance_starting` means the platform returned the Azure stopped-app HTML page
 instead of a sidecar JSON payload. It is distinct from `stopped` (known zero
-replicas) and `unavailable` (broken, rejected, or malformed response).
+replicas) and `unavailable` (broken, rejected, or malformed response). When the
+Azure state is known but not `running`, `reason` is that raw state string (e.g.
+`stopped`); `state_unavailable` means the Azure state could not be read at all;
+`timeout` appears only in the `?include_stats=true` list path when a per-instance
+fetch does not finish inside the batch deadline.
 
 ### `POST /databases/{id}/rotate-token`
 
-Entra-authenticated. Generates a new instance token, updates the child Container
-App's `ASMDB_TOKEN`, and returns the new token once:
+Entra-authenticated. Rotation is **two-phase**: this route only *prepares* a new
+token, and `POST /databases/{id}/rotate-token/commit` applies it. Preparing
+generates the token, returns it once, and stores only an encrypted, short-lived
+copy in metadata so a client that times out can retry prepare and recover it.
+Nothing is applied to the instance until commit.
 
+**202**
 ```json
-{ "token": "<shown once>", "warning": "Token rotation restarts the instance and briefly interrupts active connections." }
+{
+  "operation": { "type": "rotate-token", "state": "pending_ack",
+    "started_at": "2026-07-26T13:40:00Z", "updated_at": "2026-07-26T13:40:00Z" },
+  "token": "<shown once>",
+  "warning": "Token rotation is prepared but not committed. Store this token, then call /rotate-token/commit to apply it."
+}
 ```
 
-Instance Container App changes are **stop-then-start**, not rolling. The
-outgoing replica is stopped first so the single-writer engine releases its file
-lock, the new revision is started, and readiness is confirmed before success is
-reported. If the replacement does not become healthy, the previous app spec and
-metadata are restored and the **old token remains the working token**.
+Calling prepare again while a rotation is already in `pending_ack` re-returns the
+same pending token, so a retry is safe. Calling it while any other operation is
+active returns `409 operation_in_progress`.
+
+### `POST /databases/{id}/rotate-token/commit`
+
+Entra-authenticated. Applies the prepared token asynchronously and returns
+promptly with **202**. Refused with `409` (`invalid_request`, message
+`no prepared token rotation to commit`) when there is no rotation in
+`pending_ack`.
+
+**202**
+```json
+{
+  "operation": { "type": "rotate-token", "state": "stopping",
+    "started_at": "2026-07-26T13:40:00Z", "updated_at": "2026-07-26T13:40:00Z" },
+  "token": "<shown once>",
+  "warning": "Token rotation is applying asynchronously. Store this token; it will be purged from metadata after completion."
+}
+```
+
+The console polls `GET /databases/{id}` and reads `database.operation`. Commit
+runs the same **stop-then-start** sequence as upgrade — states `stopping` →
+`starting` → `verifying_health` → `done`. Instance Container App changes are not
+rolling: the outgoing replica is stopped first so the single-writer engine
+releases its file lock, the new revision is started, and readiness is confirmed
+before the new token hash is recorded. If the replacement does not become
+healthy, the previous app spec and metadata are restored and the **old token
+remains the working token** (`state` = `failed`).
 
 ### `POST /databases/{id}/upgrade`
 
@@ -453,20 +492,26 @@ Every non-2xx from either plane:
 { "error": { "code": "<machine_code>", "message": "<human>", "detail": "<optional>" } }
 ```
 
-| code | HTTP |
-|---|---|
-| `unauthorized` | 401 |
-| `not_found` | 404 |
-| `already_exists` | 409 |
-| `invalid_request` | 400 |
-| `field_too_long` | 400 |
-| `quota_exceeded` | 429 |
-| `engine_error` | 502 |
-| `internal` | 500 |
-| `instance_starting` | 504 |
-| `no_upgrade` | 409 |
-| `operation_in_progress` | 409 |
-| `gateway_timeout` | 504 |
+| code | HTTP | plane / notes |
+|---|---|---|
+| `unauthorized` | 401 | both — missing or invalid bearer token |
+| `forbidden` | 403 | control plane — authenticated but not in the `ASMDB_ADMIN` group |
+| `not_found` | 404 | both |
+| `already_exists` | 409 | sidecar — row already exists |
+| `invalid_request` | 400 | both. Also returned with **409** by `rotate-token/commit` when there is no prepared rotation |
+| `field_too_long` | 400 | sidecar — `tag`/`content` over the column limit |
+| `request_too_large` | 413 | sidecar — request body over the size limit |
+| `quota_exceeded` | 429 | control plane — tier instance quota |
+| `engine_error` | 502 | sidecar — engine command failed or unparseable |
+| `bad_gateway` | 502 | control plane — instance unreachable, timed out mid-read, or returned a malformed response (the `exec` proxy) |
+| `backup_missing` | 500 | sidecar — `prepare-upgrade` backup ran but the file could not be statted |
+| `internal` | 500 | both |
+| `engine_unhealthy` | 503 | sidecar — `/health` reports the engine is not healthy |
+| `unavailable` | 503 | control plane — platform credential is not configured |
+| `instance_starting` | 504 | control plane — Azure returns its stopped-app page during the cold-start retry budget |
+| `gateway_timeout` | 504 | control plane — upstream instance timed out |
+| `no_upgrade` | 409 | control plane — instance already on the current engine |
+| `operation_in_progress` | 409 | control plane — another management operation is active |
 
 ---
 

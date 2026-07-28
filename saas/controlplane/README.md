@@ -15,12 +15,7 @@ Required:
 | `ASMDB_ENTRA_CLIENT_ID` | application id; accepted audience is `api://<client-id>` |
 | `ASMDB_ENTRA_GROUP_ID` | `ASMDB_ADMIN` group object id |
 
-> **The three Entra variables are documented as required but are not enforced.**
-> `main.go` supplies this deployment's real tenant, client and group ids as
-> defaults, so a control plane started without them comes up silently validating
-> tokens against those identities instead of refusing to start. That is wrong in
-> both directions: it bakes one deployment's identifiers into the source, and it
-> lets a misconfigured deployment look healthy. It should fail fast when unset.
+Startup fails if any required variable is empty.
 
 Optional/defaulted:
 
@@ -34,7 +29,9 @@ Optional/defaulted:
 | `ASMDB_STORAGE_ACCOUNT` | unset | enables blob metadata store in container `instances` |
 | `ASMDB_PUBLIC_BASE` | internal app FQDN | public data-plane base, e.g. `https://www.asmdb.cloud/db` |
 | `ASMDB_ENV_STORAGE` | `asmdb-data` | Container Apps environment storage mount name |
-| `ASMDB_PLATFORM_SECRET` | unset | derives per-instance `/v1/stats` platform tokens; stats degrade if missing |
+| `ASMDB_PLATFORM_SECRET` | unset | derives per-instance `/v1/stats` and `/v1/prepare-upgrade` platform tokens; stats, upgrades, and token rotation degrade or fail if missing |
+| `ASMDB_SITE_DIR` | `/app/site` | static site directory |
+| `ASMDB_BACKUP_TIMEOUT` | `30m` | positive Go duration for pre-upgrade backup |
 
 Management routes fail closed unless a verified Entra access token has the
 `ASMDB_ADMIN` group claim. The instance token is separate and is used only for
@@ -94,16 +91,18 @@ stores only its SHA-256 hash, records the full `ASMDB_IMAGE` reference and
 engine version tag, then creates Container App `db-<id suffix>` in the
 configured resource group/environment. The child app receives:
 
-**Only at creation.** A *rotation* stores the prepared token in clear in the
-instance record, keeps it after the rotation commits, and returns it in the
-`operation` field of every response carrying the database object. See the known
-gap in [`docs/SECURITY.md`](../../docs/SECURITY.md).
-
 - `ASMDB_TOKEN`
 - `ASMDB_PLATFORM_TOKEN`
 - `ASMDB_NAME=main`
 - `ASMDB_DATA=/data`
 - `PORT=8080`
+- `ASMDB_CAPACITY=small|medium|large`
+
+Token rotation is two-phase. `POST /rotate-token` stores an encrypted
+short-lived pending token and returns the plaintext token once. Repeating the
+prepare call while it is still pending returns the same token. `POST
+/rotate-token/commit` applies it asynchronously, returns the token again for
+recovery, and purges the encrypted pending token when the operation is done.
 
 Ingress is internal on target port 8080. Customer data-plane traffic enters
 through APIM at `https://www.asmdb.cloud/db/<24-char-suffix>/...`; the control
@@ -122,11 +121,11 @@ rather than forwarding HTML. Stats and list views do not wake instances;
 
 Instance app updates are stop-then-start rather than rolling because the engine
 holds an exclusive lock and `maxReplicas` is 1. Token rotation is two-phase:
-`POST /rotate-token` prepares and returns a recoverable `pendingToken` without
-touching the app, then `POST /rotate-token/commit` applies it asynchronously.
-This means a client timeout cannot leave the customer with an unknown working
-token. Upgrade also waits for the replacement revision to become healthy; on
-failure the previous app spec is restored.
+`POST /rotate-token` prepares and returns a recoverable token without touching
+the app, then `POST /rotate-token/commit` applies it asynchronously. This means
+a client timeout cannot leave the customer with an unknown working token.
+Upgrade also waits for the replacement revision to become healthy; on failure
+the previous app spec is restored.
 
 Upgrade preparation calls the sidecar's narrow `POST /v1/prepare-upgrade` route
 with the per-instance platform token. That route must not accept caller-supplied

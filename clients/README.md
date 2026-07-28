@@ -1,7 +1,7 @@
 # Connecting to asmdb from your application
 
-Current engine: **1.7.0**, storage format **2**. The binaries are 43,749 bytes
-(PE64) and 52,221 bytes (ELF64), and downloads are published at
+Current engine: **1.7.0**, storage format **2**. The binaries are 43,741 bytes
+(PE64) and 52,205 bytes (ELF64), and downloads are published at
 <https://www.asmdb.cloud/downloads/> with SHA-256 hashes in the manifest.
 
 **asmdb is not a server and there is no driver / client library.** It is a
@@ -50,7 +50,8 @@ Keep `id` and `value` as decimal strings in any JSON or network protocol. A
 limited to 39 usable UTF-8 bytes, content to 175 usable UTF-8 bytes, and the
 engine refuses over-long values rather than truncating them. The fixed record
 size is 256 bytes. Local databases default to the large table: 4,194,304 slots,
-with 3,145,728 usable rows under the engine's 0.75 load-factor cap.
+with 3,145,728 usable rows — the service's published ceiling, three quarters of
+the 4,194,304 slot table. The engine itself applies no load-factor cap.
 
 There is also a hosted option: cloud instances expose REST at
 `https://www.asmdb.cloud/db/<instance>/v1/rows` and MCP at

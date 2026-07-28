@@ -123,30 +123,36 @@ use the instance access token. It is an opaque bearer string issued at creation,
 returned with the endpoint once, and stored by the control plane only as a hash.
 Comparisons are constant time.
 
-> **Known gap — plaintext token during and after rotation.** Rotation is
-> deliberately two-phase so a client that times out does not lose the only copy
-> of a token that was in fact issued; that failure locked a user out of their own
-> database once, which is why the two-phase design exists. The prepared token is
-> therefore written **in clear** to the instance record in blob metadata, it is
-> **kept after the rotation commits**, and it is serialised in the `operation`
-> field of every response that returns the database object — including
-> `GET /api/v1/databases`. So the guarantee stated above does not hold from the
-> moment a rotation is prepared. Anyone who can read the metadata container, or
-> who can list databases, can read that token. This is tracked as a release
-> blocker: the fix is to purge it on commit, encrypt it at rest with a short
-> time to live while it is pending, and never serialise it in list or get
-> responses. Until then, treat a rotated token as exposed to any administrator
-> and to anyone with access to the metadata store.
+Rotation is deliberately two-phase so a client that times out does not lose the
+only copy of a token that was in fact issued. Preparing a rotation returns the
+new token in the direct response and stores only an encrypted, short-lived copy
+in metadata. The encrypted value is sealed with AES-GCM using a key derived from
+`ASMDB_PLATFORM_SECRET` and the database id as associated data; it expires after
+15 minutes if not committed. `GET /api/v1/databases` and other database-object
+responses use a separate operation response type that omits both plaintext and
+encrypted pending-token fields; `token_leak_test.go` exists to keep that true.
+On commit, the control plane decrypts the pending token, applies it, stores the
+new hash, and replaces the operation with a `done` record that carries no token
+material. The code paths are `handleRotateTokenPrepare`,
+`handleRotateTokenCommit`, `runRotateToken`, `expireStaleOperation` and
+`operationForResponse` in `saas/controlplane/api.go`, with encryption in
+`saas/controlplane/token_crypto.go`.
 
-Tokens are not retrievable after creation. Rotation is available at
-`POST /api/v1/databases/{id}/rotate-token` and is authenticated with Entra, not
-with the instance token; that is intentional, because rotation is needed when
-the instance token is lost. Rotation stops the instance, applies the new token,
-starts it again and confirms health. The new token arrives as an environment
-variable, which creates a new Container Apps revision. A rolling update cannot
-work with the engine's exclusive lock, so the old process must exit before the
-replacement can open the database; if the replacement does not become healthy,
-the control plane rolls back to the previous token and revision.
+The remaining exposure is narrower: while a rotation is pending, an authorised
+administrator who can call the rotation endpoint can recover the same prepared
+token until it is committed or expires, and anyone who has both metadata access
+and `ASMDB_PLATFORM_SECRET` can decrypt the pending value. Metadata access alone
+or database-list access alone should not reveal the token.
+
+Rotation is available at `POST /api/v1/databases/{id}/rotate-token` and is
+authenticated with Entra, not with the instance token; that is intentional,
+because rotation is needed when the instance token is lost. Rotation stops the
+instance, applies the new token, starts it again and confirms health. The new
+token arrives as an environment variable, which creates a new Container Apps
+revision. A rolling update cannot work with the engine's exclusive lock, so the
+old process must exit before the replacement can open the database; if the
+replacement does not become healthy, the control plane rolls back to the previous
+token and revision.
 
 ## Hosted durability and isolation
 

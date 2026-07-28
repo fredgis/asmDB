@@ -28,6 +28,8 @@ Hosted instances are reached through the control-plane prefix
 | `ASMDB_NAME` | `main` | Database base name. |
 | `ASMDB_TOKEN` | required | instance bearer token; startup fails if empty. |
 | `ASMDB_PLATFORM_TOKEN` | unset | optional platform token for `/v1/stats` and the narrow `/v1/prepare-upgrade` backup hook. |
+| `ASMDB_START_TIMEOUT` | `5m` | optional Go duration for engine startup and recovery on slow storage. |
+| `ASMDB_CAPACITY` | engine default | passed through to the engine when it creates a new database; supported values are `small`, `medium`, and `large`. |
 | `PORT` | `8080` | HTTP listen port. |
 
 ## Routes
