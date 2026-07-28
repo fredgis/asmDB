@@ -5,7 +5,7 @@ Builds and packages the asmDB Analytical Capabilities Fabric workload into one u
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.0.1",
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path,
     [string]$FrontendApiUrl = "https://REPLACE-ME-backend.example.com",
     [switch]$AllowPlaceholders
