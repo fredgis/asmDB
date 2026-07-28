@@ -640,6 +640,33 @@ paid for once:
 - No status conveyed by colour alone.
 - Every published number is real or explicitly absent — never a plausible placeholder.
 
+#### What a link's state means
+
+The three words on a link are derived from what Fabric reports, and are recomputed
+whenever run history is read. They were once written at creation and never revisited,
+which made every link read `Planned` for ever and made the word meaningless.
+
+| State | When |
+|---|---|
+| **Warning** | The notebook could not be created, or the most recent run failed |
+| **Active** | A run is in progress, or a schedule is enabled, or the last run succeeded |
+| **Planned** | The link is saved but nothing runs it yet |
+
+Warning takes precedence over Active: a scheduled link whose last run failed is a
+Warning, because the schedule existing is not evidence that the sync works.
+
+Each state carries the sentence that justifies it. A Warning quotes Fabric's own
+`failureReason` rather than asking the reader to go and find it.
+
+#### Where run history comes from
+
+`GET /v1/workspaces/{ws}/items/{nb}/jobs/instances`, for every link that has a notebook.
+
+This matters more than it sounds. An earlier version kept only what the current browser
+session had started, so a scheduled run that failed overnight left Monitoring empty and
+every link still reading `Planned` — the workload showed nothing wrong while the sync
+was not working at all.
+
 ### Phase 5 — operations *(Partly built)*
 
 **Workstream G.** Scope: `docs/`, `workload/docs/`.
@@ -698,6 +725,7 @@ does the Entra registration by hand. Where they differ, SkyNav is the better mod
 | A **verified custom domain** resolving to the Static Web App | The manifest's `ServiceEndpoint/Url` must resolve **at upload time**, or the upload is rejected |
 | Fabric **tenant admin** | Only an admin can upload a workload and enable it |
 | Entra privileges to register an app and **grant admin consent** | Consent is not something a normal user can give |
+| A Fabric **managed private endpoint** to the Container Apps environment, approved | The gateway is internal and has no public DNS; without this the sync notebooks fail on name resolution, reported only as a cancelled Spark session |
 
 ### 7.2 The order, and why it is not negotiable
 

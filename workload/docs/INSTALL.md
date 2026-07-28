@@ -411,6 +411,65 @@ Expect `{"status":"ok"}` and `HTTP=200`. Resolving the hostname to a `10.20.*` a
 
 **A note on the token.** It is set as an application setting rather than a Key Vault reference. The vault has public network access disabled by tenant policy and is reachable only through the Fabric managed private endpoint, so App Service cannot read it. A Key Vault reference would fail at startup. This is a deliberate trade-off, not an oversight: revisit it if a private endpoint for App Service is added to the vault.
 
+### 4.2 Letting the Spark notebooks reach the gateway, which is a different path entirely
+
+§4.1 solves the **backend's** route to the gateway. It does nothing for the notebooks, and the distinction is easy to miss because both are "our code calling the gateway".
+
+The backend is an App Service we own, sitting in a subnet we created, so outbound VNet integration is available to it. A Fabric notebook is not ours: it runs on Spark inside Microsoft's own managed network, in a different region from the gateway. It cannot be placed in `asmdb-vnet`, and no setting on the notebook will change that.
+
+Left alone, the sync notebook fails on its first HTTP call with a DNS error, and Fabric reports it as:
+
+```
+System cancelled the Spark session due to statement execution failures
+Code: System_Cancelled_Session_Statements_Failed
+```
+
+That message names the symptom and not the cause, which is why this section exists. The gateway's hostname has no public DNS record at all — the environment is internal, with a `10.20.*` address — so from outside the VNet the failure is *name resolution*, not a refused connection.
+
+**The mechanism is a Fabric managed private endpoint**, the same one already used for Key Vault. Fabric creates a private endpoint inside its own managed VNet, pointed at our resource; we approve it on the resource; Fabric then resolves the private DNS name for every Spark session in the workspace.
+
+The Container Apps environment supports this because it is a workload-profiles environment. Confirm the target before creating anything:
+
+```powershell
+az network private-link-resource list --id "<managedEnvironmentId>" -o json
+# groupId must be managedEnvironments
+# requiredZoneNames: privatelink.<region>.azurecontainerapps.io
+```
+
+Create it against the **environment**, not the container app — a private endpoint on Container Apps targets the environment, and every app in it becomes reachable:
+
+```powershell
+$tok = az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv
+$body = @{
+  name                        = "asmdbCdcGateway"
+  targetPrivateLinkResourceId = "<managedEnvironmentId>"
+  targetSubresourceType       = "managedEnvironments"
+  requestMessage              = "asmDB sync notebooks need the CDC gateway"
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -ContentType "application/json" -Body $body `
+  -Uri "https://api.fabric.microsoft.com/v1/workspaces/<workspaceId>/managedPrivateEndpoints" `
+  -Headers @{ Authorization = "******" }
+```
+
+Then approve it on the Azure side. The connection appears a minute or two after the call returns, and an approval attempted before it exists fails with `PrivateEndpointConnectionLockConflict` — retry rather than treating that as an error:
+
+```powershell
+az network private-endpoint-connection list --id "<managedEnvironmentId>" -o table
+az network private-endpoint-connection approve --id "<connectionId>" --description "Approved for asmDB sync notebooks"
+```
+
+**Both sides must agree before it works, and they do not agree immediately.** Azure reports the connection `Pending` for a while after a successful approval, and Fabric reports `provisioningState: Provisioning` for longer still. Check the Fabric side, which is the one Spark actually consults:
+
+```powershell
+Invoke-RestMethod -Uri "https://api.fabric.microsoft.com/v1/workspaces/<workspaceId>/managedPrivateEndpoints" `
+  -Headers @{ Authorization = "******" }
+# wait for provisioningState = Succeeded and connectionState.status = Approved
+```
+
+Sessions started before it reaches `Succeeded` keep the old, failing DNS view. Start a fresh session rather than re-running an existing one.
+
+**Two consequences worth knowing in advance.** Spark sessions in a workspace with managed private endpoints take noticeably longer to start, because the session is placed in the managed VNet. And the endpoint is per workspace: a second workspace syncing from the same gateway needs its own, approved separately.
+
 ## 5. Enable the workload once in Fabric
 
 What to do after the first package is uploaded:
@@ -501,6 +560,33 @@ A Fabric notebook's security context depends entirely on how it was triggered:
 Scheduling the notebook directly is the obvious thing to do, and it works — in testing, under your own account. It runs under a **named human identity**, so it keeps working right up until that person's access changes or they leave, at which point the sync stops with a Key Vault permission error that points at nothing.
 
 So the supported production path is a **Data Factory pipeline** containing a **Notebook activity** with **Workspace Identity** selected as the authentication method. Schedule the *pipeline*. Do not schedule the notebook for unattended production. The workload UI exposes Fabric native notebook scheduling as a convenience and states this trade-off beside the control; use it only when a named-human identity is acceptable.
+
+### 7.0 What the workload's own scheduler does, and the contract it obeys
+
+The Notebooks tab schedules the notebook itself, for the convenience case above. It does **not** use the workload SDK's `itemSchedule` client, and that distinction cost a working day to find.
+
+`workloadClient.itemSchedule.*` is for the custom item types a workload declares in its own manifest. A Notebook is a first-party Fabric item, and its schedules live in the Fabric REST API. The two contracts have no fields in common — `jobDefinitionObjectId` does not exist in REST, and there is no `Hourly` type at all. Calls through the SDK client fail in ways that do not name this as the reason.
+
+The workload therefore calls the REST API directly, with a token acquired for the Fabric audience:
+
+```
+POST   /v1/workspaces/{ws}/items/{nb}/jobs/RunNotebook/schedules      → 201, synchronous
+PATCH  /v1/workspaces/{ws}/items/{nb}/jobs/RunNotebook/schedules/{id}
+GET    /v1/workspaces/{ws}/items/{nb}/jobs/RunNotebook/schedules
+POST   /v1/workspaces/{ws}/items/{nb}/jobs/RunNotebook/instances      → 202, not 200
+GET    /v1/workspaces/{ws}/items/{nb}/jobs/instances                  → run history
+```
+
+Four details decide whether a schedule is accepted, and none of them is obvious from the schema:
+
+| Detail | What the API requires |
+|---|---|
+| `localTimeZoneId` | A **Windows** identifier — `Romance Standard Time`, not `Europe/Paris`. `UTC` is valid in both systems and is the safe fallback |
+| `startDateTime`, `endDateTime` | Required in practice, though the schema marks them optional |
+| Timestamp format | `YYYY-MM-DDTHH:mm:ss` with **no trailing `Z`**, despite the documentation showing one |
+| Hourly cadence | Expressed as `type: "Cron"` with `interval` in **minutes** — an hourly schedule is `interval: 60` |
+
+Run-on-demand returns **202 Accepted**. Treating only 200 as success makes every run report a failure it did not have.
 
 ### 7.1 Enable the tenant setting first
 

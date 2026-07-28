@@ -1,0 +1,28 @@
+Document the network path Spark needs, and the schedule contract
+
+Two things were missing from the install guide, and both cost real time
+to rediscover.
+
+The gateway section only ever covered the backend's route to it, through
+VNet integration. A Spark notebook cannot use that path: it runs in
+Microsoft's own managed network, in another region, and cannot be placed
+in our VNet. Without a Fabric managed private endpoint to the Container
+Apps environment, the sync notebook fails on name resolution and Fabric
+reports only "System cancelled the Spark session due to statement
+execution failures", which names the symptom and not the cause.
+
+The section now covers creating that endpoint, approving it, the
+PrivateEndpointConnectionLockConflict that a too-early approval returns,
+the lag between Azure reporting Approved and Fabric reporting Succeeded,
+and the fact that it is per workspace.
+
+The schedule contract is written down for the same reason: the workload
+SDK's itemSchedule client is for custom item types, not first-party
+notebooks, and the four details that decide whether the REST call is
+accepted are not obvious from the schema.
+
+WORKLOAD.md gains the rules behind Active, Planned and Warning, which
+until now were words with no definition behind them.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: ab8ae5e0-e62f-4539-823d-70570d7062e3
