@@ -27,7 +27,7 @@ export interface SyncLink {
   mode?: string;
   prefix: string;
   decoder: DecoderMode;
-  createNotebook: boolean;
+  createNotebook?: boolean;
   status: LinkState;
   lastRun?: string;
   nextRun?: string;

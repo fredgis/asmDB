@@ -240,10 +240,12 @@ dd { margin: 0; font-weight: 700; }
 .tabBar button { border: 0; border-radius: var(--asmdb-radius-sm); background: transparent; color: var(--colorNeutralForeground2); padding: 10px 14px; font-weight: 800; cursor: pointer; }
 .tabBar button.selected { background: var(--asmdb-accent-2); color: var(--asmdb-on-violet); }
 .notebooksGrid { display: grid; grid-template-columns: minmax(260px, .82fr) minmax(0, 1.8fr); gap: 14px; }
-.notebookListPanel, .notebookDetailPanel { display: grid; grid-template-rows: 64px minmax(0, 1fr); align-content: start; }
+.notebookListPanel, .notebookDetailPanel { display: grid; grid-template-rows: 64px auto; align-content: start; align-items: start; }
 .notebookListPanel > .panelHead, .notebookDetailPanel > .panelHead { min-height: 64px; align-items: start; }
-.notebookList, .notebookDetail { padding: 0 16px 16px; min-width: 0; display: grid; gap: 12px; }
+.notebookList, .notebookDetail { padding: 0 16px 16px; min-width: 0; display: grid; gap: 12px; align-self: start; }
+.notebookList { max-height: min(520px, calc(100vh - 310px)); overflow: auto; align-content: start; }
 .notebookItem { width: 100%; min-width: 0; padding: 12px; border: 1px solid var(--colorNeutralStroke2); border-radius: var(--asmdb-radius); background: var(--colorNeutralBackground2); color: var(--colorNeutralForeground1); display: grid; gap: 4px; text-align: left; cursor: pointer; }
+.notebookItem strong { font: 700 14px/1.25 var(--asmdb-font-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .notebookItem.selected { border-color: var(--asmdb-accent-2); background: color-mix(in oklch, var(--asmdb-accent-2) 12%, var(--colorNeutralBackground2)); }
 .notebookItem span, .notebookItem small { color: var(--colorNeutralForeground2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .generateList { display: grid; gap: 8px; }
@@ -254,7 +256,23 @@ dd { margin: 0; font-weight: 700; }
 .scheduleBox, .codePreview, .jobHistory { min-width: 0; padding: 14px; border: 1px solid var(--colorNeutralStroke2); border-radius: var(--asmdb-radius); background: var(--colorNeutralBackground2); }
 .scheduleBox h3, .codePreview h3, .jobHistory h3 { margin: 0 0 10px; }
 .scheduleNote { margin: 0 0 12px; color: var(--colorNeutralForeground2); line-height: 1.5; }
+.codePreview {
+  --asmdb-code-keyword: oklch(45% 0.18 292);
+  --asmdb-code-string: oklch(37% 0.12 205);
+  --asmdb-code-comment: var(--colorNeutralForeground3);
+  --asmdb-code-number: oklch(42% 0.12 85);
+}
+.fabricTheme-dark .codePreview {
+  --asmdb-code-keyword: var(--asmdb-accent-2);
+  --asmdb-code-string: var(--asmdb-accent);
+  --asmdb-code-comment: var(--colorNeutralForeground2);
+  --asmdb-code-number: var(--asmdb-warn);
+}
 .codePreview pre { max-height: 390px; background: var(--colorNeutralBackground1); border: 1px solid var(--colorNeutralStroke2); border-radius: var(--asmdb-radius); }
+.pyKeyword { color: var(--asmdb-code-keyword); font-weight: 600; }
+.pyString { color: var(--asmdb-code-string); }
+.pyComment { color: var(--asmdb-code-comment); font-style: italic; }
+.pyNumber { color: var(--asmdb-code-number); }
 .saveStatus { grid-column: 1 / -1; }
 .detailOverlay { position: fixed; inset: 0; z-index: 10; padding: 22px; display: grid; place-items: center; background: color-mix(in oklch, var(--asmdb-paper) 72%, transparent); }
 .detailPopup { width: min(720px, 100%); max-height: calc(100vh - 44px); overflow: auto; box-shadow: 0 30px 80px color-mix(in oklch, var(--asmdb-paper) 64%, transparent); }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { KeyboardEvent } from "react";
-import { Button, Checkbox, Dropdown, Input, Option, Textarea } from "@fluentui/react-components";
+import { Button, Dropdown, Input, Option, Textarea } from "@fluentui/react-components";
 import type { OptionOnSelectData, SelectionEvents } from "@fluentui/react-components";
 import type { ItemJobInstance, ItemSchedule } from "@ms-fabric/workload-client";
 import { useWorkloadClient } from "./context/WorkloadContext";
@@ -127,6 +127,20 @@ target_table = f"{table_prefix}{source_database_name.lower().replace('-', '_')}"
 `;
 }
 
+function highlightPython(code: string) {
+  const keywordPattern = /\b(from|import|as|if|else|elif|for|while|in|return|with|def|class|True|False|None)\b/g;
+  const tokenPattern = /(#.*$|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b\d+(?:\.\d+)?\b|\b(?:from|import|as|if|else|elif|for|while|in|return|with|def|class|True|False|None)\b)/gm;
+  return code.split(tokenPattern).filter(Boolean).map((part, index) => {
+    let className = "";
+    if (part.startsWith("#")) className = "pyComment";
+    else if (part.startsWith("\"") || part.startsWith("'")) className = "pyString";
+    else if (/^\d/.test(part)) className = "pyNumber";
+    else if (keywordPattern.test(part)) className = "pyKeyword";
+    keywordPattern.lastIndex = 0;
+    return className ? <span className={className} key={index}>{part}</span> : <span key={index}>{part}</span>;
+  });
+}
+
 function schedulePayload(notebookId: string, cadence: "Hourly" | "Daily", enabled: boolean, existing?: ItemSchedule): ItemSchedule {
   const weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map((key) => ({ key, selected: true }));
   return {
@@ -223,7 +237,6 @@ function App() {
   const [sourceId, setSourceId] = useState("");
   const [targetId, setTargetId] = useState("");
   const [prefix, setPrefix] = useState("");
-  const [createNotebook, setCreateNotebook] = useState(true);
   const [decoder, setDecoder] = useState<DecoderMode>("none");
   const [sample, setSample] = useState("");
   const [toast, setToast] = useState<string | null>(null);
@@ -232,7 +245,7 @@ function App() {
   const [previewText, setPreviewText] = useState("Select a premium asmDB database and request a CDC preview. No sample has been fetched yet.");
   const [previewRows, setPreviewRows] = useState<PreviewEntry[]>([]);
   const [saveState, setSaveState] = useState<RequestState>("not-configured");
-  const [saveMessage, setSaveMessage] = useState("Choose a source database and target lakehouse, then create a link.");
+  const [saveMessage, setSaveMessage] = useState("");
   const [deleteConfirmId, setDeleteConfirmId] = useState("");
   const [activeTab, setActiveTab] = useState<"links" | "notebooks" | "monitoring">("links");
   const [selectedNotebookId, setSelectedNotebookId] = useState("");
@@ -421,7 +434,6 @@ function App() {
       targetId: selectedTarget.id,
       prefix,
       decoder,
-      createNotebook,
       status: "Planned",
     };
     const nextLinks = [link, ...links.data];
@@ -429,13 +441,6 @@ function App() {
       const persistedLinks = await saveLinkState(workloadClient, nextLinks);
       setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
       setSelectedId(persistedLinks.find((saved) => saved.id === link.id)?.id ?? persistedLinks[0]?.id ?? "");
-      const savedLink = persistedLinks.find((saved) => saved.id === link.id) ?? link;
-      if (createNotebook) {
-        setSaveState("ready");
-        setSaveMessage(`Saved link. Generating notebook ${notebookNameFor(savedLink)}…`);
-        await generateNotebookFor(savedLink, persistedLinks);
-        return;
-      }
     } catch (error) {
       console.error("Create Link failed", error);
       const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "unknown";
@@ -525,7 +530,7 @@ function App() {
           decoder: resolvedLink.decoder,
         });
         const created: GeneratedNotebook = { ...notebook, createdAt: new Date().toISOString() };
-        const persistedLinks = await saveLinkState(workloadClient, resolved.links.map((candidate) => candidate.id === resolvedLink.id ? { ...candidate, notebook: created, createNotebook: true } : candidate));
+        const persistedLinks = await saveLinkState(workloadClient, resolved.links.map((candidate) => candidate.id === resolvedLink.id ? { ...candidate, notebook: created } : candidate));
         setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
         setSelectedNotebookId(created.notebookId);
         setActiveTab("notebooks");
@@ -649,7 +654,8 @@ function App() {
             <button type="button" role="tab" aria-selected={activeTab === "monitoring"} className={activeTab === "monitoring" ? "selected" : ""} onClick={() => setActiveTab("monitoring")}>Monitoring</button>
           </div>
 
-          {activeTab === "links" ? <section className="middleGrid">
+          {activeTab === "links" ? <>
+          <section className="middleGrid">
             <article className="panel" aria-labelledby="create-heading">
               <div className="panelHead"><h2 id="create-heading"><span aria-hidden="true">ↄ</span>Create Sync Link</h2></div>
               <form className="formGrid" onSubmit={(event) => event.preventDefault()}>
@@ -667,7 +673,6 @@ function App() {
 
                 <label htmlFor="prefix">Target Table Prefix</label>
                 <Input id="prefix" value={prefix} onChange={(_, data) => setPrefix(data.value)} placeholder="Optional prefix" />
-                <div className="checkboxRow"><Checkbox id="notebook" checked={createNotebook} onChange={(_, data) => setCreateNotebook(Boolean(data.checked))} label="Create Notebook" /><p className="fieldCaption inlineCaption">Generates a Fabric notebook after the link is saved, then stores the notebook id with the link.</p></div>
 
                 <section className="decoderBox" aria-labelledby="decoder-heading">
                   <div className="decoderTitle"><h3 id="decoder-heading">Content decoding</h3><div className="decoderActions"><Button size="small" type="button" onClick={onPreviewCdc} disabled={!selectedSource || previewState === "checking"}>{previewState === "checking" ? "Fetching…" : "Fetch CDC sample"}</Button><span className="surfaceBadge">{byteLength(sample)} / {CONTENT_LIMIT_BYTES} bytes</span></div></div>
@@ -697,9 +702,9 @@ function App() {
                 <LineageLegend />
               </div>
             </article>
-          </section> : activeTab === "notebooks" ? <NotebooksView notebooks={notebooks} selectedNotebookId={selectedNotebook?.notebookId ?? ""} onSelect={setSelectedNotebookId} onGenerate={generateNotebookFor} links={links.data} state={notebookState} message={notebookMessage} schedule={schedule} cadence={scheduleCadence} onCadence={setScheduleCadence} onSaveSchedule={saveSchedule} onRunNow={runNotebookNow} onOpen={openNotebook} history={jobHistory} /> : <MonitoringView links={links.data} activityRows={activityRows} activeLinks={activeLinks} plannedLinks={plannedLinks} warningLinks={warningLinks} successfulRuns={successfulRuns} failedRuns={failedRuns} onSelect={selectLink} />}
-
+          </section>
           <section className="panel cdcPanel" aria-labelledby="cdc-heading"><div className="panelHead"><h2 id="cdc-heading"><span aria-hidden="true">▤</span>CDC Preview</h2></div><div className="panelBody"><StateMessage state={previewState} text={previewText} />{previewRows.length ? <CdcPreview entries={previewRows} /> : null}</div></section>
+          </> : activeTab === "notebooks" ? <NotebooksView notebooks={notebooks} selectedNotebookId={selectedNotebook?.notebookId ?? ""} onSelect={setSelectedNotebookId} onGenerate={generateNotebookFor} links={links.data} state={notebookState} message={notebookMessage} schedule={schedule} cadence={scheduleCadence} onCadence={setScheduleCadence} onSaveSchedule={saveSchedule} onRunNow={runNotebookNow} onOpen={openNotebook} history={jobHistory} /> : <MonitoringView links={links.data} activityRows={activityRows} activeLinks={activeLinks} plannedLinks={plannedLinks} warningLinks={warningLinks} successfulRuns={successfulRuns} failedRuns={failedRuns} onSelect={selectLink} />}
 
           <footer className="footer"><span>{connection.updatedAt ? `✓ Data checked: ${formatTime(connection.updatedAt)}` : "○ Data not checked yet"}</span></footer>
         </section>
@@ -851,7 +856,7 @@ function NotebooksView({
           </div>
           <p className="fieldCaption inlineCaption">Current: {schedule?.scheduleEnabled ? `${schedule.scheduleType}; next run ${schedule.nextJobScheduleTime ?? schedule.nextJobScheduleTimeUtc ?? "not reported"}` : "disabled or not created yet"}.</p>
         </section>
-        <section className="codePreview" aria-labelledby="code-heading"><h3 id="code-heading">PySpark preview</h3><pre>{notebookCodeFor(selected.link)}</pre></section>
+        <section className="codePreview" aria-labelledby="code-heading"><h3 id="code-heading">PySpark preview</h3><pre>{highlightPython(notebookCodeFor(selected.link))}</pre></section>
         <section className="jobHistory" aria-labelledby="history-heading"><h3 id="history-heading">Recent runs</h3>{history.length ? <div className="tableWrap"><table><thead><tr><th>Status</th><th>Scheduled</th><th>Started</th><th>Ended</th></tr></thead><tbody>{history.slice(0, 5).map((job) => <tr key={job.itemJobInstanceId}><td>{job.statusString}</td><td>{job.jobScheduleTimeUtc || "—"}</td><td>{job.jobStartTimeUtc || "—"}</td><td>{job.jobEndTimeUtc || "—"}</td></tr>)}</tbody></table></div> : <p className="fieldCaption inlineCaption">No real job history returned yet.</p>}</section>
       </div> : <StateMessage state="not-configured" text="Generate a notebook from a saved link to preview code and configure scheduling." />}
     </article>
