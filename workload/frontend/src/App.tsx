@@ -5,7 +5,7 @@ import type { OptionOnSelectData, SelectionEvents } from "@fluentui/react-compon
 import { useWorkloadClient } from "./context/WorkloadContext";
 import { useThemePreference, type ThemePreference } from "./context/ThemePreferenceContext";
 import { createNotebook as createNotebookArtifact, DependencyError, fetchDatabases, fetchHealth, previewCdc } from "./lib/api";
-import { deleteNotebook, getFabricApiToken, listNotebookSchedules, runNotebookNow as runNotebookNowViaRest, saveNotebookSchedule, type FabricNotebookSchedule, type NotebookRunInstance, type ScheduleCadence, type ScheduleDraft } from "./lib/fabric-notebooks";
+import { deleteNotebook, getFabricApiToken, listNotebookRuns, listNotebookSchedules, runFailureText, runNotebookNow as runNotebookNowViaRest, runOutcome, saveNotebookSchedule, type FabricNotebookSchedule, type NotebookRunInstance, type ScheduleCadence, type ScheduleDraft } from "./lib/fabric-notebooks";
 import { fetchLakehouses, resolveWorkspaceId } from "./lib/fabric";
 import { getFabricToken } from "./lib/auth-helper";
 import { byteLength, CONTENT_LIMIT_BYTES, decodeSample } from "./lib/decoder";
@@ -83,6 +83,17 @@ function statusClass(status: LinkState | "Failed") {
   if (status === "Active") return "stateActive";
   if (status === "Planned") return "statePlanned";
   return "stateWarning";
+}
+
+function statusReason(link: SyncLink, runs: NotebookRunInstance[] | undefined, scheduleEnabled: boolean | undefined): { status: LinkState; reason: string } {
+  if (link.notebookStatus === "failed") return { status: "Warning", reason: link.notebookError ? `Notebook creation failed: ${link.notebookError}` : "Notebook creation failed." };
+  const latest = runs?.[0];
+  if (latest && runOutcome(latest) === "failed") return { status: "Warning", reason: runFailureText(latest) || "The most recent notebook run failed." };
+  if (!link.notebook) return { status: "Planned", reason: "No notebook has been created for this link yet." };
+  if (latest && runOutcome(latest) === "running") return { status: "Active", reason: "A notebook run is in progress." };
+  if (scheduleEnabled) return { status: "Active", reason: "The notebook is scheduled and its last run did not fail." };
+  if (latest && runOutcome(latest) === "succeeded") return { status: "Active", reason: "The most recent notebook run succeeded." };
+  return { status: "Planned", reason: "The notebook exists but nothing runs it: enable a schedule or run it once." };
 }
 
 function issueText(issue?: LoadIssue) {
@@ -336,6 +347,10 @@ function App() {
   const [notebookMessage, setNotebookMessage] = useState("Create a link to create its notebook automatically.");
   const [schedule, setSchedule] = useState<FabricNotebookSchedule | null>(null);
   const [jobHistory, setJobHistory] = useState<NotebookRunInstance[]>([]);
+  const [runsByLink, setRunsByLink] = useState<Record<string, NotebookRunInstance[]>>({});
+  const [scheduledLinks, setScheduledLinks] = useState<Record<string, boolean>>({});
+  const [runsState, setRunsState] = useState<RequestState>("not-configured");
+  const [runsMessage, setRunsMessage] = useState("Open Monitoring to read run history from Fabric.");
   const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft>(() => defaultScheduleDraft());
 
   const showToast = useCallback((message: string) => {
@@ -426,11 +441,20 @@ function App() {
     [notebooks, selectedNotebookId]
   );
   const lineage = useMemo(() => graphFromLinks(links.data), [links.data]);
-  const activeLinks = links.data.filter((link) => link.status === "Active").length;
-  const plannedLinks = links.data.filter((link) => link.status === "Planned").length;
-  const warningLinks = links.data.filter((link) => link.status === "Warning").length;
-  const successfulRuns = jobHistory.filter((job) => `${job.status ?? ""}`.toLowerCase().includes("success")).length;
-  const failedRuns = jobHistory.filter((job) => `${job.status ?? ""}`.toLowerCase().includes("fail")).length;
+  const linkStatus = useMemo(() => {
+    const map: Record<string, { status: LinkState; reason: string }> = {};
+    for (const link of links.data) {
+      map[link.id] = statusReason(link, runsByLink[link.id], scheduledLinks[link.id]);
+    }
+    return map;
+  }, [links.data, runsByLink, scheduledLinks]);
+  const statusOf = useCallback((link: SyncLink): LinkState => linkStatus[link.id]?.status ?? link.status, [linkStatus]);
+  const activeLinks = links.data.filter((link) => statusOf(link) === "Active").length;
+  const plannedLinks = links.data.filter((link) => statusOf(link) === "Planned").length;
+  const warningLinks = links.data.filter((link) => statusOf(link) === "Warning").length;
+  const allRuns = useMemo(() => Object.values(runsByLink).flat(), [runsByLink]);
+  const successfulRuns = allRuns.filter((run) => runOutcome(run) === "succeeded").length;
+  const failedRuns = allRuns.filter((run) => runOutcome(run) === "failed").length;
   const decoded = useMemo(() => {
     if (!sample) return { status: decoderOptions.find((item) => item.value === decoder)?.label ?? "None", preview: "No CDC sample fetched yet.", failed: false };
     try {
@@ -440,9 +464,16 @@ function App() {
     }
   }, [decoder, sample]);
 
-  const activityRows: RunRecord[] = jobHistory.length && selectedNotebook
-    ? jobHistory.slice(0, 5).map((job, index) => ({ id: job.id ?? `run-${index}`, source: selectedNotebook.link.source, target: selectedNotebook.link.target, status: `${job.status ?? ""}`.toLowerCase().includes("fail") ? "Failed" : "Active", lastRun: job.createdDateTime ?? new Date().toISOString(), lag: job.status ?? "Accepted" }))
-    : links.data.filter((link) => link.lastRun && link.lastRun !== "Never run").map((link) => ({ id: link.id, source: link.source, target: link.target, status: link.status, lastRun: link.lastRun, lag: link.lag }));
+  const activityRows: RunRecord[] = links.data.flatMap((link) =>
+    (runsByLink[link.id] ?? []).slice(0, 5).map((run, index) => ({
+      id: run.id ?? `${link.id}-run-${index}`,
+      source: link.source,
+      target: link.target,
+      status: runOutcome(run) === "failed" ? "Failed" as const : runOutcome(run) === "succeeded" ? "Active" as const : "Planned" as const,
+      lastRun: run.startTimeUtc ?? run.createdDateTime ?? "Unknown",
+      lag: runFailureText(run) || run.status || "Unknown",
+    }))
+  ).sort((a, b) => `${b.lastRun ?? ""}`.localeCompare(`${a.lastRun ?? ""}`));
   const canCreate = Boolean(selectedSource && selectedTarget && links.state !== "failed");
   const headerIssue = connection.state === "failed" ? connection.issue : databases.state === "failed" ? databases.issue : lakehouses.state === "failed" ? lakehouses.issue : links.state === "failed" ? links.issue : undefined;
   const headerChecking = connection.state === "checking" || databases.state === "checking" || lakehouses.state === "checking" || links.state === "checking";
@@ -453,6 +484,61 @@ function App() {
     setSelectedId(linkId);
     setDetailsOpen(true);
   }, []);
+
+  const loadRuns = useCallback(async () => {
+    const withNotebooks = links.data.filter((link) => link.notebook?.notebookId);
+    if (!withNotebooks.length) {
+      setRunsByLink({});
+      setScheduledLinks({});
+      setRunsState("no-data");
+      setRunsMessage("No notebook exists yet, so Fabric has no run history to report.");
+      return;
+    }
+    setRunsState("checking");
+    setRunsMessage("Reading run history from Fabric…");
+    try {
+      const token = await getFabricApiToken(workloadClient);
+      if (!token) throw new DependencyError({ dependency: "identity", code: "fabric_token_unavailable", message: "Could not acquire a Fabric API token to read run history." });
+      const workspaceId = await resolveWorkspaceId(workloadClient);
+      const runs: Record<string, NotebookRunInstance[]> = {};
+      const scheduled: Record<string, boolean> = {};
+      const failures: string[] = [];
+      for (const link of withNotebooks) {
+        const notebookId = link.notebook!.notebookId;
+        try {
+          const instances = await listNotebookRuns(token, workspaceId, notebookId);
+          runs[link.id] = [...instances].sort((a, b) => `${b.startTimeUtc ?? ""}`.localeCompare(`${a.startTimeUtc ?? ""}`));
+        } catch (error) {
+          failures.push(`${link.source} → ${link.target}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        try {
+          const schedules = await listNotebookSchedules(token, workspaceId, notebookId);
+          scheduled[link.id] = schedules.some((entry) => entry.enabled);
+        } catch {
+          scheduled[link.id] = link.notebookStatus === "scheduled";
+        }
+      }
+      setRunsByLink(runs);
+      setScheduledLinks(scheduled);
+      const total = Object.values(runs).reduce((count, list) => count + list.length, 0);
+      if (failures.length) {
+        setRunsState("failed");
+        setRunsMessage(`Fabric refused part of the run history. ${failures.join(" | ")}`);
+      } else {
+        setRunsState(total ? "ready" : "no-data");
+        setRunsMessage(total ? `Read ${total} run${total === 1 ? "" : "s"} from Fabric.` : "Fabric reports no runs for these notebooks yet.");
+      }
+    } catch (error) {
+      console.error("Could not read run history", error);
+      setRunsState("failed");
+      setRunsMessage(error instanceof Error ? error.message : String(error));
+    }
+  }, [links.data, workloadClient]);
+
+  useEffect(() => {
+    if (activeTab !== "monitoring") return;
+    void loadRuns();
+  }, [activeTab, loadRuns]);
 
   useEffect(() => {
     setSelectedNotebookId((current) => current && notebooks.some((notebook) => notebook.key === current) ? current : notebooks[0]?.key ?? "");
@@ -478,7 +564,9 @@ function App() {
         const notebookSchedule = schedules[0] ?? null;
         setSchedule(notebookSchedule);
         setScheduleDraft(draftFromSchedule(notebookSchedule));
-        setJobHistory([]);
+        const instances = await listNotebookRuns(token, workspaceId, selectedNotebookKey);
+        if (cancelled) return;
+        setJobHistory([...instances].sort((a, b) => `${b.startTimeUtc ?? ""}`.localeCompare(`${a.startTimeUtc ?? ""}`)));
       } catch (error) {
         if (cancelled) return;
         console.error("Could not read notebook schedules", error);
@@ -830,12 +918,12 @@ function App() {
             </article>
           </section>
           <section className="panel cdcPanel" aria-labelledby="cdc-heading"><div className="panelHead"><h2 id="cdc-heading"><span aria-hidden="true">▤</span>CDC Preview</h2></div><div className="panelBody"><StateMessage state={previewState} text={previewText} />{previewRows.length ? <CdcPreview entries={previewRows} /> : null}</div></section>
-          </> : activeTab === "notebooks" ? <NotebooksView notebooks={notebooks} selectedNotebookId={selectedNotebook?.key ?? ""} onSelect={setSelectedNotebookId} state={notebookState} message={notebookMessage} schedule={schedule} draft={scheduleDraft} onDraft={setScheduleDraft} onSaveSchedule={saveSchedule} onRunNow={runNotebookNow} onOpen={openNotebook} history={jobHistory} /> : <MonitoringView links={links.data} activityRows={activityRows} activeLinks={activeLinks} plannedLinks={plannedLinks} warningLinks={warningLinks} successfulRuns={successfulRuns} failedRuns={failedRuns} onSelect={selectLink} />}
+          </> : activeTab === "notebooks" ? <NotebooksView notebooks={notebooks} selectedNotebookId={selectedNotebook?.key ?? ""} onSelect={setSelectedNotebookId} state={notebookState} message={notebookMessage} schedule={schedule} draft={scheduleDraft} onDraft={setScheduleDraft} onSaveSchedule={saveSchedule} onRunNow={runNotebookNow} onOpen={openNotebook} history={jobHistory} /> : <MonitoringView links={links.data} activityRows={activityRows} activeLinks={activeLinks} plannedLinks={plannedLinks} warningLinks={warningLinks} successfulRuns={successfulRuns} failedRuns={failedRuns} onSelect={selectLink} linkStatus={linkStatus} runsState={runsState} runsMessage={runsMessage} onRefresh={() => { void loadRuns(); }} />}
 
           <footer className="footer"><span>{connection.updatedAt ? `✓ Data checked: ${formatTime(connection.updatedAt)}` : "○ Data not checked yet"}</span></footer>
         </section>
       </main>
-      {detailsOpen && selectedLink ? <div className="detailOverlay" role="dialog" aria-modal="true" aria-labelledby="detail-heading"><article className="panel detailPopup"><div className="panelHead"><h2 id="detail-heading"><span aria-hidden="true">ↄ</span>Selected Link Details</h2><Button type="button" onClick={() => setDetailsOpen(false)}>Close</Button></div><LinkSummary link={selectedLink} confirmDelete={deleteConfirmId === selectedLink.id} onAskDelete={() => setDeleteConfirmId(selectedLink.id)} onCancelDelete={() => setDeleteConfirmId("")} onDelete={() => void deleteLink(selectedLink.id)} /></article></div> : null}
+      {detailsOpen && selectedLink ? <div className="detailOverlay" role="dialog" aria-modal="true" aria-labelledby="detail-heading"><article className="panel detailPopup"><div className="panelHead"><h2 id="detail-heading"><span aria-hidden="true">ↄ</span>Selected Link Details</h2><Button type="button" onClick={() => setDetailsOpen(false)}>Close</Button></div><LinkSummary link={selectedLink} status={statusOf(selectedLink)} reason={linkStatus[selectedLink.id]?.reason ?? ""} confirmDelete={deleteConfirmId === selectedLink.id} onAskDelete={() => setDeleteConfirmId(selectedLink.id)} onCancelDelete={() => setDeleteConfirmId("")} onDelete={() => void deleteLink(selectedLink.id)} /></article></div> : null}
       <div className={`toast ${toast ? "show" : ""}`} role="status" aria-live="polite">{toast}</div>
     </div>
   );
@@ -874,37 +962,38 @@ function LineageLegend() {
   </div>;
 }
 
-function MonitoringView({ links, activityRows, activeLinks, plannedLinks, warningLinks, successfulRuns, failedRuns, onSelect }: { links: SyncLink[]; activityRows: RunRecord[]; activeLinks: number; plannedLinks: number; warningLinks: number; successfulRuns: number; failedRuns: number; onSelect: (id: string) => void }) {
+function MonitoringView({ links, activityRows, activeLinks, plannedLinks, warningLinks, successfulRuns, failedRuns, onSelect, linkStatus, runsState, runsMessage, onRefresh }: { links: SyncLink[]; activityRows: RunRecord[]; activeLinks: number; plannedLinks: number; warningLinks: number; successfulRuns: number; failedRuns: number; onSelect: (id: string) => void; linkStatus: Record<string, { status: LinkState; reason: string }>; runsState: RequestState; runsMessage: string; onRefresh: () => void }) {
   return <section className="monitoringGrid">
     <article className="panel monitoringHero">
-      <div className="panelHead"><h2><span aria-hidden="true">◴</span>Run monitoring</h2></div>
+      <div className="panelHead"><h2><span aria-hidden="true">◴</span>Run monitoring</h2><Button size="small" type="button" onClick={onRefresh}>Refresh</Button></div>
       <div className="monitorStats">
-        <div><strong>{activityRows.length || "—"}</strong><span>real run records</span></div>
+        <div><strong>{activityRows.length || "—"}</strong><span>runs read from Fabric</span></div>
         <div><strong>{successfulRuns || "—"}</strong><span>successful runs</span></div>
         <div><strong>{failedRuns || "—"}</strong><span>failed runs</span></div>
         <div><strong>{links.length || "—"}</strong><span>saved links</span></div>
       </div>
+      <StateMessage state={runsState} text={runsMessage} />
     </article>
     <article className="panel">
       <div className="panelHead"><h2><span aria-hidden="true">▤</span>Recent Sync Activity</h2></div>
-      {activityRows.length ? <div className="activityList">{activityRows.map((row) => <button type="button" className="activityItem" key={row.id} onClick={() => { const link = links.find((candidate) => candidate.source === row.source && candidate.target === row.target); if (link) onSelect(link.id); }}><span>{row.source} → {row.target}</span><span className={`compactStatus ${statusClass(row.status)}`}>{statusIcon(row.status)} {row.status}</span><small>{row.lastRun ?? "Unknown"} · {row.lag ?? "Unknown"}</small></button>)}</div> : <div className="quietPanel"><span className="surfaceBadge">No runs yet</span><p>Run history appears here after generated notebooks run on demand or on schedule.</p></div>}
+      {activityRows.length ? <div className="activityList">{activityRows.map((row) => <button type="button" className="activityItem" key={row.id} onClick={() => { const link = links.find((candidate) => candidate.source === row.source && candidate.target === row.target); if (link) onSelect(link.id); }}><span>{row.source} → {row.target}</span><span className={`compactStatus ${statusClass(row.status)}`}>{statusIcon(row.status)} {row.status}</span><small>{row.lastRun ?? "Unknown"} · {row.lag ?? "Unknown"}</small></button>)}</div> : <div className="quietPanel"><span className="surfaceBadge">No runs yet</span><p>Fabric returned no run instances for the generated notebooks. Runs appear here once a notebook has run on demand or on schedule.</p></div>}
     </article>
     <article className="panel">
-      <div className="panelHead"><h2><span aria-hidden="true">◇</span>Coverage & Readiness</h2></div>
-      <div className="readinessSummary"><p>{links.length ? `${links.length} saved ${links.length === 1 ? "link" : "links"}: ${activeLinks} active, ${plannedLinks} planned, ${warningLinks} warning.` : "No coverage to report until a link is saved."}</p><div className="readinessBar" aria-hidden="true"><span className="barActive" style={{ flexGrow: activeLinks }} /><span className="barPlanned" style={{ flexGrow: plannedLinks }} /><span className="barWarning" style={{ flexGrow: warningLinks }} /></div><div className="linkHealthList">{links.map((link) => <button type="button" key={link.id} onClick={() => onSelect(link.id)}><span>{link.source} → {link.target}</span><span className={`compactStatus ${statusClass(link.status)}`}>{statusIcon(link.status)} {link.status}</span></button>)}</div></div>
+      <div className="panelHead"><h2><span aria-hidden="true">◇</span>Coverage &amp; Readiness</h2></div>
+      <div className="readinessSummary"><p>{links.length ? `${links.length} saved ${links.length === 1 ? "link" : "links"}: ${activeLinks} active, ${plannedLinks} planned, ${warningLinks} warning.` : "No coverage to report until a link is saved."}</p><div className="readinessBar" aria-hidden="true"><span className="barActive" style={{ flexGrow: activeLinks }} /><span className="barPlanned" style={{ flexGrow: plannedLinks }} /><span className="barWarning" style={{ flexGrow: warningLinks }} /></div><div className="linkHealthList">{links.map((link) => { const computed = linkStatus[link.id]; const status = computed?.status ?? link.status; return <button type="button" key={link.id} onClick={() => onSelect(link.id)}><span>{link.source} → {link.target}</span><span className={`compactStatus ${statusClass(status)}`}>{statusIcon(status)} {status}</span><small>{computed?.reason ?? ""}</small></button>; })}</div></div>
     </article>
   </section>;
 }
 
-function LinkSummary({ link, confirmDelete, onAskDelete, onCancelDelete, onDelete }: { link: SyncLink; confirmDelete: boolean; onAskDelete: () => void; onCancelDelete: () => void; onDelete: () => void }) {
+function LinkSummary({ link, status, reason, confirmDelete, onAskDelete, onCancelDelete, onDelete }: { link: SyncLink; status: LinkState; reason: string; confirmDelete: boolean; onAskDelete: () => void; onCancelDelete: () => void; onDelete: () => void }) {
   return <div className="linkSummary">
     <div className="linkPair">
       <span className="linkEndpoint sourceEndpoint">▤ {link.source}</span>
       <span className="linkArrow">→</span>
       <span className="linkEndpoint targetEndpoint">⌂ {link.target}</span>
     </div>
-    <span className={`compactStatus ${statusClass(link.status)}`}>{statusIcon(link.status)} {link.status}</span>
-    <p>{link.status === "Planned" ? "This link is configured and waiting for its first real run." : "This link is selected in the lineage graph."}</p>
+    <span className={`compactStatus ${statusClass(status)}`}>{statusIcon(status)} {status}</span>
+    <p>{reason}</p>
     <details className="linkMore">
       <summary>Show technical details</summary>
       <dl>
@@ -1010,7 +1099,7 @@ function NotebooksView({
           <p className="fieldCaption inlineCaption">Current: {schedule?.enabled ? `enabled; next run ${nextRunText(schedule)}` : "disabled or not created yet"}.</p>
         </section> : null}
         {selectedNotebook ? <section className="codePreview" aria-labelledby="code-heading"><h3 id="code-heading">PySpark preview</h3><pre>{highlightPython(notebookCodeFor(selected.link))}</pre></section> : null}
-        {selectedNotebook ? <section className="jobHistory" aria-labelledby="history-heading"><h3 id="history-heading">Recent runs</h3>{history.length ? <div className="tableWrap"><table><thead><tr><th>Status</th><th>Accepted</th><th>Instance</th></tr></thead><tbody>{history.slice(0, 5).map((job, index) => <tr key={job.id ?? index}><td>{job.status ?? "Accepted"}</td><td>{job.createdDateTime || "just now"}</td><td>{job.id || "not returned"}</td></tr>)}</tbody></table></div> : <p className="fieldCaption inlineCaption">No run started from this session yet.</p>}</section> : null}
+        {selectedNotebook ? <section className="jobHistory" aria-labelledby="history-heading"><h3 id="history-heading">Recent runs</h3>{history.length ? <div className="tableWrap"><table><thead><tr><th>Status</th><th>Started</th><th>Detail</th></tr></thead><tbody>{history.slice(0, 5).map((job, index) => <tr key={job.id ?? index}><td><span className={`compactStatus ${statusClass(runOutcome(job) === "failed" ? "Failed" : runOutcome(job) === "succeeded" ? "Active" : "Planned")}`}>{job.status ?? "Unknown"}</span></td><td>{job.startTimeUtc ?? job.createdDateTime ?? "Unknown"}</td><td>{runFailureText(job) || job.invokeType || "—"}</td></tr>)}</tbody></table></div> : <p className="fieldCaption inlineCaption">Fabric reports no runs for this notebook yet.</p>}</section> : null}
       </div> : <StateMessage state="not-configured" text="No notebook has been created yet. Create a sync link to create one automatically." />}
     </article>
   </section>;

@@ -38,6 +38,12 @@ export interface NotebookRunInstance {
   id?: string;
   status?: string;
   createdDateTime?: string;
+  itemId?: string;
+  jobType?: string;
+  invokeType?: string;
+  startTimeUtc?: string;
+  endTimeUtc?: string;
+  failureReason?: { errorCode?: string; message?: string } | null;
 }
 
 export interface ScheduleDraft {
@@ -173,5 +179,28 @@ export async function saveNotebookSchedule(token: string, workspaceId: string, n
 
 export async function runNotebookNow(token: string, workspaceId: string, notebookId: string): Promise<NotebookRunInstance> {
   return fabricFetch<NotebookRunInstance>(token, fabricUrl(workspaceId, notebookId, "/instances"), { method: "POST" }, [202]);
+}
+
+export async function listNotebookRuns(token: string, workspaceId: string, notebookId: string): Promise<NotebookRunInstance[]> {
+  const url = `${itemUrl(workspaceId, notebookId)}/jobs/instances`;
+  const payload = await fabricFetch<unknown>(token, url);
+  if (!payload || typeof payload !== "object") return [];
+  const value = (payload as Record<string, unknown>).value;
+  return Array.isArray(value) ? value as NotebookRunInstance[] : [];
+}
+
+export function runOutcome(run: NotebookRunInstance): "succeeded" | "failed" | "running" | "unknown" {
+  const status = `${run.status ?? ""}`.toLowerCase();
+  if (status === "completed") return "succeeded";
+  if (status === "failed" || status === "cancelled") return "failed";
+  if (status === "inprogress" || status === "notstarted") return "running";
+  return "unknown";
+}
+
+export function runFailureText(run: NotebookRunInstance): string {
+  const reason = run.failureReason;
+  if (!reason) return "";
+  const code = reason.errorCode ? `[${reason.errorCode}] ` : "";
+  return `${code}${reason.message ?? ""}`.trim();
 }
 
