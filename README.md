@@ -133,6 +133,21 @@ does not carry a client secret. The full design is in
 [`docs/SAAS.md`](docs/SAAS.md), and the engine/platform threat model is in
 [`docs/SECURITY.md`](docs/SECURITY.md).
 
+The console keeps one database selected at a time, so every command is explicit
+about what it will touch. Rows and live stats come from the instance itself
+rather than from a cache:
+
+<p align="center">
+  <img src="docs/assets/asmdb-cloud-console.png" alt="The asmdb Cloud console on the Database view tab: the selected premium database with its instance id, a preview of table rows read from /v1/rows, and live stats showing row count against capacity, CPU, and memory split between actual and reserved" width="90%">
+</p>
+
+The CLI tab runs the same commands the local binary accepts, against the hosted
+instance and authenticated with the instance token rather than the Entra one:
+
+<p align="center">
+  <img src="docs/assets/asmdb-cloud-cli.png" alt="The asmdb Cloud CLI tab: the asmdb banner rendered in ASCII, a prompt accepting HELP, COUNT, SELECT and INSERT, and shortcut buttons for common commands" width="90%">
+</p>
+
 ## asmDB Analytical Capabilities — a Fabric workload
 
 asmdb is a transactional engine and deliberately not an analytical one: one fixed
