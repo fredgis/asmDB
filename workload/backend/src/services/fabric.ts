@@ -51,8 +51,6 @@ export interface Lakehouse {
   workspaceId: string;
 }
 
-export type SyncMode = "cdc_incremental" | "full_reload";
-
 export interface CreateNotebookRequest {
   workspaceId: string;
   displayName: string;
@@ -62,7 +60,6 @@ export interface CreateNotebookRequest {
   lakehouseName: string;
   tablePrefix?: string;
   decoder?: "None" | "Hex" | "Base64" | "JSON" | "CSV" | "MessagePack";
-  syncMode: SyncMode;
 }
 
 export interface CreatedNotebook {
@@ -232,14 +229,6 @@ export class FabricService {
   }
 
   async createNotebook(userToken: string, request: CreateNotebookRequest): Promise<CreatedNotebook> {
-    if (request.syncMode === "full_reload") {
-      throw new HttpError(
-        400,
-        "bad_request",
-        "full_reload is not supported by the current sync notebook template; it only implements incremental sync and raises for reseed."
-      );
-    }
-
     const accessToken = await this.broker.exchange(userToken, FABRIC_SCOPE);
     await this.ensureLakehouseExists(accessToken, request.workspaceId, request.lakehouseId);
     const url = `${this.config.fabricApi.replace(/\/+$/, "")}/v1/workspaces/${encodeURIComponent(

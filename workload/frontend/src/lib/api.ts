@@ -1,5 +1,5 @@
 import { authHeaders, invalidateFabricToken } from "./auth-helper";
-import type { DatabaseInfo, LoadIssue } from "@/types/workload";
+import type { DatabaseInfo, DecoderMode, GeneratedNotebook, LoadIssue } from "@/types/workload";
 
 export const API_BASE = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? "" : "https://asmdb-analytical-backend.azurewebsites.net");
 
@@ -68,4 +68,30 @@ export async function previewCdc(token: string, instanceId: string): Promise<unk
   }
   if (!response.ok) throw new DependencyError(await parseFailure(response, "CDC preview failed."));
   return response.json();
+}
+
+export interface CreateNotebookRequest {
+  workspaceId: string;
+  displayName: string;
+  sourceDatabaseId: string;
+  sourceDatabaseName: string;
+  lakehouseId: string;
+  lakehouseName: string;
+  tablePrefix?: string;
+  decoder?: DecoderMode;
+}
+
+export async function createNotebook(token: string, body: CreateNotebookRequest): Promise<Omit<GeneratedNotebook, "createdAt">> {
+  let response: Response;
+  try {
+    response = await fetch(url("/api/notebooks"), {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    throw new DependencyError({ dependency: "backend", message: `Notebook request could not reach the backend: ${error instanceof Error ? error.message : String(error)}` });
+  }
+  if (!response.ok) throw new DependencyError(await parseFailure(response, "Notebook generation failed."));
+  return response.json() as Promise<Omit<GeneratedNotebook, "createdAt">>;
 }

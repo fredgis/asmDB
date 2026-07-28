@@ -580,7 +580,6 @@ describe("asmDB workload API", () => {
     lakehouseName: "Lakehouse",
     tablePrefix: "asmdb_",
     decoder: "JSON",
-    syncMode: "cdc_incremental",
   } as const;
 
   async function postNotebook(app: ReturnType<typeof createApp>) {
@@ -590,6 +589,73 @@ describe("asmDB workload API", () => {
       .set("authorization", `Bearer ${token}`)
       .send(notebookBody);
   }
+
+  it("names missing notebook fields in 400 validation details", async () => {
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+    const { sourceDatabaseId: _sourceDatabaseId, ...bodyWithoutSourceId } = notebookBody;
+
+    const res = await request(app)
+      .post("/api/notebooks")
+      .set("authorization", `Bearer ${token}`)
+      .send(bodyWithoutSourceId);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatchObject({
+      code: "bad_request",
+      message: "Invalid notebook request body",
+      validationErrors: expect.arrayContaining([
+        expect.objectContaining({
+          path: "sourceDatabaseId",
+          message: expect.any(String),
+        }),
+      ]),
+    });
+    expect(JSON.stringify(res.body.error)).not.toContain("db_premium");
+    expect(state.fabricRequests).toHaveLength(0);
+  });
+
+  it("names malformed notebook fields in 400 validation details", async () => {
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .post("/api/notebooks")
+      .set("authorization", `Bearer ${token}`)
+      .send({ ...notebookBody, lakehouseId: "not-a-guid" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.validationErrors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "lakehouseId",
+          message: expect.stringMatching(/uuid|guid/i),
+        }),
+      ])
+    );
+    expect(JSON.stringify(res.body.error)).not.toContain("not-a-guid");
+    expect(state.fabricRequests).toHaveLength(0);
+  });
+
+  it("treats empty optional notebook fields as absent", async () => {
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .post("/api/notebooks")
+      .set("authorization", `Bearer ${token}`)
+      .send({ ...notebookBody, tablePrefix: "", decoder: "" });
+
+    expect(res.status).toBe(201);
+    const fabricRequest = state.fabricRequests[0] as {
+      definition: { parts: Array<{ path: string; payload: string }> };
+    };
+    const contentPart = fabricRequest.definition.parts.find((part) => part.path === "artifact.content.ipynb");
+    const decoded = Buffer.from(contentPart?.payload ?? "", "base64").toString("utf8");
+    expect(decoded).toContain("orders");
+    expect(decoded).not.toContain("asmdb_orders");
+    expect(decoded).toContain('DECODER = \\"None\\"');
+  });
 
   it("creates a notebook and sends substituted base64 notebook content", async () => {
     const app = createApp({ config: testConfig() });
@@ -661,19 +727,5 @@ describe("asmDB workload API", () => {
 
     expect(res.status).toBe(504);
     expect(res.body.error.code).toBe("fabric_operation_timeout");
-  });
-
-  it("does not pretend full_reload exists in the current template", async () => {
-    const token = await signToken();
-    const app = createApp({ config: testConfig() });
-
-    const res = await request(app)
-      .post("/api/notebooks")
-      .set("authorization", `Bearer ${token}`)
-      .send({ ...notebookBody, syncMode: "full_reload" });
-
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe("bad_request");
-    expect(state.fabricRequests).toHaveLength(0);
   });
 });

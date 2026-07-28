@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "generate:notebook-template": "node scripts/generate-notebook-template.mjs",
     "build": "tsc",
     "start": "node dist/index.js",
     "test": "vitest run"

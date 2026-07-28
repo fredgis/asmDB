@@ -21,10 +21,10 @@ export interface LakehouseInfo {
 export interface SyncLink {
   id: string;
   source: string;
-  sourceId?: string;
+  sourceId: string;
   target: string;
-  targetId?: string;
-  mode: string;
+  targetId: string;
+  mode?: string;
   prefix: string;
   decoder: DecoderMode;
   createNotebook: boolean;
@@ -33,6 +33,14 @@ export interface SyncLink {
   nextRun?: string;
   lag?: string;
   lastGoodSampleAt?: string;
+  notebook?: GeneratedNotebook;
+}
+
+export interface GeneratedNotebook {
+  notebookId: string;
+  displayName: string;
+  webUrl?: string;
+  createdAt: string;
 }
 
 export interface LineageGraph {
@@ -64,4 +72,3 @@ export interface Loadable<T> {
   issue?: LoadIssue;
   updatedAt?: Date;
 }
-

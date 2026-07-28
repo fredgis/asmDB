@@ -21,7 +21,10 @@ describe("embedded notebook template", () => {
   it("is identical to workload/notebooks/sync_template.py", () => {
     const onDisk = readFileSync(sourcePath, "utf8").replace(/\r\n/g, "\n");
     const embedded = ASMDB_SYNC_TEMPLATE.replace(/\r\n/g, "\n");
-    expect(embedded).toBe(onDisk);
+    expect(
+      embedded,
+      "Embedded notebook template drifted from workload/notebooks/sync_template.py. Run `npm run generate:notebook-template` from workload/backend and commit the regenerated src/services/notebook-template.ts."
+    ).toBe(onDisk);
   });
 
   it("still carries the guarantees the notebook was reviewed for", () => {
