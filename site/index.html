@@ -247,8 +247,8 @@
 
         <figure style="margin-top: var(--space-lg)">
           <pre class="code"><span class="c"># or run it locally against a file, no cloud at all</span>
-<span class="k">npx</span> asmdb-mcp <span class="c">--db</span> ./memory</pre>
-          <figcaption>The same tools, the same engine, over stdio.</figcaption>
+ASMDB_DB=memory <span class="k">node</span> mcp/src/server.js</pre>
+          <figcaption>The same tools, the same engine, over stdio. Configured by environment variables — see <code>mcp/README.md</code>.</figcaption>
         </figure>
       </div>
     </div>
@@ -265,8 +265,10 @@
         The instance access token is a bearer token with full authority over that
         database: read, write, delete and <code>TRUNCATE</code>. A web application
         calls asmdb from its server. The browser talks to your backend, never to
-        the database directly, and the private database environment is not
-        reachable from the public internet.
+        the database directly — the instance API sends no CORS headers, so a
+        browser refuses the call before it leaves. The container itself is never
+        exposed; every request arrives through the gateway, which means the token
+        is the only thing standing between a caller and the data.
       </p>
     </div>
 
@@ -384,16 +386,19 @@
       </figure>
 
       <figure>
-        <pre class="code"><span class="c"># Python — the client speaks the engine's own protocol</span>
-<span class="k">from</span> asmdb <span class="k">import</span> Client
+        <pre class="code"><span class="c"># Python — one HTTP call, no driver to install</span>
+<span class="k">import</span> os, requests
 
-db = Client(url, token)
-db.insert(<span class="s">"1001"</span>, value=<span class="s">"5"</span>, tag=<span class="s">"project"</span>,
-          content=<span class="s">"asmdb in assembly"</span>)
+base = os.environ[<span class="s">"ASMDB_ENDPOINT"</span>]
+auth = {<span class="s">"Authorization"</span>: <span class="s">"Bearer "</span> + os.environ[<span class="s">"ASMDB_TOKEN"</span>]}
 
-<span class="k">for</span> row <span class="k">in</span> db.find(<span class="s">"assembly"</span>, limit=<span class="s">50</span>):
-    print(row.id, row.content)</pre>
-        <figcaption>Python, C# and C clients ship in the repository.</figcaption>
+requests.post(base + <span class="s">"/v1/rows"</span>, headers=auth, json={
+    <span class="s">"id"</span>: <span class="s">"1001"</span>, <span class="s">"value"</span>: <span class="s">"5"</span>,
+    <span class="s">"tag"</span>: <span class="s">"project"</span>, <span class="s">"content"</span>: <span class="s">"asmdb in assembly"</span>})
+
+rows = requests.get(base + <span class="s">"/v1/find?q=assembly&amp;limit=50"</span>,
+                    headers=auth).json()[<span class="s">"rows"</span>]</pre>
+        <figcaption>The REST API needs no client library. The Python, C# and C clients under <code>clients/</code> drive the local binary, not a hosted database.</figcaption>
       </figure>
     </div>
   </div>

@@ -913,7 +913,9 @@ JavaScript `number`. Do not let a client parse them into numbers.
 | `GET /v1/range?lo=&hi=&limit=&offset=` | — | rows with `lo <= value <= hi` |
 
 `limit` defaults to 100 and caps at 1000; `offset` defaults to 0. Page with
-`nextOffset` rather than computing offsets yourself.
+`nextOffset` rather than computing offsets yourself. `find` and `range` are
+**full scans** — fine for a filter a user applies deliberately, wrong for
+search-as-you-type, because every keystroke walks the whole table.
 
 ### A minimal server-side route
 
