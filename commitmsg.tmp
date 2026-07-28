@@ -1,9 +1,0 @@
-Bump to 1.0.1 so the artwork can actually be uploaded
-
-Fabric rejects an upload whose version already exists, so shipping the
-new Hub artwork under 1.0.0 would have failed for a reason unrelated to
-anything in the package. The version lives in three files that the
-preflight cross-checks; all three move together.
-
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
-Copilot-Session: ab8ae5e0-e62f-4539-823d-70570d7062e3
