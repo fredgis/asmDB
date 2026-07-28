@@ -14,7 +14,7 @@
         "title": "Install asmDB Analytical Capabilities",
         "introduction": "Follow the workload packaging, upload, and enablement procedure.",
         "description": "Prepare the dedicated Entra app, isolated Azure resource group, custom domain, package, and Fabric Admin Portal steps.",
-        "image": "assets/logo.png",
+        "image": "assets/hub-get-started.png",
         "link": "https://github.com/fredgis/asmDB/blob/main/workload/docs/INSTALL.md"
       }
     ],
@@ -57,10 +57,13 @@
     "description": "asmDB Analytical Capabilities lets Fabric users synchronise premium asmDB change logs into lakehouse Delta tables through generated notebooks, with workload-level visibility into configured lineage and CDC lag.",
     "image": {
       "mediaType": 0,
-      "source": "assets/logo.png"
+      "source": "assets/hub-banner.png"
     },
     "slideMedia": [
-      { "mediaType": 0, "source": "assets/logo.png" }
+      { "mediaType": 0, "source": "assets/hub-glance-1.png" },
+      { "mediaType": 0, "source": "assets/hub-glance-2.png" },
+      { "mediaType": 0, "source": "assets/hub-glance-3.png" },
+      { "mediaType": 0, "source": "assets/hub-glance-4.png" }
     ],
     "supportLink": {
       "documentation": { "url": "https://github.com/fredgis/asmDB/blob/main/workload/docs/INSTALL.md" },

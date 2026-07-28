@@ -1,0 +1,36 @@
+Author the Hub artwork at the sizes Fabric actually renders
+
+Every image in Product.json pointed at the same square logo. The Hub
+renders each field into a fixed slot and stretches whatever it is given,
+so the banner behind the title was a square scaled to 1920x240 and then
+clipped into an arc, the Get started card was an oversized crop, and the
+At a glance carousel was one giant square.
+
+Only the banner is validated, and it is validated strictly: exactly
+1920x240, checked at upload rather than at packaging. The remaining
+sizes come from the assets Microsoft's own extensibility toolkit ships,
+read out of the PNG headers rather than from prose: 16:9 slides, a
+320x180 Get started card, a square icon of at least 240px.
+
+The banner is generated rather than drawn by hand so it can be
+regenerated when the brand moves. Its left third stays dark because the
+portal draws the workload title there in white and crops that edge at
+narrow viewports; the circuitry and blooms sit centre-right, and nothing
+legible goes in the file.
+
+At a glance now carries four captures of the running workload: sync
+links with lineage, the notebooks tab with its scheduler, and monitoring
+in both themes - the light one included deliberately, because respecting
+the host theme is a compliance point and a screenshot proves it.
+
+Screenshots are padded to 16:9, not cropped. The captures are about
+1.65:1 and cropping would cut away the interface the slide exists to
+show; padding uses each capture's own edge colour so it is invisible in
+either theme.
+
+pack.ps1 copied only logo.png into the package, so any asset added here
+would have been referenced and then absent. It now copies the whole
+assets folder.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: ab8ae5e0-e62f-4539-823d-70570d7062e3

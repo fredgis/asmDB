@@ -419,7 +419,12 @@ function New-Package {
     Copy-Item $ItemXmlPath (Join-Path $StageDir "BE\$($ItemName)Item.xml") -Force
     Copy-Item $ProductPath (Join-Path $StageDir "FE\Product.json") -Force
     Copy-Item $ItemJsonPath (Join-Path $StageDir "FE\$($ItemName)Item.json") -Force
-    Copy-Item (Join-Path $ManifestRoot "assets\logo.png") (Join-Path $StageDir "FE\Assets\logo.png") -Force
+    # Every asset the manifest references must reach the package, not just the
+    # logo: Fabric validates asset references at upload, so a missing file is
+    # discovered after everything else is done rather than at packaging time.
+    $stagedAssets = Join-Path $StageDir "FE\Assets"
+    New-Item -ItemType Directory -Force -Path $stagedAssets | Out-Null
+    Copy-Item (Join-Path $ManifestRoot "assets\*") $stagedAssets -Force
     New-ContentTypesFile
     New-RelationshipFile
 

@@ -626,8 +626,34 @@ This is disabled by default and requires a **Fabric tenant administrator**. With
 
 # Part 2 — Every release or upgrade
 
-## 1. Replace release-blocking placeholders
+## 0. Regenerate the Hub artwork when the interface changes
 
+The Workload Hub renders each `Product.json` image into a fixed slot and **stretches whatever it is given** to fill it. Pointing every field at the square logo is what produced the distorted arc behind the workload title, an oversized crop on the Get started card, and a single giant square in the At a glance carousel.
+
+Only one size is validated at upload — the banner, at **exactly 1920×240** ([publishing requirements §3.1.5](https://learn.microsoft.com/en-us/fabric/extensibility-toolkit/publishing-requirements-workload)). The rest are unvalidated but still rendered into a shape, so they have to be authored deliberately:
+
+| `Product.json` field | Size | Notes |
+|---|---|---|
+| `productDetail.image` | **1920×240** | Validated. Supply a flat rectangle: the portal clips the arc itself. The title is drawn over the left, and narrow viewports crop the left edge, so keep that area quiet and put nothing legible in the file |
+| `productDetail.slideMedia` | 16:9 | Up to 10 entries; images or YouTube/Vimeo embeds |
+| `homePage.learningMaterials[].image` | **320×180** | Contained with padding, never edge-to-edge |
+| `icon`, `favicon` | ≥ 240×240 square | Rendered anywhere from 16 to 64 px, so supply something larger and let it downsample |
+
+Limits enforced on the `Assets` folder: `.png`/`.jpg`/`.jpeg` only, **1.5 MB per file**, **15 files**, and `Product.json` itself under 50 KB.
+
+Regenerate from the checked-in logo and the README screenshots:
+
+```powershell
+python workload/build/gen_hub_assets.py
+```
+
+The screenshots are padded to 16:9 rather than cropped — the captures are about 1.65:1, and cropping would remove the interface the slide exists to show. Padding uses each capture's own edge colour, so it is invisible in both the light and dark themes.
+
+**How to know it worked:** `pack.ps1` reports `[PASS] Manifest asset references satisfy Fabric upload limits`, and every generated file prints under the 1.5 MB ceiling.
+
+**Failure looks like:** the packaging preflight names the offending file and its size. Upload-time failures are worse — Fabric validates dimensions when the package is uploaded, not when it is built, so a wrong banner size is discovered after every other step is done.
+
+## 1. Replace release-blocking placeholders
 What to do: before producing an uploadable package, replace every placeholder in the manifest files:
 
 - [ ] `workload/manifest/WorkloadManifest.xml` `AADFEApp/AppId`: replace `00000000-0000-0000-0000-000000000000` with the dedicated Entra app id.
