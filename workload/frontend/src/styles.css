@@ -248,11 +248,14 @@ dd { margin: 0; font-weight: 700; }
 .notebookItem strong { font: 700 14px/1.25 var(--asmdb-font-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .notebookItem.selected { border-color: var(--asmdb-accent-2); background: color-mix(in oklch, var(--asmdb-accent-2) 12%, var(--colorNeutralBackground2)); }
 .notebookItem span, .notebookItem small { color: var(--colorNeutralForeground2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.generateList { display: grid; gap: 8px; }
 .notebookHero { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 14px; border-radius: var(--asmdb-radius); background: linear-gradient(135deg, color-mix(in oklch, var(--asmdb-accent-2) 16%, var(--colorNeutralBackground2)), color-mix(in oklch, var(--asmdb-accent) 12%, var(--colorNeutralBackground2))); border: 1px solid var(--colorNeutralStroke2); }
 .notebookHero h3 { margin: 0 0 4px; font: 760 22px/1.1 var(--asmdb-font-display); }
 .notebookHero p { margin: 0; color: var(--colorNeutralForeground2); }
 .notebookActions, .scheduleControls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.scheduleGrid { display: grid; grid-template-columns: minmax(110px, max-content) minmax(0, 1fr); gap: 10px 12px; align-items: center; margin-block: 10px 12px; }
+.weekdayPicker { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
+.weekdayPicker button { border: 1px solid var(--colorNeutralStroke2); border-radius: var(--asmdb-radius-sm); background: var(--colorNeutralBackground1); color: var(--colorNeutralForeground2); padding: 6px 8px; cursor: pointer; }
+.weekdayPicker button.selected { border-color: var(--asmdb-accent-2); background: color-mix(in oklch, var(--asmdb-accent-2) 18%, var(--colorNeutralBackground1)); color: var(--colorNeutralForeground1); }
 .scheduleBox, .codePreview, .jobHistory { min-width: 0; padding: 14px; border: 1px solid var(--colorNeutralStroke2); border-radius: var(--asmdb-radius); background: var(--colorNeutralBackground2); }
 .scheduleBox h3, .codePreview h3, .jobHistory h3 { margin: 0 0 10px; }
 .scheduleNote { margin: 0 0 12px; color: var(--colorNeutralForeground2); line-height: 1.5; }

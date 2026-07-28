@@ -1,0 +1,26 @@
+Delete the notebook with its link, and schedule through the Fabric REST API
+
+The scheduling never worked because it used the wrong API. The
+workloadClient.itemSchedule client targets custom workload item types
+declared in a manifest; a Notebook is a first-party Fabric item whose
+schedules live in the REST API. The two contracts share no fields:
+jobDefinitionObjectId does not exist in REST, and there is no Hourly
+type at all.
+
+Schedules now go to /jobs/RunNotebook/schedules directly, with a
+Fabric-audience token. Three details decided whether the call was
+accepted: localTimeZoneId must be a Windows identifier rather than
+IANA, startDateTime and endDateTime are required in practice despite
+being optional in the schema, and the timestamps carry no trailing Z.
+The editor now offers the five cadences the portal offers, with Hourly
+expressed as a Cron interval in minutes.
+
+Run now returned 202 Accepted and we only accepted 200, which is why
+every run reported failure.
+
+Deleting a link now deletes its notebook. When that call fails the link
+is still removed and the message says the notebook remains, rather than
+claiming a cascade that did not happen.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: ab8ae5e0-e62f-4539-823d-70570d7062e3

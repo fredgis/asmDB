@@ -2,15 +2,15 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { Button, Dropdown, Input, Option, Textarea } from "@fluentui/react-components";
 import type { OptionOnSelectData, SelectionEvents } from "@fluentui/react-components";
-import type { ItemJobInstance, ItemSchedule } from "@ms-fabric/workload-client";
 import { useWorkloadClient } from "./context/WorkloadContext";
 import { useThemePreference, type ThemePreference } from "./context/ThemePreferenceContext";
 import { createNotebook as createNotebookArtifact, DependencyError, fetchDatabases, fetchHealth, previewCdc } from "./lib/api";
+import { deleteNotebook, getFabricApiToken, listNotebookSchedules, runNotebookNow as runNotebookNowViaRest, saveNotebookSchedule, type FabricNotebookSchedule, type NotebookRunInstance, type ScheduleCadence, type ScheduleDraft } from "./lib/fabric-notebooks";
 import { fetchLakehouses, resolveWorkspaceId } from "./lib/fabric";
 import { getFabricToken } from "./lib/auth-helper";
 import { byteLength, CONTENT_LIMIT_BYTES, decodeSample } from "./lib/decoder";
 import { graphFromLinks, loadLinks, saveLinkState } from "./lib/onelake";
-import type { DatabaseInfo, DecoderMode, GeneratedNotebook, LakehouseInfo, LinkState, LoadIssue, Loadable, RequestState, RunRecord, SyncLink } from "./types/workload";
+import type { DatabaseInfo, DecoderMode, GeneratedNotebook, LakehouseInfo, LinkState, LoadIssue, Loadable, NotebookStatus, RequestState, RunRecord, SyncLink } from "./types/workload";
 import "./styles.css";
 
 const decoderOptions: { value: DecoderMode; label: string }[] = [
@@ -23,7 +23,21 @@ const decoderOptions: { value: DecoderMode; label: string }[] = [
 ];
 
 const emptyIssue: LoadIssue = { dependency: "backend", message: "Not checked yet." };
-const NOTEBOOK_JOB_TYPE = "RunNotebook";
+const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const timezoneMap: Record<string, string> = {
+  UTC: "UTC",
+  "Etc/UTC": "UTC",
+  "Europe/Paris": "Romance Standard Time",
+  "Europe/Brussels": "Romance Standard Time",
+  "Europe/Madrid": "Romance Standard Time",
+  "Europe/Berlin": "W. Europe Standard Time",
+  "Europe/Amsterdam": "W. Europe Standard Time",
+  "Europe/London": "GMT Standard Time",
+  "America/New_York": "Eastern Standard Time",
+  "America/Chicago": "Central Standard Time",
+  "America/Denver": "Mountain Standard Time",
+  "America/Los_Angeles": "Pacific Standard Time",
+};
 
 interface CdcFrame {
   commitSeq?: string;
@@ -40,6 +54,14 @@ interface CdcOperation {
 type PreviewEntry =
   | { kind: "reset"; commitSeq: string }
   | { kind: "op"; commitSeq: string; op: string; id: string; tag: string; content: string; value: string; created: string; updated: string };
+
+interface NotebookListItem {
+  key: string;
+  displayName: string;
+  status: NotebookStatus | "not-created";
+  link: SyncLink;
+  notebook?: GeneratedNotebook;
+}
 
 function emptyLoadable<T>(data: T): Loadable<T> {
   return { state: "checking", data, issue: emptyIssue };
@@ -89,6 +111,12 @@ function formatEpochMilliseconds(value: string) {
 
 function notebookNameFor(link: SyncLink) {
   return `asmDB Sync - ${link.source} to ${link.target}`.slice(0, 120);
+}
+
+function notebookStatusFor(link: SyncLink): NotebookListItem["status"] {
+  if (link.notebookStatus) return link.notebookStatus;
+  if (link.notebook) return "created";
+  return "not-created";
 }
 
 function notebookCodeFor(link: SyncLink) {
@@ -141,23 +169,77 @@ function highlightPython(code: string) {
   });
 }
 
-function schedulePayload(notebookId: string, cadence: "Hourly" | "Daily", enabled: boolean, existing?: ItemSchedule): ItemSchedule {
-  const weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map((key) => ({ key, selected: true }));
+function pad(value: number) {
+  return String(value).padStart(2, "0");
+}
+
+function toLocalDateTimeInput(date: Date) {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function withoutSeconds(value: string) {
+  return value.slice(0, 16);
+}
+
+function toFabricLocalDateTime(value: string) {
+  const normalised = value.includes("T") ? value : toLocalDateTimeInput(new Date(value));
+  const [date, time = "00:00"] = normalised.split("T");
+  return `${date}T${time.slice(0, 5)}:00`;
+}
+
+function defaultScheduleDraft(): ScheduleDraft {
+  const now = new Date();
+  now.setMinutes(Math.ceil(now.getMinutes() / 15) * 15, 0, 0);
+  const end = new Date(now);
+  end.setFullYear(end.getFullYear() + 1);
+  const iana = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   return {
-    jobDefinitionObjectId: existing?.jobDefinitionObjectId ?? "",
-    itemObjectId: notebookId,
-    itemJobType: existing?.itemJobType ?? NOTEBOOK_JOB_TYPE,
-    scheduleEnabled: enabled,
-    scheduleType: cadence,
-    localTimeZoneId: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-    scheduleWeekdays: weekdays as ItemSchedule["scheduleWeekdays"],
-    scheduleHours: cadence === "Daily" ? ["00:00"] : undefined,
-    cronPeriod: cadence === "Hourly" ? 1 : undefined,
-    cronUnit: cadence === "Hourly" ? "Hours" : undefined,
-    executionData: "{}",
-    maxConcurrency: 1,
-    maxNumRetries: 1,
-  } as ItemSchedule;
+    cadence: "Daily",
+    minuteInterval: 15,
+    hourlyInterval: 1,
+    time: "09:00",
+    weekdays: ["Monday", "Wednesday", "Friday"],
+    dayOfMonth: 15,
+    startDateTime: toLocalDateTimeInput(now),
+    endDateTime: toLocalDateTimeInput(end),
+    localTimeZoneId: timezoneMap[iana] ?? "UTC",
+  };
+}
+
+function draftFromSchedule(schedule: FabricNotebookSchedule | null): ScheduleDraft {
+  const draft = defaultScheduleDraft();
+  if (!schedule?.configuration) return draft;
+  const config = schedule.configuration;
+  const firstTime = config.times?.[0] ?? draft.time;
+  return {
+    ...draft,
+    cadence: config.type === "Cron" ? (config.interval && config.interval < 60 ? "Minute" : "Hourly") : config.type,
+    minuteInterval: config.type === "Cron" && config.interval && config.interval < 60 ? config.interval : draft.minuteInterval,
+    hourlyInterval: config.type === "Cron" && config.interval && config.interval >= 60 ? Math.max(1, Math.round(config.interval / 60)) : draft.hourlyInterval,
+    time: firstTime,
+    weekdays: config.weekdays?.length ? config.weekdays : draft.weekdays,
+    dayOfMonth: config.occurrence?.dayOfMonth ?? draft.dayOfMonth,
+    startDateTime: config.startDateTime ? withoutSeconds(config.startDateTime) : draft.startDateTime,
+    endDateTime: config.endDateTime ? withoutSeconds(config.endDateTime) : draft.endDateTime,
+    localTimeZoneId: config.localTimeZoneId ?? draft.localTimeZoneId,
+  };
+}
+
+function scheduleBody(draft: ScheduleDraft, enabled: boolean) {
+  const common = {
+    startDateTime: toFabricLocalDateTime(draft.startDateTime),
+    endDateTime: toFabricLocalDateTime(draft.endDateTime),
+    localTimeZoneId: draft.localTimeZoneId || "UTC",
+  };
+  if (draft.cadence === "Minute") return { enabled, configuration: { type: "Cron" as const, interval: Math.max(1, draft.minuteInterval), ...common } };
+  if (draft.cadence === "Hourly") return { enabled, configuration: { type: "Cron" as const, interval: Math.max(1, draft.hourlyInterval) * 60, ...common } };
+  if (draft.cadence === "Daily") return { enabled, configuration: { type: "Daily" as const, times: [draft.time], ...common } };
+  if (draft.cadence === "Weekly") return { enabled, configuration: { type: "Weekly" as const, times: [draft.time], weekdays: draft.weekdays.length ? draft.weekdays : ["Monday"], ...common } };
+  return { enabled, configuration: { type: "Monthly" as const, times: [draft.time], recurrence: 1, occurrence: { occurrenceType: "DayOfMonth" as const, dayOfMonth: Math.min(31, Math.max(1, draft.dayOfMonth)) }, ...common } };
+}
+
+function nextRunText(schedule: FabricNotebookSchedule | null) {
+  return schedule?.nextRunDateTime ?? schedule?.nextRunTime ?? "not reported yet";
 }
 
 function extractFrames(preview: unknown): CdcFrame[] {
@@ -251,10 +333,10 @@ function App() {
   const [selectedNotebookId, setSelectedNotebookId] = useState("");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [notebookState, setNotebookState] = useState<RequestState>("not-configured");
-  const [notebookMessage, setNotebookMessage] = useState("Generate a notebook from a saved link.");
-  const [schedule, setSchedule] = useState<ItemSchedule | null>(null);
-  const [jobHistory, setJobHistory] = useState<ItemJobInstance[]>([]);
-  const [scheduleCadence, setScheduleCadence] = useState<"Hourly" | "Daily">("Daily");
+  const [notebookMessage, setNotebookMessage] = useState("Create a link to create its notebook automatically.");
+  const [schedule, setSchedule] = useState<FabricNotebookSchedule | null>(null);
+  const [jobHistory, setJobHistory] = useState<NotebookRunInstance[]>([]);
+  const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft>(() => defaultScheduleDraft());
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -325,27 +407,30 @@ function App() {
   const selectedSource = databases.data.find((database) => database.id === sourceId) ?? null;
   const selectedTarget = lakehouses.data.find((lakehouse) => lakehouse.id === targetId) ?? null;
   const selectedLink = links.data.find((link) => link.id === selectedId) ?? null;
-  // Both of these must be memoised. They are rebuilt from links.data with a
-  // spread, so without useMemo every render produces new object identities,
-  // and the effects below that depend on them re-run on every render: each run
-  // sets state, which re-renders, which rebuilds these, which re-runs the
-  // effects. Fabric's own rate limiter caught it - 100 requests per second to
-  // getItemJobHistory - and showed the user a "this workload has an issue"
-  // dialog, which is the worst possible way to discover a dependency bug.
+  // Keep notebook rows stable so schedule effects depend on the notebook id
+  // instead of a new object identity on every render.
   const notebooks = useMemo(
-    () => links.data.flatMap((link) => (link.notebook ? [{ ...link.notebook, link }] : [])),
+    () => links.data
+      .filter((link) => link.notebook || link.notebookStatus || link.notebookError)
+      .map((link) => ({
+        key: link.notebook?.notebookId ?? link.id,
+        displayName: link.notebook?.displayName ?? notebookNameFor(link),
+        status: notebookStatusFor(link),
+        notebook: link.notebook,
+        link,
+      })),
     [links.data]
   );
   const selectedNotebook = useMemo(
-    () => notebooks.find((notebook) => notebook.notebookId === selectedNotebookId) ?? notebooks[0] ?? null,
+    () => notebooks.find((notebook) => notebook.key === selectedNotebookId) ?? notebooks[0] ?? null,
     [notebooks, selectedNotebookId]
   );
   const lineage = useMemo(() => graphFromLinks(links.data), [links.data]);
   const activeLinks = links.data.filter((link) => link.status === "Active").length;
   const plannedLinks = links.data.filter((link) => link.status === "Planned").length;
   const warningLinks = links.data.filter((link) => link.status === "Warning").length;
-  const successfulRuns = jobHistory.filter((job) => job.isSuccessful).length;
-  const failedRuns = jobHistory.filter((job) => !job.isSuccessful).length;
+  const successfulRuns = jobHistory.filter((job) => `${job.status ?? ""}`.toLowerCase().includes("success")).length;
+  const failedRuns = jobHistory.filter((job) => `${job.status ?? ""}`.toLowerCase().includes("fail")).length;
   const decoded = useMemo(() => {
     if (!sample) return { status: decoderOptions.find((item) => item.value === decoder)?.label ?? "None", preview: "No CDC sample fetched yet.", failed: false };
     try {
@@ -356,7 +441,7 @@ function App() {
   }, [decoder, sample]);
 
   const activityRows: RunRecord[] = jobHistory.length && selectedNotebook
-    ? jobHistory.slice(0, 5).map((job) => ({ id: job.itemJobInstanceId, source: selectedNotebook.link.source, target: selectedNotebook.link.target, status: job.isSuccessful ? "Active" : "Failed", lastRun: job.jobEndTimeUtc || job.jobStartTimeUtc || job.jobScheduleTimeUtc, lag: job.statusString, message: job.serviceExceptionJson }))
+    ? jobHistory.slice(0, 5).map((job, index) => ({ id: job.id ?? `run-${index}`, source: selectedNotebook.link.source, target: selectedNotebook.link.target, status: `${job.status ?? ""}`.toLowerCase().includes("fail") ? "Failed" : "Active", lastRun: job.createdDateTime ?? new Date().toISOString(), lag: job.status ?? "Accepted" }))
     : links.data.filter((link) => link.lastRun && link.lastRun !== "Never run").map((link) => ({ id: link.id, source: link.source, target: link.target, status: link.status, lastRun: link.lastRun, lag: link.lag }));
   const canCreate = Boolean(selectedSource && selectedTarget && links.state !== "failed");
   const headerIssue = connection.state === "failed" ? connection.issue : databases.state === "failed" ? databases.issue : lakehouses.state === "failed" ? lakehouses.issue : links.state === "failed" ? links.issue : undefined;
@@ -370,42 +455,38 @@ function App() {
   }, []);
 
   useEffect(() => {
-    setSelectedNotebookId((current) => current && notebooks.some((notebook) => notebook.notebookId === current) ? current : notebooks[0]?.notebookId ?? "");
+    setSelectedNotebookId((current) => current && notebooks.some((notebook) => notebook.key === current) ? current : notebooks[0]?.key ?? "");
   }, [notebooks]);
 
-  const selectedNotebookKey = selectedNotebook?.notebookId ?? "";
+  const selectedNotebookKey = selectedNotebook?.notebook?.notebookId ?? "";
 
   useEffect(() => {
-    // Depend on the id, not the object. Even memoised, the notebook object
-    // changes identity whenever links.data does - a save, a refresh - and
-    // re-fetching the schedule and history on every such change is both
-    // wasteful and how the request storm started.
-    if (!selectedNotebookKey || !workloadClient?.itemSchedule) {
+    if (!selectedNotebookKey) {
       setSchedule(null);
       setJobHistory([]);
+      setScheduleDraft(defaultScheduleDraft());
       return;
     }
     let cancelled = false;
-    void Promise.allSettled([
-      workloadClient.itemSchedule.listItemSchedules({ itemObjectId: selectedNotebookKey }),
-      workloadClient.itemSchedule.getItemJobHistory({ objectId: selectedNotebookKey }),
-    ]).then(([schedules, history]) => {
-      if (cancelled) return;
-      if (schedules.status === "fulfilled") {
-        const notebookSchedule = schedules.value.itemSchedules.find((item) => item.itemJobType === NOTEBOOK_JOB_TYPE) ?? schedules.value.itemSchedules[0] ?? null;
+    void (async () => {
+      try {
+        const token = await getFabricApiToken(workloadClient);
+        if (!token) throw new DependencyError({ dependency: "identity", code: "fabric_token_unavailable", message: "Could not acquire a Fabric API token for notebook schedules." });
+        const workspaceId = await resolveWorkspaceId(workloadClient);
+        const schedules = await listNotebookSchedules(token, workspaceId, selectedNotebookKey);
+        if (cancelled) return;
+        const notebookSchedule = schedules[0] ?? null;
         setSchedule(notebookSchedule);
-        if (notebookSchedule?.scheduleType === "Hourly" || notebookSchedule?.scheduleType === "Daily") setScheduleCadence(notebookSchedule.scheduleType);
-      } else {
-        console.error("Could not read notebook schedules", schedules.reason);
+        setScheduleDraft(draftFromSchedule(notebookSchedule));
+        setJobHistory([]);
+      } catch (error) {
+        if (cancelled) return;
+        console.error("Could not read notebook schedules", error);
         setSchedule(null);
-      }
-      if (history.status === "fulfilled") {
-        setJobHistory(history.value.history ?? []);
-      } else {
-        console.error("Could not read notebook job history", history.reason);
+        setScheduleDraft(defaultScheduleDraft());
         setJobHistory([]);
       }
-    });
+    })();
     return () => { cancelled = true; };
   }, [selectedNotebookKey, workloadClient]);
 
@@ -435,12 +516,18 @@ function App() {
       prefix,
       decoder,
       status: "Planned",
+      notebookStatus: "creating",
     };
     const nextLinks = [link, ...links.data];
     try {
       const persistedLinks = await saveLinkState(workloadClient, nextLinks);
       setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
-      setSelectedId(persistedLinks.find((saved) => saved.id === link.id)?.id ?? persistedLinks[0]?.id ?? "");
+      const savedLink = persistedLinks.find((saved) => saved.id === link.id) ?? link;
+      setSelectedId(savedLink.id);
+      setSaveState("ready");
+      setSaveMessage(`Saved to links.json and lineage/graph.json: ${selectedSource.name} -> ${selectedTarget.name}. Creating notebook…`);
+      showToast(`Sync link saved: ${selectedSource.name} to ${selectedTarget.name}. Creating notebook…`);
+      await generateNotebookFor(savedLink, persistedLinks);
     } catch (error) {
       console.error("Create Link failed", error);
       const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "unknown";
@@ -450,23 +537,36 @@ function App() {
       showToast(message);
       return;
     }
-    setSaveState("ready");
-    setSaveMessage(`Saved to links.json and lineage/graph.json: ${selectedSource.name} -> ${selectedTarget.name}.`);
-    showToast(`Sync link saved: ${selectedSource.name} to ${selectedTarget.name}.`);
   }
 
   async function deleteLink(linkId: string) {
     const link = links.data.find((candidate) => candidate.id === linkId);
     if (!link) return;
     setSaveState("checking");
+
+    let notebookOutcome = "";
+    if (link.notebook?.notebookId) {
+      try {
+        const token = await getFabricApiToken(workloadClient);
+        if (!token) throw new Error("A Fabric API token was not returned.");
+        const workspaceId = await resolveWorkspaceId(workloadClient);
+        await deleteNotebook(token, workspaceId, link.notebook.notebookId);
+        notebookOutcome = ` Notebook "${link.notebook.displayName}" was deleted.`;
+      } catch (error) {
+        console.error("Notebook delete failed", error);
+        const reason = error instanceof Error ? error.message : String(error);
+        notebookOutcome = ` Notebook "${link.notebook.displayName}" could not be deleted and still exists in the workspace: ${reason}`;
+      }
+    }
+
     try {
       const persistedLinks = await saveLinkState(workloadClient, links.data.filter((candidate) => candidate.id !== linkId));
       setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
       setSelectedId(persistedLinks[0]?.id ?? "");
       setDeleteConfirmId("");
       setSaveState("ready");
-      setSaveMessage(`Deleted ${link.source} -> ${link.target} from links.json and lineage/graph.json.`);
-      showToast("Sync link deleted.");
+      setSaveMessage(`Deleted ${link.source} -> ${link.target} from links.json and lineage/graph.json.${notebookOutcome}`);
+      showToast(notebookOutcome.includes("could not be deleted") ? "Sync link deleted; the notebook remains." : "Sync link deleted.");
     } catch (error) {
       console.error("Delete Link failed", error);
       const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "unknown";
@@ -507,7 +607,11 @@ function App() {
       setNotebookState("checking");
       setNotebookMessage(`Generating ${notebookNameFor(link)}…`);
       try {
-        const resolved = await resolveNotebookLink(link, currentLinks);
+        const creatingLinks = currentLinks.map((candidate) => candidate.id === link.id ? { ...candidate, notebookStatus: "creating" as const, notebookError: undefined } : candidate);
+        const creatingPersisted = await saveLinkState(workloadClient, creatingLinks);
+        setLinks({ state: creatingPersisted.length ? "ready" : "no-data", data: creatingPersisted, updatedAt: new Date() });
+        const creatingLink = creatingPersisted.find((candidate) => candidate.id === link.id) ?? link;
+        const resolved = await resolveNotebookLink(creatingLink, creatingPersisted);
         const resolvedLink = resolved.link;
         const token = await getFabricToken(workloadClient);
         if (!token) throw new DependencyError({ dependency: "identity", code: "token_unavailable", message: "Could not acquire the workload token." });
@@ -530,54 +634,76 @@ function App() {
           decoder: resolvedLink.decoder,
         });
         const created: GeneratedNotebook = { ...notebook, createdAt: new Date().toISOString() };
-        const persistedLinks = await saveLinkState(workloadClient, resolved.links.map((candidate) => candidate.id === resolvedLink.id ? { ...candidate, notebook: created } : candidate));
+        const latest = await loadLinks(workloadClient);
+        const baseLinks = latest.some((candidate) => candidate.id === resolvedLink.id) ? latest : resolved.links;
+        const persistedLinks = await saveLinkState(workloadClient, baseLinks.map((candidate) => candidate.id === resolvedLink.id ? { ...candidate, notebook: created, notebookStatus: "created" as const, notebookError: undefined } : candidate));
         setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
         setSelectedNotebookId(created.notebookId);
         setActiveTab("notebooks");
         setNotebookState("ready");
         setNotebookMessage(`Notebook generated: ${created.displayName}.`);
+        setSaveMessage(`Saved link and created notebook: ${created.displayName}.`);
         showToast(`Notebook generated: ${created.displayName}.`);
       } catch (error) {
         console.error("Notebook generation failed", error);
         const issue = issueFrom(error, { dependency: "backend", message: "Notebook generation failed." });
+        try {
+          const latest = await loadLinks(workloadClient);
+          const baseLinks = latest.some((candidate) => candidate.id === link.id) ? latest : currentLinks;
+          const failedLinks = baseLinks.map((candidate) => candidate.id === link.id ? { ...candidate, notebookStatus: "failed" as const, notebookError: `${issue.code ? `[${issue.code}] ` : ""}${issue.message}` } : candidate);
+          const persistedLinks = await saveLinkState(workloadClient, failedLinks);
+          setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
+        } catch (persistError) {
+          console.error("Could not persist notebook failure status", persistError);
+        }
         setNotebookState("failed");
         setNotebookMessage(`${issue.code ? `[${issue.code}] ` : ""}${issue.message}`);
+        setSaveMessage(`Link saved, but notebook creation failed: ${issue.message}`);
         showToast(issue.message);
       }
     }
 
   async function saveSchedule(enabled: boolean) {
-      if (!selectedNotebook || !workloadClient?.itemSchedule) return;
+      if (!selectedNotebook?.notebook) return;
       setNotebookState("checking");
       setNotebookMessage("Saving notebook schedule…");
       try {
-        const payload = schedulePayload(selectedNotebook.notebookId, scheduleCadence, enabled, schedule ?? undefined);
-        const saved = schedule?.jobDefinitionObjectId
-          ? await workloadClient.itemSchedule.updateItemScheduledJobs({ objectId: selectedNotebook.notebookId, payload })
-          : await workloadClient.itemSchedule.createItemScheduledJobs({ objectId: selectedNotebook.notebookId, payload });
+        const token = await getFabricApiToken(workloadClient);
+        if (!token) throw new DependencyError({ dependency: "identity", code: "fabric_token_unavailable", message: "Could not acquire a Fabric API token for notebook schedules." });
+        const workspaceId = await resolveWorkspaceId(workloadClient);
+        const saved = await saveNotebookSchedule(token, workspaceId, selectedNotebook.notebook.notebookId, scheduleBody(scheduleDraft, enabled), schedule?.id ?? selectedNotebook.link.notebookScheduleId);
         setSchedule(saved);
+        setScheduleDraft(draftFromSchedule(saved));
+        const latest = await loadLinks(workloadClient);
+        const persistedLinks = await saveLinkState(workloadClient, latest.map((candidate) => candidate.id === selectedNotebook.link.id ? { ...candidate, notebookStatus: saved.enabled ? "scheduled" as const : "unscheduled" as const, notebookScheduleId: saved.id } : candidate));
+        setLinks({ state: persistedLinks.length ? "ready" : "no-data", data: persistedLinks, updatedAt: new Date() });
         setNotebookState("ready");
-        setNotebookMessage(enabled ? `Schedule enabled. Next run: ${saved.nextJobScheduleTime ?? saved.nextJobScheduleTimeUtc ?? "not reported yet"}.` : "Schedule disabled.");
+        setNotebookMessage(enabled ? `Schedule enabled. Next run: ${nextRunText(saved)}.` : "Schedule disabled.");
       } catch (error) {
         console.error("Schedule save failed", error);
+        const issue = issueFrom(error, { dependency: "fabric", message: "Notebook schedule request failed." });
         setNotebookState("failed");
-        setNotebookMessage(error instanceof Error ? error.message : String(error));
+        setNotebookMessage(`${issue.code ? `[${issue.code}] ` : ""}${issue.message}`);
       }
     }
 
   async function runNotebookNow() {
-      if (!selectedNotebook || !workloadClient?.itemSchedule) return;
+      if (!selectedNotebook?.notebook) return;
       setNotebookState("checking");
       setNotebookMessage("Starting notebook run…");
       try {
-        const run = await workloadClient.itemSchedule.runItemJob({ itemObjectId: selectedNotebook.notebookId, itemJobType: NOTEBOOK_JOB_TYPE, payload: { executionData: "{}" } });
+        const token = await getFabricApiToken(workloadClient);
+        if (!token) throw new DependencyError({ dependency: "identity", code: "fabric_token_unavailable", message: "Could not acquire a Fabric API token to run the notebook." });
+        const workspaceId = await resolveWorkspaceId(workloadClient);
+        const run = await runNotebookNowViaRest(token, workspaceId, selectedNotebook.notebook.notebookId);
         setJobHistory((current) => [run, ...current]);
         setNotebookState("ready");
-        setNotebookMessage(`Run started: ${run.statusString}.`);
+        setNotebookMessage(`Run accepted by Fabric${run.id ? `: ${run.id}` : ""}.`);
       } catch (error) {
         console.error("Run now failed", error);
+        const issue = issueFrom(error, { dependency: "fabric", message: "Run now failed." });
         setNotebookState("failed");
-        setNotebookMessage(error instanceof Error ? error.message : String(error));
+        setNotebookMessage(`${issue.code ? `[${issue.code}] ` : ""}${issue.message}`);
       }
     }
 
@@ -704,12 +830,12 @@ function App() {
             </article>
           </section>
           <section className="panel cdcPanel" aria-labelledby="cdc-heading"><div className="panelHead"><h2 id="cdc-heading"><span aria-hidden="true">▤</span>CDC Preview</h2></div><div className="panelBody"><StateMessage state={previewState} text={previewText} />{previewRows.length ? <CdcPreview entries={previewRows} /> : null}</div></section>
-          </> : activeTab === "notebooks" ? <NotebooksView notebooks={notebooks} selectedNotebookId={selectedNotebook?.notebookId ?? ""} onSelect={setSelectedNotebookId} onGenerate={generateNotebookFor} links={links.data} state={notebookState} message={notebookMessage} schedule={schedule} cadence={scheduleCadence} onCadence={setScheduleCadence} onSaveSchedule={saveSchedule} onRunNow={runNotebookNow} onOpen={openNotebook} history={jobHistory} /> : <MonitoringView links={links.data} activityRows={activityRows} activeLinks={activeLinks} plannedLinks={plannedLinks} warningLinks={warningLinks} successfulRuns={successfulRuns} failedRuns={failedRuns} onSelect={selectLink} />}
+          </> : activeTab === "notebooks" ? <NotebooksView notebooks={notebooks} selectedNotebookId={selectedNotebook?.key ?? ""} onSelect={setSelectedNotebookId} state={notebookState} message={notebookMessage} schedule={schedule} draft={scheduleDraft} onDraft={setScheduleDraft} onSaveSchedule={saveSchedule} onRunNow={runNotebookNow} onOpen={openNotebook} history={jobHistory} /> : <MonitoringView links={links.data} activityRows={activityRows} activeLinks={activeLinks} plannedLinks={plannedLinks} warningLinks={warningLinks} successfulRuns={successfulRuns} failedRuns={failedRuns} onSelect={selectLink} />}
 
           <footer className="footer"><span>{connection.updatedAt ? `✓ Data checked: ${formatTime(connection.updatedAt)}` : "○ Data not checked yet"}</span></footer>
         </section>
       </main>
-      {detailsOpen && selectedLink ? <div className="detailOverlay" role="dialog" aria-modal="true" aria-labelledby="detail-heading"><article className="panel detailPopup"><div className="panelHead"><h2 id="detail-heading"><span aria-hidden="true">ↄ</span>Selected Link Details</h2><Button type="button" onClick={() => setDetailsOpen(false)}>Close</Button></div><LinkSummary link={selectedLink} confirmDelete={deleteConfirmId === selectedLink.id} onAskDelete={() => setDeleteConfirmId(selectedLink.id)} onCancelDelete={() => setDeleteConfirmId("")} onDelete={() => void deleteLink(selectedLink.id)} onGenerateNotebook={() => void generateNotebookFor(selectedLink)} /></article></div> : null}
+      {detailsOpen && selectedLink ? <div className="detailOverlay" role="dialog" aria-modal="true" aria-labelledby="detail-heading"><article className="panel detailPopup"><div className="panelHead"><h2 id="detail-heading"><span aria-hidden="true">ↄ</span>Selected Link Details</h2><Button type="button" onClick={() => setDetailsOpen(false)}>Close</Button></div><LinkSummary link={selectedLink} confirmDelete={deleteConfirmId === selectedLink.id} onAskDelete={() => setDeleteConfirmId(selectedLink.id)} onCancelDelete={() => setDeleteConfirmId("")} onDelete={() => void deleteLink(selectedLink.id)} /></article></div> : null}
       <div className={`toast ${toast ? "show" : ""}`} role="status" aria-live="polite">{toast}</div>
     </div>
   );
@@ -770,7 +896,7 @@ function MonitoringView({ links, activityRows, activeLinks, plannedLinks, warnin
   </section>;
 }
 
-function LinkSummary({ link, confirmDelete, onAskDelete, onCancelDelete, onDelete, onGenerateNotebook }: { link: SyncLink; confirmDelete: boolean; onAskDelete: () => void; onCancelDelete: () => void; onDelete: () => void; onGenerateNotebook: () => void }) {
+function LinkSummary({ link, confirmDelete, onAskDelete, onCancelDelete, onDelete }: { link: SyncLink; confirmDelete: boolean; onAskDelete: () => void; onCancelDelete: () => void; onDelete: () => void }) {
   return <div className="linkSummary">
     <div className="linkPair">
       <span className="linkEndpoint sourceEndpoint">▤ {link.source}</span>
@@ -788,50 +914,67 @@ function LinkSummary({ link, confirmDelete, onAskDelete, onCancelDelete, onDelet
       </dl>
     </details>
     <div className="deleteZone">
-      {!link.notebook ? <Button type="button" appearance="primary" onClick={onGenerateNotebook}>Generate notebook</Button> : <span className="surfaceBadge">Notebook ready</span>}
-      {confirmDelete ? <div className="deleteConfirm"><span>Delete this link?</span><Button size="small" type="button" onClick={onCancelDelete}>Cancel</Button><Button size="small" appearance="primary" type="button" onClick={onDelete}>Delete</Button></div> : <Button type="button" onClick={onAskDelete}>Delete link</Button>}
+      <span className={`surfaceBadge ${link.notebookStatus === "failed" ? "surfaceBadgeDanger" : ""}`}>{notebookStatusLabel(notebookStatusFor(link))}</span>
+      {confirmDelete ? <div className="deleteConfirm"><span>{link.notebook ? `Delete this link and its notebook "${link.notebook.displayName}"?` : "Delete this link?"}</span><Button size="small" type="button" onClick={onCancelDelete}>Cancel</Button><Button size="small" appearance="primary" type="button" onClick={onDelete}>{link.notebook ? "Delete link and notebook" : "Delete link"}</Button></div> : <Button type="button" onClick={onAskDelete}>Delete link</Button>}
     </div>
   </div>;
+}
+
+function notebookStatusLabel(status: NotebookListItem["status"]) {
+  switch (status) {
+    case "creating": return "Creating";
+    case "created": return "Created";
+    case "scheduled": return "Scheduled";
+    case "unscheduled": return "Not scheduled";
+    case "failed": return "Failed to create";
+    default: return "Not created";
+  }
 }
 
 function NotebooksView({
   notebooks,
   selectedNotebookId,
   onSelect,
-  onGenerate,
-  links,
   state,
   message,
   schedule,
-  cadence,
-  onCadence,
+  draft,
+  onDraft,
   onSaveSchedule,
   onRunNow,
   onOpen,
   history,
 }: {
-  notebooks: Array<GeneratedNotebook & { link: SyncLink }>;
+  notebooks: NotebookListItem[];
   selectedNotebookId: string;
   onSelect: (id: string) => void;
-  onGenerate: (link: SyncLink) => void;
-  links: SyncLink[];
   state: RequestState;
   message: string;
-  schedule: ItemSchedule | null;
-  cadence: "Hourly" | "Daily";
-  onCadence: (cadence: "Hourly" | "Daily") => void;
+  schedule: FabricNotebookSchedule | null;
+  draft: ScheduleDraft;
+  onDraft: (draft: ScheduleDraft) => void;
   onSaveSchedule: (enabled: boolean) => void;
   onRunNow: () => void;
   onOpen: (notebook: GeneratedNotebook) => void;
-  history: ItemJobInstance[];
+  history: NotebookRunInstance[];
 }) {
-  const selected = notebooks.find((notebook) => notebook.notebookId === selectedNotebookId) ?? notebooks[0] ?? null;
+  const selected = notebooks.find((notebook) => notebook.key === selectedNotebookId) ?? notebooks[0] ?? null;
+  const selectedNotebook = selected?.notebook ?? null;
+  const updateDraft = (patch: Partial<ScheduleDraft>) => onDraft({ ...draft, ...patch });
+  const toggleWeekday = (day: string) => {
+    const hasDay = draft.weekdays.includes(day);
+    const next = hasDay ? draft.weekdays.filter((item) => item !== day) : [...draft.weekdays, day];
+    updateDraft({ weekdays: next.length ? next : [day] });
+  };
   return <section className="notebooksGrid">
     <article className="panel notebookListPanel">
       <div className="panelHead"><h2><span aria-hidden="true">▤</span>Generated notebooks</h2></div>
       <div className="notebookList">
-        {notebooks.length ? notebooks.map((notebook) => <button type="button" key={notebook.notebookId} className={selected?.notebookId === notebook.notebookId ? "notebookItem selected" : "notebookItem"} onClick={() => onSelect(notebook.notebookId)}><strong>{notebook.displayName}</strong><span>{notebook.link.source} → {notebook.link.target}</span><small>Created {new Date(notebook.createdAt).toLocaleString()}</small></button>) : <StateMessage state="no-data" text="No generated notebooks yet. Choose a saved link below to create one." />}
-        {!notebooks.length && links.length ? <div className="generateList">{links.map((link) => <Button key={link.id} type="button" appearance="primary" onClick={() => onGenerate(link)}>Generate notebook for {link.source} → {link.target}</Button>)}</div> : null}
+        {notebooks.length ? notebooks.map((notebook) => <button type="button" key={notebook.key} className={selected?.key === notebook.key ? "notebookItem selected" : "notebookItem"} onClick={() => onSelect(notebook.key)}>
+          <strong>{notebook.displayName}</strong>
+          <span>{notebook.link.source} → {notebook.link.target}</span>
+          <small><span className={`compactStatus ${notebook.status === "failed" ? "statusWarning" : notebook.status === "created" || notebook.status === "scheduled" ? "statusActive" : "statusPlanned"}`}>{notebookStatusLabel(notebook.status)}</span>{notebook.notebook ? ` · Created ${new Date(notebook.notebook.createdAt).toLocaleString()}` : ""}</small>
+        </button>) : <StateMessage state="no-data" text="No notebooks yet. Create a sync link to create its notebook automatically." />}
       </div>
     </article>
     <article className="panel notebookDetailPanel">
@@ -839,26 +982,36 @@ function NotebooksView({
       {selected ? <div className="notebookDetail">
         <div className="notebookHero">
           <div><h3>{selected.displayName}</h3><p>{selected.link.source} → {selected.link.target}</p></div>
-          <div className="notebookActions">{selected.webUrl ? <Button type="button" onClick={() => onOpen(selected)}>Open in Fabric</Button> : null}<Button type="button" appearance="primary" onClick={onRunNow}>Run now</Button></div>
+          <div className="notebookActions">{selectedNotebook?.webUrl ? <Button type="button" onClick={() => onOpen(selectedNotebook)}>Open in Fabric</Button> : null}{selectedNotebook ? <Button type="button" appearance="primary" onClick={onRunNow}>Run now</Button> : null}</div>
         </div>
-        <StateMessage state={state} text={message} />
-        <section className="scheduleBox" aria-labelledby="schedule-heading">
+        <StateMessage state={selected.status === "failed" ? "failed" : selected.status === "creating" ? "checking" : selectedNotebook ? state : "not-configured"} text={selected.link.notebookError ?? (selectedNotebook ? message : "The link exists, but no notebook is attached to it. Create Link now creates notebooks automatically for new links; older links may need to be recreated.")} />
+        {selectedNotebook ? <section className="scheduleBox" aria-labelledby="schedule-heading">
           <h3 id="schedule-heading">Schedule</h3>
-          <p className="scheduleNote">Direct notebook schedules run as the user who created or last updated the schedule. For durable unattended operation, use a Data Factory pipeline with Workspace Identity authentication.</p>
-          <div className="scheduleControls">
+          <p className="scheduleNote">Schedules use Fabric REST for first-party Notebook items. The token is requested for Fabric API Item.Execute.All and Item.ReadWrite.All scopes.</p>
+          <div className="scheduleGrid">
             <label htmlFor="cadence">Cadence</label>
-            <Dropdown id="cadence" value={cadence} selectedOptions={[cadence]} onOptionSelect={(_, data) => { if (data.optionValue === "Hourly" || data.optionValue === "Daily") onCadence(data.optionValue); }}>
+            <Dropdown id="cadence" value={draft.cadence} selectedOptions={[draft.cadence]} onOptionSelect={(_, data) => { if (data.optionValue) updateDraft({ cadence: data.optionValue as ScheduleCadence }); }}>
+              <Option value="Minute">By the minute</Option>
               <Option value="Hourly">Hourly</Option>
               <Option value="Daily">Daily</Option>
+              <Option value="Weekly">Weekly</Option>
+              <Option value="Monthly">Monthly</Option>
             </Dropdown>
-            <Button type="button" onClick={() => onSaveSchedule(true)}>Enable schedule</Button>
-            <Button type="button" onClick={() => onSaveSchedule(false)}>Disable</Button>
+            {draft.cadence === "Minute" ? <><label htmlFor="minuteInterval">Every</label><Input id="minuteInterval" type="number" min="1" value={String(draft.minuteInterval)} onChange={(_, data) => updateDraft({ minuteInterval: Math.max(1, Number(data.value) || 15) })} contentAfter="minutes" /></> : null}
+            {draft.cadence === "Hourly" ? <><label htmlFor="hourlyInterval">Every</label><Input id="hourlyInterval" type="number" min="1" value={String(draft.hourlyInterval)} onChange={(_, data) => updateDraft({ hourlyInterval: Math.max(1, Number(data.value) || 1) })} contentAfter="hours" /></> : null}
+            {draft.cadence === "Daily" || draft.cadence === "Weekly" || draft.cadence === "Monthly" ? <><label htmlFor="scheduleTime">Time</label><Input id="scheduleTime" type="time" value={draft.time} onChange={(_, data) => updateDraft({ time: data.value })} /></> : null}
+            {draft.cadence === "Weekly" ? <div className="weekdayPicker" role="group" aria-label="Weekdays">{weekdays.map((day) => <button key={day} type="button" className={draft.weekdays.includes(day) ? "selected" : ""} aria-pressed={draft.weekdays.includes(day)} onClick={() => toggleWeekday(day)}>{day.slice(0, 3)}</button>)}</div> : null}
+            {draft.cadence === "Monthly" ? <><label htmlFor="dayOfMonth">Day of month</label><Input id="dayOfMonth" type="number" min="1" max="31" value={String(draft.dayOfMonth)} onChange={(_, data) => updateDraft({ dayOfMonth: Math.min(31, Math.max(1, Number(data.value) || 1)) })} /></> : null}
+            <label htmlFor="startDateTime">Start</label><Input id="startDateTime" type="datetime-local" value={draft.startDateTime} onChange={(_, data) => updateDraft({ startDateTime: data.value })} />
+            <label htmlFor="endDateTime">End</label><Input id="endDateTime" type="datetime-local" value={draft.endDateTime} onChange={(_, data) => updateDraft({ endDateTime: data.value })} />
+            <label htmlFor="timeZone">Time zone</label><Input id="timeZone" value={draft.localTimeZoneId} onChange={(_, data) => updateDraft({ localTimeZoneId: data.value || "UTC" })} />
           </div>
-          <p className="fieldCaption inlineCaption">Current: {schedule?.scheduleEnabled ? `${schedule.scheduleType}; next run ${schedule.nextJobScheduleTime ?? schedule.nextJobScheduleTimeUtc ?? "not reported"}` : "disabled or not created yet"}.</p>
-        </section>
-        <section className="codePreview" aria-labelledby="code-heading"><h3 id="code-heading">PySpark preview</h3><pre>{highlightPython(notebookCodeFor(selected.link))}</pre></section>
-        <section className="jobHistory" aria-labelledby="history-heading"><h3 id="history-heading">Recent runs</h3>{history.length ? <div className="tableWrap"><table><thead><tr><th>Status</th><th>Scheduled</th><th>Started</th><th>Ended</th></tr></thead><tbody>{history.slice(0, 5).map((job) => <tr key={job.itemJobInstanceId}><td>{job.statusString}</td><td>{job.jobScheduleTimeUtc || "—"}</td><td>{job.jobStartTimeUtc || "—"}</td><td>{job.jobEndTimeUtc || "—"}</td></tr>)}</tbody></table></div> : <p className="fieldCaption inlineCaption">No real job history returned yet.</p>}</section>
-      </div> : <StateMessage state="not-configured" text="Generate a notebook from a saved link to preview code and configure scheduling." />}
+          <div className="scheduleControls"><Button type="button" onClick={() => onSaveSchedule(true)} appearance="primary">Save schedule</Button><Button type="button" onClick={() => onSaveSchedule(false)}>Disable</Button></div>
+          <p className="fieldCaption inlineCaption">Current: {schedule?.enabled ? `enabled; next run ${nextRunText(schedule)}` : "disabled or not created yet"}.</p>
+        </section> : null}
+        {selectedNotebook ? <section className="codePreview" aria-labelledby="code-heading"><h3 id="code-heading">PySpark preview</h3><pre>{highlightPython(notebookCodeFor(selected.link))}</pre></section> : null}
+        {selectedNotebook ? <section className="jobHistory" aria-labelledby="history-heading"><h3 id="history-heading">Recent runs</h3>{history.length ? <div className="tableWrap"><table><thead><tr><th>Status</th><th>Accepted</th><th>Instance</th></tr></thead><tbody>{history.slice(0, 5).map((job, index) => <tr key={job.id ?? index}><td>{job.status ?? "Accepted"}</td><td>{job.createdDateTime || "just now"}</td><td>{job.id || "not returned"}</td></tr>)}</tbody></table></div> : <p className="fieldCaption inlineCaption">No run started from this session yet.</p>}</section> : null}
+      </div> : <StateMessage state="not-configured" text="No notebook has been created yet. Create a sync link to create one automatically." />}
     </article>
   </section>;
 }

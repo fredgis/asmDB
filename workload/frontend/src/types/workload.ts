@@ -1,6 +1,7 @@
 export type RequestState = "not-configured" | "no-data" | "failed" | "ready" | "stale" | "checking";
 export type DecoderMode = "none" | "hex" | "base64" | "json" | "csv" | "messagepack";
 export type LinkState = "Active" | "Planned" | "Warning";
+export type NotebookStatus = "creating" | "created" | "failed" | "scheduled" | "unscheduled";
 
 export interface DatabaseInfo {
   id: string;
@@ -27,12 +28,14 @@ export interface SyncLink {
   mode?: string;
   prefix: string;
   decoder: DecoderMode;
-  createNotebook?: boolean;
   status: LinkState;
   lastRun?: string;
   nextRun?: string;
   lag?: string;
   lastGoodSampleAt?: string;
+  notebookStatus?: NotebookStatus;
+  notebookError?: string;
+  notebookScheduleId?: string;
   notebook?: GeneratedNotebook;
 }
 
