@@ -21,10 +21,20 @@ const optionalTrimmedString = (maxLength: number) =>
     (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
     z.string().trim().max(maxLength).optional()
   );
-const optionalDecoderSchema = z.preprocess(
-  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
-  z.enum(["None", "Hex", "Base64", "JSON", "CSV", "MessagePack"]).optional()
-);
+// The frontend's DecoderMode is lowercase ("none", "base64", "messagepack")
+// while this enum was written capitalised, so every request was rejected with
+// a 400 that named the field but still looked like a mystery. Normalise the
+// case here rather than making both sides agree by convention: a contract that
+// only works when two independently maintained lists share their casing will
+// break again the first time someone adds a decoder to one of them.
+const DECODERS = ["None", "Hex", "Base64", "JSON", "CSV", "MessagePack"] as const;
+
+const optionalDecoderSchema = z.preprocess((value) => {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (trimmed === "") return undefined;
+  return DECODERS.find((decoder) => decoder.toLowerCase() === trimmed.toLowerCase()) ?? trimmed;
+}, z.enum(DECODERS).optional());
 const notebookBodySchema = z
   .object({
     workspaceId: workspaceIdSchema,

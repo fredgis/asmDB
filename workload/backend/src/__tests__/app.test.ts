@@ -657,6 +657,27 @@ describe("asmDB workload API", () => {
     expect(decoded).toContain('DECODER = \\"None\\"');
   });
 
+  // The frontend's DecoderMode is lowercase. Every existing test used the
+  // capitalised spelling, so the mismatch survived a full suite and only
+  // surfaced as a 400 in production.
+  it("accepts the lowercase decoder values the frontend actually sends", async () => {
+    const token = await signToken();
+    const app = createApp({ config: testConfig() });
+
+    const res = await request(app)
+      .post("/api/notebooks")
+      .set("authorization", `Bearer ${token}`)
+      .send({ ...notebookBody, decoder: "messagepack" });
+
+    expect(res.status).toBe(201);
+    const fabricRequest = state.fabricRequests[0] as {
+      definition: { parts: Array<{ path: string; payload: string }> };
+    };
+    const contentPart = fabricRequest.definition.parts.find((part) => part.path === "artifact.content.ipynb");
+    const decoded = Buffer.from(contentPart?.payload ?? "", "base64").toString("utf8");
+    expect(decoded).toContain('DECODER = \\"MessagePack\\"');
+  });
+
   it("creates a notebook and sends substituted base64 notebook content", async () => {
     const app = createApp({ config: testConfig() });
     const res = await postNotebook(app);
