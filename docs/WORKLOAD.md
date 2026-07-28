@@ -492,6 +492,75 @@ if reset_frame_seen:
   is retained, and surface it in the UI — the "Warning" state in the mockup is exactly
   this case.
 
+### 4.6 One run, drawn
+
+Every branch below is reachable in production, and each of the three refusals exists
+because the alternative is a lakehouse that quietly disagrees with the database.
+
+```mermaid
+flowchart TD
+  START(["Notebook run starts"]) --> WM["Read watermark from the<br/>Delta table's own properties"]
+  WM --> FETCH["GET /cdc?from=watermark<br/><i>from is EXCLUSIVE</i>"]
+
+  FETCH --> CLASS{"What came back?"}
+
+  CLASS -->|"503 share_unreadable"| RETRY["Back off and retry<br/>4 attempts, doubling"]
+  RETRY --> FETCH
+
+  CLASS -->|"409 cdc_gap / cdc_corrupt"| BASE{"Does the log still<br/>start at baseSeq 0?"}
+  BASE -->|no| STOP1(["REFUSE · retention trimmed the history<br/>a partial tail is not a full reload"])
+  BASE -->|yes| REPLAY["Replay the whole log<br/>into a fresh image"]
+  REPLAY --> STAGE
+
+  CLASS -->|"a RESET frame"| RESETN["TRUNCATE / RESTORE / BENCH<br/>replaced the table.<br/>The log carries no rows for it"]
+  RESETN --> CAP{"Reseeded fewer than<br/>3 times this run?"}
+  CAP -->|no| STOP2(["REFUSE · the source is being replaced<br/>faster than this sync can follow"])
+  CAP -->|yes| SNAP["GET /snapshot · page by slot<br/>pinned to X-Asmdb-Snapshot-Seq"]
+  SNAP --> SNAPOK{"Same sequence<br/>on every page?"}
+  SNAPOK -->|no| SNAP
+  SNAPOK -->|yes| SEED["Stage page by page,<br/>then replace the table once"]
+  SEED --> SEEDWM["Write watermark = snapshot sequence"]
+  SEEDWM --> FETCH
+
+  CLASS -->|"frames"| MORE{"has-more?"}
+  MORE -->|yes| NEXT["from = last commitSeq in page"]
+  NEXT --> FETCH
+  MORE -->|no| COLLAPSE["Collapse to one row per id<br/>last write in the batch wins"]
+
+  COLLAPSE --> STAGE["Stage with an EXPLICIT schema<br/><i>inference fails when a column<br/>is null in every row</i>"]
+  STAGE --> MERGE["MERGE INTO the Delta table<br/>matched: update · not matched: insert"]
+  MERGE --> WRITEWM["Write the new watermark<br/><b>after</b> the data, never before"]
+  WRITEWM --> ACK["Acknowledge the watermark<br/>best-effort"]
+  ACK --> WARN(["The gateway has no /ack route yet:<br/>warn and finish. A failed acknowledgement<br/>must never fail a committed sync"])
+
+  classDef read fill:#0e1726,stroke:#3ABB9F,color:#dfe7f5
+  classDef seed fill:#141024,stroke:#8b5cf6,color:#dfe7f5
+  classDef write fill:#0b1a2e,stroke:#38bdf8,color:#dfe7f5
+  classDef stop fill:#2a1116,stroke:#f43f5e,color:#ffe4e9
+  classDef warn fill:#2a2110,stroke:#f59e0b,color:#fff3d6
+  classDef gate fill:#111827,stroke:#94a3b8,color:#e2e8f0
+
+  class START,WM,FETCH,RETRY,COLLAPSE,NEXT,REPLAY read
+  class RESETN,SNAP,SEED,SEEDWM seed
+  class STAGE,MERGE,WRITEWM,ACK write
+  class STOP1,STOP2 stop
+  class WARN warn
+  class CLASS,BASE,MORE,CAP,SNAPOK gate
+```
+
+Three things in that picture are the whole design, and each was learned the hard way:
+
+**`from` is exclusive.** Paging from `watermark + 1` skips exactly one frame per call.
+It shipped once, and the symptom was a run that reported success having done nothing.
+
+**The watermark is written after the data, always.** A crash between the two either
+replays an idempotent `MERGE`, which is harmless, or skips rows for ever, which is not.
+The order is asserted in code rather than merely intended.
+
+**A `RESET` cannot be replayed.** The log holds no rows for it, so folding it would
+empty the table rather than reload it. Seeding from a snapshot pinned to a change-log
+sequence is what makes "reload, then resume" exact instead of approximate.
+
 ---
 
 ## 5. Fabric integration — what is supported, and what we do not yet know
