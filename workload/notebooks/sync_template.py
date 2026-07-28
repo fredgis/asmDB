@@ -715,7 +715,7 @@ def rebuild_from_cdc_base(
         has_more = str(headers.get("X-Asmdb-Has-More", "false")).lower() == "true"
         if not has_more:
             break
-        from_seq = last_in_page + 1
+        from_seq = last_in_page
 
     rows, new_watermark = fold_rebuild_frames(frames_for_rebuild, base_seq=base_seq, decoder=DECODER, config=DECODER_CONFIG)
     apply_rebuild_rows(spark_session, table_name, rows, new_watermark)
@@ -726,7 +726,7 @@ def rebuild_from_cdc_base(
 def run_sync() -> None:
     token = get_gateway_token(KEY_VAULT_URL, KEY_VAULT_SECRET_NAME)
     last_seq = read_watermark(spark, TARGET_TABLE)  # noqa: F821 - provided by Fabric
-    from_seq = last_seq + 1
+    from_seq = last_seq
     all_frames: List[Dict[str, Any]] = []
 
     while True:
@@ -739,8 +739,15 @@ def run_sync() -> None:
                 new_watermark = rebuild_from_cdc_base(spark, GATEWAY_URL, INSTANCE_ID, token, TARGET_TABLE, reseed, requested_seq)  # noqa: F821
                 acknowledge_watermark(GATEWAY_URL, INSTANCE_ID, token, new_watermark)
                 return
+            if reseed.reason == "reset_frame":
+                raise FullReloadUnavailable(
+                    "the source table was replaced wholesale (TRUNCATE, RESTORE or BENCH), which the engine "
+                    f"reports as a single RESET frame at commitSeq={reseed.detail.get('commitSeq')} carrying no rows. "
+                    "The change log therefore does not contain the new contents, and replaying it would empty "
+                    f"the lakehouse table rather than reload it. {TARGET_TABLE} has been left exactly as it was. "
+                    "Seed the table from the current source state, then resume syncing after that sequence."
+                ) from reseed
             raise
-            return
 
         if not frames:
             break
@@ -749,7 +756,7 @@ def run_sync() -> None:
         has_more = str(headers.get("X-Asmdb-Has-More", "false")).lower() == "true"
         if not has_more:
             break
-        from_seq = last_in_page + 1
+        from_seq = last_in_page
 
     rows, new_watermark = collapse_frames(all_frames, decoder=DECODER, config=DECODER_CONFIG)
     if new_watermark <= last_seq:

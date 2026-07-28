@@ -7,6 +7,7 @@ import types
 
 import pytest
 
+import sync_template
 from sync_template import (
     FIXED_COLUMN_TYPES,
     row_from_op,
@@ -342,3 +343,79 @@ def test_iso_to_datetime_accepts_the_form_millis_to_iso_produces():
     assert parsed.year >= 2020
     assert _iso_to_datetime(None) is None
     assert _iso_to_datetime("not a date") is None
+
+
+def test_paging_uses_the_gateways_exclusive_from_semantics(monkeypatch):
+    """The gateway skips frames whose commitSeq is <= from.
+
+    api.go: `if frame.CommitSeq <= from { continue }`, and the gateway README
+    tells clients to "keep paging from the last consumed commitSeq". Asking for
+    watermark + 1 therefore skips exactly one frame on every call - the first
+    unconsumed one - which is silent data loss. It hid a RESET frame in
+    production and made a run that changed nothing report success.
+    """
+
+    requested = []
+
+    def fake_fetch(gateway, instance, token, from_seq, limit):
+        requested.append(from_seq)
+        if len(requested) == 1:
+            return ([frame(4, [upsert(1, 10)]), frame(5, [upsert(2, 20)])], {"X-Asmdb-Has-More": "true"})
+        return ([frame(6, [upsert(3, 30)])], {"X-Asmdb-Has-More": "false"})
+
+    monkeypatch.setattr("sync_template.fetch_cdc_page", fake_fetch)
+    monkeypatch.setattr("sync_template.get_gateway_token", lambda vault, name: "token")
+    monkeypatch.setattr("sync_template.spark", object(), raising=False)
+    monkeypatch.setattr("sync_template.read_watermark", lambda spark, table: 3)
+    monkeypatch.setattr("sync_template.apply_incremental_rows", lambda *a, **k: None)
+    monkeypatch.setattr("sync_template.acknowledge_watermark", lambda *a, **k: True)
+
+    sync_template.run_sync()
+
+    assert requested == [3, 5], "from must be the last consumed commitSeq, never that plus one"
+
+
+def test_rebuild_paging_also_uses_exclusive_from(monkeypatch):
+    requested = []
+
+    def fake_fetch(gateway, instance, token, from_seq, limit):
+        requested.append(from_seq)
+        if len(requested) == 1:
+            return ([frame(1, [upsert(1, 10)]), frame(2, [upsert(2, 20)])], {"X-Asmdb-Has-More": "true", "X-Asmdb-Base-Seq": "0"})
+        return ([frame(3, [upsert(3, 30)])], {"X-Asmdb-Has-More": "false", "X-Asmdb-Base-Seq": "0"})
+
+    monkeypatch.setattr("sync_template.fetch_cdc_page", fake_fetch)
+    monkeypatch.setattr("sync_template.apply_rebuild_rows", lambda *a, **k: None)
+
+    reason = ReseedRequired("cdc_gap", {"baseSeq": "0", "requestedFrom": "9"})
+    rebuild_from_cdc_base("spark", "gateway", "instance", "token", "target", reason, requested_seq=9)
+
+    assert requested == [0, 2]
+
+
+def test_a_reset_frame_fails_the_run_rather_than_emptying_the_table(monkeypatch):
+    """BENCH, TRUNCATE and RESTORE emit one RESET frame carrying no operations.
+
+    The change log cannot rebuild the table from that: replaying it clears the
+    image and leaves nothing behind. Refusing loudly is correct - silently
+    writing an empty table would destroy the lakehouse copy.
+    """
+
+    def fake_fetch(gateway, instance, token, from_seq, limit):
+        return ([frame(7, [], reset=True)], {"X-Asmdb-Has-More": "false"})
+
+    monkeypatch.setattr("sync_template.fetch_cdc_page", fake_fetch)
+    monkeypatch.setattr("sync_template.get_gateway_token", lambda vault, name: "token")
+    monkeypatch.setattr("sync_template.spark", object(), raising=False)
+    monkeypatch.setattr("sync_template.read_watermark", lambda spark, table: 6)
+
+    applied = []
+    monkeypatch.setattr("sync_template.apply_incremental_rows", lambda *a, **k: applied.append(a))
+    monkeypatch.setattr("sync_template.apply_rebuild_rows", lambda *a, **k: applied.append(a))
+
+    with pytest.raises(FullReloadUnavailable) as exc:
+        sync_template.run_sync()
+
+    assert "replaced wholesale" in str(exc.value)
+    assert "left exactly as it was" in str(exc.value)
+    assert applied == [], "a reset must not write anything"
