@@ -58,8 +58,8 @@ In asmdb Cloud, instances are not public endpoints. The deployed network is:
 
 - VNet `asmdb-vnet` (`10.20.0.0/16`) with separate subnets for Container Apps,
   API Management and private endpoints.
-- An internal Container Apps environment (`internal: true`) at static IP
-  `10.20.1.197`. Its Container Apps domain is not publicly resolvable.
+- An internal Container Apps environment (`internal: true`) at a private address
+  inside that VNet. Its Container Apps domain is not publicly resolvable.
 - API Management in Developer SKU, External VNet mode, as the only public front
   door.
 - Private endpoints for Blob storage, the Azure Files share and the container

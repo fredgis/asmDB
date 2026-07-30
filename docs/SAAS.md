@@ -71,7 +71,7 @@ The live platform is in resource group `<service-resource-group>`, region `swede
 | Resource | Deployed name | Notes |
 |---|---|---|
 | API Management | `asmdb-apim` | Developer SKU, External VNet mode, gateway `https://asmdb-apim.azure-api.net`, public IP `4.223.65.58`. This is the only public application front door; the registry still has public network access for builds. |
-| Container Apps environment | `asmdb-env` | Internal environment, static IP `10.20.1.197`, domain `<container-apps-env>.swedencentral.azurecontainerapps.io`. Inside the VNet, a private DNS wildcard maps that domain to the internal environment address. |
+| Container Apps environment | `asmdb-env` | Internal environment, a private static IP, domain `<container-apps-env>.<region>.azurecontainerapps.io`. Inside the VNet, a private DNS wildcard maps that domain to the internal environment address. |
 | Virtual network | `asmdb-vnet` | `10.20.0.0/16`, with subnets for Container Apps, APIM and private endpoints. |
 | Blob storage | `asmdbstosmwggii` | Control-plane metadata. `publicNetworkAccess: Disabled`, `allowSharedKeyAccess: false`; access is through managed identity. |
 | File storage | `asmdbfsosmwggii3rfc4` | Premium FileStorage, NFS 4.1 share `instances`, 100 GiB provisioned. Instance directories are separated by mount sub-path. |
@@ -101,7 +101,7 @@ flowchart TB
         CASubnet["Container Apps delegated subnet"]
         PESubnet["private endpoints subnet"]
 
-        subgraph CAE["asmdb-env · internal<br/>10.20.1.197"]
+        subgraph CAE["asmdb-env · internal"]
             CP["asmdb-cp<br/>control plane"]
             DB["db-&lt;instance&gt;<br/>sidecar + asmdb"]
         end
@@ -144,7 +144,7 @@ APIM has two APIs.
 | APIM API | Path | Backend | Important policy |
 |---|---|---|---|
 | `asmdb` | `''` | Control plane `asmdb-cp` | Overrides `Host` to the backend FQDN. |
-| `asmdb-instances` | `db` | `https://db-{instance}.<container-apps-env>.swedencentral.azurecontainerapps.io` | Strips `/db/{instance}`, overrides `Host`, and uses a 60-second forward timeout for cold starts. |
+| `asmdb-instances` | `db` | `https://db-{instance}.<container-apps-env>.<region>.azurecontainerapps.io` | Strips `/db/{instance}`, overrides `Host`, and uses a 60-second forward timeout for cold starts. |
 
 A customer receives this base endpoint:
 

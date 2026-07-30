@@ -42,3 +42,8 @@ workload/build/out/
 
 workload/build/backend.zip
 workload/build/backend-stage/
+
+# Deployment identity. deploy.env names one tenant, one subscription and one
+# set of Entra objects; deploy.env.example carries the shape with placeholders
+# and is the file that belongs in the repository.
+/deploy.env

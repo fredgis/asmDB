@@ -112,11 +112,13 @@ func (v *fakeAccessTokenVerifier) Verify(_ context.Context, raw string) (verifie
 }
 
 func testConfig() config {
-	clientID := "<console-app-id>"
+	// Fabricated identifiers. A test does not need the real directory, and a
+	// real tenant id in a public repository names an environment for no gain.
+	clientID := "22222222-2222-2222-2222-222222222222"
 	return config{
-		EntraTenantID: "<tenant-id>",
+		EntraTenantID: "11111111-1111-1111-1111-111111111111",
 		EntraClientID: clientID,
-		EntraGroupID:  "<admin-group-id>",
+		EntraGroupID:  "33333333-3333-3333-3333-333333333333",
 		EntraScope:    "api://" + clientID + "/" + entraScopeName,
 	}
 }

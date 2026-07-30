@@ -28,10 +28,10 @@ The reference environment is provisioned. These are the real values; substitute 
 | Application ID URI | `https://asmdb.cloud/fe/be/Org.AsmdbAnalytical/1` | same |
 | Package version | `1.0.1` | `workload/manifest/WorkloadManifest.xml`, `workload/build/Workload.nuspec`, and `pack.ps1 -Version 1.0.1` |
 | Exposed scope | `FabricWorkloadControl`; preauthorise Power BI `871c010f-5e61-4fb1-83ac-98610a7e9110`, Fabric Client for Workloads `d2450708-699c-41e3-8077-b0c8341509aa`, and Power BI Service `00000009-0000-0000-c000-000000000000`; delegated `Fabric.Extend` consented | same |
-| Federated credential | subject `<backend-mi-principal-id>` (backend managed identity), audience `api://AzureADTokenExchange` | `…/federatedIdentityCredentials` |
+| Federated credential | subject `<backend-managed-identity-principal-id>` (backend managed identity), audience `api://AzureADTokenExchange` | `…/federatedIdentityCredentials` |
 | Key Vault | `<key-vault-name>`, **RBAC authorisation enabled**, public network access disabled | `az keyvault show` |
 | Key Vault grant | workspace identity `<fabric-workspace-name>` / `<workspace-identity-object-id>` → **Key Vault Secrets User** | `az role assignment list --scope <vault>` |
-| Backend | `https://asmdb-analytical-backend.azurewebsites.net` | `/health` returns `{"status":"ok","version":"0.1.0"}` |
+| Backend | `https://<backend-app-name>.azurewebsites.net` | `/health` returns `{"status":"ok","version":"0.1.0"}` |
 | Frontend | `https://fe.asmdb.cloud` | `/`, `/sync-hub` and `/close` all return 200 over HTTPS |
 | CDC gateway | internal Container App in `<service-resource-group>`, uid `100:101`, read-only NFS mount | `/cdc/{id}` and `/snapshot/{id}` answered through the backend passthrough |
 | Notebook data path | `ASMDB_NOTEBOOK_GATEWAY_URL` = `…/api/sync` | a snapshot of a live instance returns `X-Asmdb-Snapshot-Seq` matching the change log's head |
@@ -255,7 +255,7 @@ Two steps in a fixed order: the DNS record must exist and resolve *before* Azure
 |---|---|
 | Type | `CNAME` |
 | Sub-domain | `fe` |
-| Target | `<static-web-app>.azurestaticapps.net` (for this deployment, `<static-web-app>.7.azurestaticapps.net`) |
+| Target | `<static-web-app>.azurestaticapps.net` (for this deployment, `<static-web-app>.azurestaticapps.net`) |
 | TTL | 3600 |
 
 Find the target with:
@@ -264,7 +264,7 @@ Find the target with:
 az staticwebapp show `
   --subscription <subscription-id> `
   --resource-group <analytics-resource-group> `
-  --name asmdb-analytical-frontend `
+  --name <static-web-app-name> `
   --query defaultHostname -o tsv
 ```
 
@@ -282,7 +282,7 @@ The answer must show `NameHost` equal to the Static Web App hostname. **Only one
 az staticwebapp hostname set `
   --subscription <subscription-id> `
   --resource-group <analytics-resource-group> `
-  --name asmdb-analytical-frontend `
+  --name <static-web-app-name> `
   --hostname "fe.asmdb.cloud"
 ```
 
@@ -292,7 +292,7 @@ This is not instant. The hostname moves through `RetrievingValidationToken` → 
 az staticwebapp hostname list `
   --subscription <subscription-id> `
   --resource-group <analytics-resource-group> `
-  --name asmdb-analytical-frontend `
+  --name <static-web-app-name> `
   --query "[].{name:name,status:status}" -o table
 ```
 
@@ -373,7 +373,7 @@ For the reference environment:
 az webapp config appsettings set `
   --subscription <subscription-id> `
   --resource-group <analytics-resource-group> `
-  --name asmdb-analytical-backend `
+  --name <backend-app-name> `
   --settings `
     PORT=5010 `
     WEBSITES_PORT=5010 `
@@ -388,7 +388,7 @@ az webapp config appsettings set `
     ASMDB_GATEWAY_TOKEN="<raw gateway token>" `
     ASMDB_KEY_VAULT_URL="https://<key-vault-name>.vault.azure.net" `
     ASMDB_KEY_VAULT_SECRET_NAME="asmdb-gateway-token" `
-    ASMDB_NOTEBOOK_GATEWAY_URL="https://asmdb-analytical-backend.azurewebsites.net/api/sync"
+    ASMDB_NOTEBOOK_GATEWAY_URL="https://<backend-app-name>.azurewebsites.net/api/sync"
 ```
 
 `ASMDB_WL_ENTRA_CLIENT_SECRET` is the local-development alternative to `ASMDB_WL_USE_MANAGED_IDENTITY=true`; do not set both in Azure. `ASMDB_WL_MANAGED_IDENTITY_CLIENT_ID` is only for a user-assigned identity. `ASMDB_CLOUD_SCOPE`, `ASMDB_FABRIC_API`, `ASMDB_WL_JWKS_URI`, `ASMDB_WL_TOKEN_ENDPOINT`, and the size/timeout settings are optional overrides; omit them unless you have a specific reason to change the defaults.
@@ -399,14 +399,14 @@ How to know it worked:
 az webapp config appsettings list `
   --subscription <subscription-id> `
   --resource-group <analytics-resource-group> `
-  --name asmdb-analytical-backend `
+  --name <backend-app-name> `
   --query "[].name" -o table
 ```
 
 The output includes every required `ASMDB_...` name above. Then:
 
 ```powershell
-Invoke-RestMethod "https://asmdb-analytical-backend.azurewebsites.net/health"
+Invoke-RestMethod "https://<backend-app-name>.azurewebsites.net/health"
 ```
 
 Expect `{"status":"ok","version":"0.1.0"}`.
@@ -432,12 +432,12 @@ az network vnet subnet create `
   --delegations Microsoft.Web/serverFarms
 
 az webapp vnet-integration add `
-  --resource-group <analytics-resource-group> --name asmdb-analytical-backend `
+  --resource-group <analytics-resource-group> --name <backend-app-name> `
   --vnet "/subscriptions/<sub>/resourceGroups/<service-resource-group>/providers/Microsoft.Network/virtualNetworks/asmdb-vnet" `
   --subnet snet-appsvc
 
 az webapp config set `
-  --resource-group <analytics-resource-group> --name asmdb-analytical-backend `
+  --resource-group <analytics-resource-group> --name <backend-app-name> `
   --vnet-route-all-enabled true
 ```
 
@@ -451,7 +451,7 @@ Name resolution needs no work: Azure already links the Container Apps environmen
 $profiles = [xml](az webapp deployment list-publishing-profiles `
   --subscription <subscription-id> `
   --resource-group <analytics-resource-group> `
-  --name asmdb-analytical-backend `
+  --name <backend-app-name> `
   --xml)
 $profile = $profiles.publishData.publishProfile |
   Where-Object { $_.publishMethod -eq "MSDeploy" } |
@@ -460,7 +460,7 @@ $basic = [Convert]::ToBase64String(
   [Text.Encoding]::ASCII.GetBytes("$($profile.userName):$($profile.userPWD)")
 )
 $cmd = 'curl -s -w "\nHTTP=%{http_code}\n" --max-time 20 https://<gateway-fqdn>/healthz'
-Invoke-RestMethod -Uri "https://asmdb-analytical-backend.scm.azurewebsites.net/api/command" -Method Post `
+Invoke-RestMethod -Uri "https://<backend-app-name>.scm.azurewebsites.net/api/command" -Method Post `
   -Headers @{ Authorization = "Basic $basic"; "Content-Type" = "application/json" } `
   -Body (@{ command = $cmd; dir = "/home" } | ConvertTo-Json)
 ```
@@ -523,8 +523,8 @@ The backend already reaches the gateway, over the VNet integration of §4.2, and
 ```powershell
 az webapp config appsettings set `
   --subscription <subscription-id> `
-  --resource-group <analytics-resource-group> --name asmdb-analytical-backend `
-  --settings ASMDB_NOTEBOOK_GATEWAY_URL="https://asmdb-analytical-backend.azurewebsites.net/api/sync"
+  --resource-group <analytics-resource-group> --name <backend-app-name> `
+  --settings ASMDB_NOTEBOOK_GATEWAY_URL="https://<backend-app-name>.azurewebsites.net/api/sync"
 ```
 
 The route mirrors the gateway's own contract — `GET /cdc/{instanceId}?from=&limit=` returning NDJSON with the `x-asmdb-*` headers — so the notebook's parsing, its gap and corruption handling, and its tests all stay as they are. Only the base URL differs.
@@ -542,7 +542,7 @@ If the setting is absent the notebooks fall back to `ASMDB_GATEWAY_URL`, which i
 ```powershell
 $token = "<raw gateway token>"
 Invoke-WebRequest -UseBasicParsing `
-  -Uri "https://asmdb-analytical-backend.azurewebsites.net/api/sync/cdc/<instanceId>?from=0&limit=5" `
+  -Uri "https://<backend-app-name>.azurewebsites.net/api/sync/cdc/<instanceId>?from=0&limit=5" `
   -Headers @{ Authorization = "Bearer $token" }
 ```
 
@@ -740,7 +740,7 @@ Failure looks like: `pack.ps1` lists every placeholder by file and field and pro
 ```powershell
 pwsh .\workload\build\deploy.ps1 `
   -Only build `
-  -BackendUrl "https://asmdb-analytical-backend.azurewebsites.net"
+  -BackendUrl "https://<backend-app-name>.azurewebsites.net"
 
 pwsh .\workload\build\deploy.ps1 `
   -Only backend

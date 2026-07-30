@@ -5,9 +5,14 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$TenantId = '<tenant-id>'
-$SubscriptionId = '<subscription-id>'
-$ResourceGroup = '<service-resource-group>'
+$InfraDir = Split-Path -Parent $PSCommandPath
+$RepoRoot = (Resolve-Path (Join-Path $InfraDir '..\..')).Path
+. (Join-Path $RepoRoot 'scripts\deploy-env.ps1')
+$DeployEnv = Get-DeployEnv -Require @('ASMDB_TENANT_ID', 'ASMDB_SUBSCRIPTION_ID', 'ASMDB_RESOURCE_GROUP')
+
+$TenantId = $DeployEnv['ASMDB_TENANT_ID']
+$SubscriptionId = $DeployEnv['ASMDB_SUBSCRIPTION_ID']
+$ResourceGroup = $DeployEnv['ASMDB_RESOURCE_GROUP']
 
 function Invoke-AzJson([string[]]$Arguments) {
     $output = & az @Arguments --only-show-errors --output json 2>&1

@@ -44,8 +44,8 @@ Options:
 - `-SkipApim` deploys the private network, private endpoints, internal Container Apps environment, storage, registry, identity, and control plane, but skips APIM for faster iteration.
 - `-WhatIf` runs Azure what-if only and stops.
 
-The script is the deployment path and is run from a workstation; there is no CI deployment. It requires Azure CLI login to tenant `<tenant-id>` and subscription `<subscription-id>`.
-The target resource group `<service-resource-group>` must already exist in `swedencentral`.
+The script is the deployment path and is run from a workstation; there is no CI deployment. It requires Azure CLI login to the tenant and subscription named in `deploy.env`.
+The target resource group named in `deploy.env` must already exist in `swedencentral`.
 For a full deploy, Azure CLI must be on `PATH` and support `az deployment
 group` and `az acr build`; the deployment uses ACR Tasks rather than a local
 Docker daemon.
@@ -65,7 +65,7 @@ Posh-ACME store. The renewal path is automated by `renew-certificate.ps1`.
 
 The script:
 
-1. verifies Azure CLI is logged in to tenant `<tenant-id>` and subscription `<subscription-id>`;
+1. verifies Azure CLI is logged in to the tenant and subscription named in `deploy.env`;
 2. renews the existing Posh-ACME order with the stored OVH DNS-01 plugin arguments, or creates/replaces it when `-OvhAppKey`, `-OvhAppSecret`, and `-OvhConsumerKey` are supplied;
 3. calls `deploy.ps1 -SkipBuild`, which reads `fullchain.pfx` and its password from the ACME store and passes them to Bicep through a temporary secure parameter file. The PFX is not passed on the command line;
 4. checks that the live HTTPS certificate and `/healthz` endpoint are serving after the deployment.

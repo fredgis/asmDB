@@ -12,13 +12,15 @@ not require an account key.
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [string]$SubscriptionId = '<subscription-id>',
-    [string]$ResourceGroup = '<service-resource-group>',
+    [string]$SubscriptionId = '',
+    [string]$ResourceGroup = '',
     [string]$Location = 'swedencentral',
     [string]$EnvironmentName = 'asmdb-env',
     [string]$WritableStorageName = 'asmdb-data',
     [string]$ReadOnlyStorageName = 'asmdb-data-ro',
-    [string]$RegistryName = '<registry>',
+    # Container registry names are globally unique DNS labels, so this one
+    # names a specific environment and comes from deploy.env.
+    [string]$RegistryName = '',
     [string]$IdentityName = 'asmdb-mi',
     [string]$ContainerAppName = 'asmdb-cdc-gateway',
     [string]$ImageRepository = 'asmdb-cdc-gateway',
@@ -29,6 +31,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+. (Join-Path $RepoRoot 'scripts\deploy-env.ps1')
+$DeployEnv = Get-DeployEnv -Require @('ASMDB_SUBSCRIPTION_ID', 'ASMDB_RESOURCE_GROUP', 'ASMDB_ACR_NAME')
+if (-not $SubscriptionId) { $SubscriptionId = $DeployEnv['ASMDB_SUBSCRIPTION_ID'] }
+if (-not $ResourceGroup)  { $ResourceGroup = $DeployEnv['ASMDB_RESOURCE_GROUP'] }
+if (-not $RegistryName)   { $RegistryName = $DeployEnv['ASMDB_ACR_NAME'] }
 
 $GatewayRoot = Join-Path $RepoRoot 'workload\cdc-gateway'
 $ScratchRoot = Join-Path $PSScriptRoot '.gateway-deploy'

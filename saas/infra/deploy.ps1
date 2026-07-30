@@ -12,28 +12,41 @@ param(
 
     # Custom gateway hostname. Must already resolve by CNAME to the gateway
     # before it is passed: the managed certificate is only issued once that
-    # record is visible from the internet.
-    [string]$CustomDomain = 'www.asmdb.cloud',
+    # record is visible from the internet. Defaults to deploy.env.
+    [string]$CustomDomain = '',
 
     # Microsoft Entra ID objects backing the console sign-in. None of these are
     # secrets — the browser flow is authorization-code with PKCE, so there is no
-    # client secret to carry. They are parameters rather than literals so the
-    # platform can be deployed into another directory without a code change.
-    [string]$EntraTenantId = '<tenant-id>',
-    [string]$EntraClientId = '<console-app-id>',
-    [string]$EntraGroupId  = '<admin-group-id>'
+    # client secret to carry. They come from deploy.env rather than from
+    # literals here, so the platform can be deployed into another directory
+    # without a code change and so the repository names no one environment.
+    [string]$EntraTenantId = '',
+    [string]$EntraClientId = '',
+    [string]$EntraGroupId  = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$TenantId = '<tenant-id>'
-$SubscriptionId = '<subscription-id>'
-$ResourceGroup = '<service-resource-group>'
-$Location = 'swedencentral'
-$DeploymentName = 'asmdb-platform'
 $InfraDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = (Resolve-Path (Join-Path $InfraDir '..\..')).Path
+. (Join-Path $RepoRoot 'scripts\deploy-env.ps1')
+$DeployEnv = Get-DeployEnv -Require @(
+    'ASMDB_TENANT_ID', 'ASMDB_SUBSCRIPTION_ID', 'ASMDB_RESOURCE_GROUP',
+    'ASMDB_ENTRA_CLIENT_ID', 'ASMDB_ENTRA_GROUP_ID', 'ASMDB_CUSTOM_DOMAIN'
+)
+
+# An explicit parameter still wins; deploy.env only supplies what was not given.
+if (-not $CustomDomain)  { $CustomDomain  = $DeployEnv['ASMDB_CUSTOM_DOMAIN'] }
+if (-not $EntraTenantId) { $EntraTenantId = $DeployEnv['ASMDB_TENANT_ID'] }
+if (-not $EntraClientId) { $EntraClientId = $DeployEnv['ASMDB_ENTRA_CLIENT_ID'] }
+if (-not $EntraGroupId)  { $EntraGroupId  = $DeployEnv['ASMDB_ENTRA_GROUP_ID'] }
+
+$TenantId = $DeployEnv['ASMDB_TENANT_ID']
+$SubscriptionId = $DeployEnv['ASMDB_SUBSCRIPTION_ID']
+$ResourceGroup = $DeployEnv['ASMDB_RESOURCE_GROUP']
+$Location = if ($DeployEnv.ContainsKey('ASMDB_LOCATION') -and $DeployEnv['ASMDB_LOCATION']) { $DeployEnv['ASMDB_LOCATION'] } else { 'swedencentral' }
+$DeploymentName = 'asmdb-platform'
 $TemplateFile = Join-Path $InfraDir 'main.bicep'
 $InstanceDockerfile = Join-Path $RepoRoot 'saas\sidecar\Dockerfile'
 $ControlPlaneDockerfile = Join-Path $RepoRoot 'saas\controlplane\Dockerfile'
@@ -224,7 +237,7 @@ if ([string]::IsNullOrWhiteSpace($Tag)) {
 Write-Host ">> release tag: $Tag" -ForegroundColor Cyan
 
 $account = Invoke-AzJson @('account', 'show')
-if (-not $account) { throw 'Azure CLI is not logged in. Run az login --tenant <tenant-id> first.' }
+if (-not $account) { throw "Azure CLI is not logged in. Run az login --tenant $TenantId first." }
 if ($account.tenantId -ne $TenantId) {
     throw "Azure CLI is logged into tenant '$($account.tenantId)', expected '$TenantId'. Run az login --tenant $TenantId."
 }

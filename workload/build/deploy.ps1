@@ -13,8 +13,8 @@ param(
     [ValidateSet('all','validate','login','entra','infrastructure','build','backend','frontend','pack')]
     [string]$Only = 'all',
 
-    [string]$SubscriptionId = '<subscription-id>',
-    [string]$ResourceGroup = '<analytics-resource-group>',
+    [string]$SubscriptionId = '',
+    [string]$ResourceGroup = '',
     [string]$Location = 'swedencentral',
     # Static Web Apps is not offered in every region: at the time of writing it
     # is limited to centralus, eastus2, westus2, westeurope and eastasia, so it
@@ -25,14 +25,14 @@ param(
     # gateway must mount the same Azure Files share the instances write to, so
     # it cannot move to the analytics group. Only the subnet below is created
     # here; nothing existing in the service group is modified.
-    [string]$ServiceResourceGroup = '<service-resource-group>',
+    [string]$ServiceResourceGroup = '',
     [string]$ServiceVNet = 'asmdb-vnet',
     [string]$BackendSubnet = 'snet-appsvc',
     [string]$BackendSubnetPrefix = '10.20.6.0/24',
     [string]$AppServicePlan = 'plan-asmdb-analytical',
     [string]$BackendAppName = 'asmdb-analytical-backend',
     [string]$StaticWebAppName = 'asmdb-analytical-frontend',
-    [string]$CustomDomain = 'fe.asmdb.cloud',
+    [string]$CustomDomain = '',
     [string]$EntraAppName = 'asmDB Analytical Capabilities',
     [string]$TenantId = '',
     [string]$AppId = '',
@@ -45,6 +45,20 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+. (Join-Path $RepoRoot 'scripts\deploy-env.ps1')
+$DeployEnv = Get-DeployEnv -Require @('ASMDB_SUBSCRIPTION_ID', 'ASMDB_WORKLOAD_RESOURCE_GROUP', 'ASMDB_RESOURCE_GROUP', 'ASMDB_WORKLOAD_DOMAIN')
+
+# Explicit parameters win; deploy.env fills in what identifies the environment.
+if (-not $SubscriptionId)       { $SubscriptionId = $DeployEnv['ASMDB_SUBSCRIPTION_ID'] }
+if (-not $ResourceGroup)        { $ResourceGroup = $DeployEnv['ASMDB_WORKLOAD_RESOURCE_GROUP'] }
+if (-not $ServiceResourceGroup) { $ServiceResourceGroup = $DeployEnv['ASMDB_RESOURCE_GROUP'] }
+# The frontend must be exactly one label beyond the verified domain: Fabric
+# strips the first label and requires the remainder to be a verified domain.
+if (-not $CustomDomain)         { $CustomDomain = "fe.$($DeployEnv['ASMDB_WORKLOAD_DOMAIN'])" }
+if (-not $TenantId -and $DeployEnv.ContainsKey('ASMDB_TENANT_ID')) { $TenantId = $DeployEnv['ASMDB_TENANT_ID'] }
+if (-not $AppId -and $DeployEnv.ContainsKey('ASMDB_WORKLOAD_APP_ID')) { $AppId = $DeployEnv['ASMDB_WORKLOAD_APP_ID'] }
+
 $AllowedManifestAssetExtensions = @('.png', '.jpg', '.jpeg')
 $MaxManifestAssetBytes = 1572864
 $PowerBiServiceAppId = '00000009-0000-0000-c000-000000000000'

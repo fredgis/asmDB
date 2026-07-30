@@ -6,13 +6,13 @@
       <CloudServiceConfiguration>
         <Cloud>Public</Cloud>
         <AADFEApp>
-          <AppId><workload-app-id></AppId>
+          <AppId>00000000-0000-0000-0000-000000000000</AppId>
         </AADFEApp>
         <EnableSandboxRelaxation>false</EnableSandboxRelaxation>
         <Endpoints>
           <ServiceEndpoint>
             <Name>Frontend</Name>
-            <Url>https://fe.asmdb.cloud</Url>
+            <Url>https://REPLACE-ME-asmdb-analytical.example.com</Url>
             <IsEndpointResolutionService>false</IsEndpointResolutionService>
           </ServiceEndpoint>
         </Endpoints>

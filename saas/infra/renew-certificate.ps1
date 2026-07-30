@@ -1,5 +1,5 @@
 param(
-    [string]$CustomDomain = 'www.asmdb.cloud',
+    [string]$CustomDomain = '',
     [int]$RenewBeforeDays = 30,
     [switch]$Force,
     [string]$Tag = '',
@@ -12,10 +12,15 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$TenantId = '<tenant-id>'
-$SubscriptionId = '<subscription-id>'
-$ResourceGroup = '<service-resource-group>'
 $InfraDir = Split-Path -Parent $PSCommandPath
+$RepoRoot = (Resolve-Path (Join-Path $InfraDir '..\..')).Path
+. (Join-Path $RepoRoot 'scripts\deploy-env.ps1')
+$DeployEnv = Get-DeployEnv -Require @('ASMDB_TENANT_ID', 'ASMDB_SUBSCRIPTION_ID', 'ASMDB_RESOURCE_GROUP', 'ASMDB_CUSTOM_DOMAIN')
+
+if (-not $CustomDomain) { $CustomDomain = $DeployEnv['ASMDB_CUSTOM_DOMAIN'] }
+$TenantId = $DeployEnv['ASMDB_TENANT_ID']
+$SubscriptionId = $DeployEnv['ASMDB_SUBSCRIPTION_ID']
+$ResourceGroup = $DeployEnv['ASMDB_RESOURCE_GROUP']
 $DeployScript = Join-Path $InfraDir 'deploy.ps1'
 
 function Require-Command([string]$Name, [string]$InstallHint) {
