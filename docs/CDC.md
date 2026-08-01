@@ -1,4 +1,12 @@
-# asmdb — change data capture (`<db>.cdc`)
+<div align="center">
+  <img src="assets/asmdb-logo.png" alt="asmdb logo" width="110">
+
+  <h1>asmdb — change data capture (<code>&lt;db&gt;.cdc</code>)</h1>
+
+  <p><em>The change-log format, and how a consumer follows it without losing a row.</em></p>
+</div>
+
+---
 
 Every committed transaction that changes something appends **one frame** to a
 durable, append-only log next to the database. A separate process can read that

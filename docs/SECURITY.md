@@ -1,4 +1,12 @@
-# Security policy and threat model
+<div align="center">
+  <img src="assets/asmdb-logo.png" alt="asmdb logo" width="110">
+
+  <h1>Security policy and threat model</h1>
+
+  <p><em>The posture as it stands today, including the gaps, stated rather than implied.</em></p>
+</div>
+
+---
 
 This document describes the security posture asmdb has today. It is not a
 claim of hardening.

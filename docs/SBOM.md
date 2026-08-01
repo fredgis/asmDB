@@ -1,4 +1,12 @@
-# Software Bill of Materials
+<div align="center">
+  <img src="assets/asmdb-logo.png" alt="asmdb logo" width="110">
+
+  <h1>Software Bill of Materials</h1>
+
+  <p><em>What this repository depends on, and what it deliberately does not.</em></p>
+</div>
+
+---
 
 This repository tracks two different dependency stories:
 

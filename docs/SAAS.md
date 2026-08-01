@@ -1,4 +1,12 @@
-# asmdb Cloud — deployed service notes
+<div align="center">
+  <img src="assets/asmdb-logo.png" alt="asmdb logo" width="110">
+
+  <h1>asmdb Cloud — deployed service notes</h1>
+
+  <p><em>The hosted platform as deployed: resources, request paths, identity, instance lifecycle.</em></p>
+</div>
+
+---
 
 > This document describes the asmdb Cloud platform that exists today: the Azure
 > resources, request paths, authentication model, instance lifecycle and the

@@ -1,4 +1,12 @@
-# asmdb Cloud — cost model and pricing
+<div align="center">
+  <img src="assets/asmdb-logo.png" alt="asmdb logo" width="110">
+
+  <h1>asmdb Cloud — cost model and pricing</h1>
+
+  <p><em>Every Azure rate, the arithmetic behind each price, and the ways the model breaks.</em></p>
+</div>
+
+---
 
 Every rate here was read from the **Azure Retail Prices API** on **2026-07-25**
 for **swedencentral**, in **USD**. Nothing is estimated from memory. The query

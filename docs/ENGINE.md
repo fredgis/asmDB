@@ -1,4 +1,12 @@
-# asmdb — Engine Specification
+<div align="center">
+  <img src="assets/asmdb-logo.png" alt="asmdb logo" width="110">
+
+  <h1>asmdb — Engine Specification</h1>
+
+  <p><em>The byte-level reference: layouts, calling convention, hashing, durability, ACID.</em></p>
+</div>
+
+---
 
 <p align="center">
   <img src="assets/asmdb-core-engine.png" alt="asmdb core engine" width="90%">

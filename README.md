@@ -207,10 +207,50 @@ The architecture and the honest list of what Fabric does and does not support ar
 the Entra domain prerequisites and their lead times, is in
 [`workload/docs/INSTALL.md`](workload/docs/INSTALL.md).
 
+## Multi-tenancy
+
+> **Design, not deployment.** The hosted platform is single-tenant today. This
+> section describes the shape it would take to serve many customers, argued on
+> paper before any migration starts.
+
+One question decides everything else: **is a customer's isolation enforced by
+code, or by the platform?** Tagging rows with a customer id and filtering every
+query is cheap and is the industry default. It also means one missing `WHERE`
+clause is a cross-customer breach, and review does not make that risk zero.
+
+asmdb takes the other answer. A customer's databases sit in resources another
+customer's identity has **no network path to** — not "is not permitted to
+reach". A bug in our code cannot cross that boundary, because the boundary is not
+made of our code.
+
+The line to remember: **share the things that compute, isolate the things that
+remember.**
+
+| Shared | Per customer |
+|---|---|
+| Control plane, container registry, APIM, Front Door | Resource group, VNet, **Container Apps environment**, Key Vault, Azure Files share, CDC gateway |
+
+The Container Apps environment is the load-bearing one. A private endpoint
+targets the **environment**, not the app, so two customers sharing one would
+share every approved endpoint — and the isolation would be code again. That
+costs roughly €80–110 per customer per month before a single database runs,
+which is a pricing floor rather than a technical problem.
+
+On the Fabric side the workload runs in the **customer's own tenant**. Their
+Spark notebooks reach their CDC gateway through a Private Link Service we
+publish and a managed private endpoint **we approve** — deliberately by hand,
+because that approval is the moment we consent to a cross-tenant network path.
+A private endpoint belongs to exactly one tenant, so this is a permanent
+per-customer onboarding step with no way to mutualise it.
+
+The full design, the cost table, the twelve onboarding steps and the open
+questions are in [`docs/MULTITENANCY.md`](docs/MULTITENANCY.md).
+
 ## Table of contents
 
 - [asmdb Cloud](#asmdb-cloud) — hosted asmdb instances, API surfaces and service design
 - [asmDB Analytical Capabilities](#asmdb-analytical-capabilities--a-fabric-workload) — Microsoft Fabric workload
+- [Multi-tenancy](#multi-tenancy) — one control plane, many customers, platform-enforced isolation
 - [What fits, and what is enforced](#what-fits-and-what-is-enforced) — capacity, schema and hard limits
 - [Why it's interesting](#why-its-interesting)
 - [Quickstart](#quickstart)
@@ -230,6 +270,7 @@ the Entra domain prerequisites and their lead times, is in
 - [Changelog](#changelog) — what changed, newest first
 - [Upgrading a database](#upgrading-a-database) — `--upgrade` between engine versions
 - [Project layout](#project-layout)
+- [Document dictionary](#document-dictionary) — which document answers which question
 
 ## Why it's interesting
 
@@ -1972,6 +2013,31 @@ asmdb/
 
 See [`docs/ENGINE.md`](docs/ENGINE.md) for the full engine specification and
 roadmap, and [`docs/SAAS.md`](docs/SAAS.md) for the SaaS productization plan.
+
+## Document dictionary
+
+Nine documents in [`docs/`](docs/), plus the workload runbook. Each answers a
+different question; this table exists so you can pick one instead of opening
+four.
+
+| Document | Answers | Read it when |
+|---|---|---|
+| [`ENGINE.md`](docs/ENGINE.md) | How the engine works, byte by byte: PE64 layout, calling convention, the record store, hashing, the two-phase commit, and why the ACID claim holds — letter by letter, with the assembly that provides each | You are changing the engine, or you do not believe the ACID claim |
+| [`COMMANDS.md`](docs/COMMANDS.md) | Every command, its exact syntax, its limits, its output and its errors — verified by running the binary | You are writing against the CLI or the TSV protocol |
+| [`CDC.md`](docs/CDC.md) | The change-log format: frames, sequences, CRC, `RESET`, retention, and the states a consumer can find the log in | You are writing something that follows the change log |
+| [`SAAS.md`](docs/SAAS.md) | The hosted platform as it is deployed: every Azure resource, request path, identity, and the instance lifecycle | You are operating asmdb Cloud or wondering why a request went where it did |
+| [`NETWORK.md`](docs/NETWORK.md) | The complete network topology — subnets, private endpoints, private DNS, what is public — today and in the multi-tenant design | You are tracing a packet, or planning isolation |
+| [`MULTITENANCY.md`](docs/MULTITENANCY.md) | How one control plane serves many customers, where isolation is enforced by the platform rather than by code, and what that costs | You are planning to serve a second customer |
+| [`WORKLOAD.md`](docs/WORKLOAD.md) | The Fabric workload: design, contracts, the Fabric behaviours that are not what the SDK suggests, and what was got wrong on the way | You are working on the workload, or debugging a sync |
+| [`INSTALL.md`](workload/docs/INSTALL.md) | The ordered installation runbook for the workload: every step, how to know it worked, and what failure looks like | You are installing the workload |
+| [`COST.md`](docs/COST.md) | Every Azure rate with its date, the arithmetic behind each published price, and the ways the model breaks | You are pricing something, or checking whether a tier pays for itself |
+| [`SECURITY.md`](docs/SECURITY.md) | The security posture as it stands, including the gaps, stated rather than implied | You are assessing the system, or you found something |
+| [`SBOM.md`](docs/SBOM.md) | What this repository depends on, and what it deliberately does not | You are auditing dependencies |
+
+Two conventions hold across all of them. **Built** means it exists in this
+repository and, where stated, is deployed; **Planned** means it does not exist
+yet. And where a rule prevents a specific disaster, the document names the
+disaster — that is what makes a rule memorable enough to obey.
 
 ## License
 

@@ -1,4 +1,12 @@
-# asmDB Analytical Capabilities — a Microsoft Fabric workload
+<div align="center">
+  <img src="assets/asmdb-logo.png" alt="asmdb logo" width="110">
+
+  <h1>asmDB Analytical Capabilities — a Microsoft Fabric workload</h1>
+
+  <p><em>The Fabric workload: design, contracts, and what was got wrong on the way.</em></p>
+</div>
+
+---
 
 > **Status: live workload, with remaining planned work called out explicitly.**
 > Convention in this document: **Built** means implemented in this repository and, where
