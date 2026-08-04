@@ -78,8 +78,8 @@
       <p class="stat__l">rows per second, inserted in RAM.<br>One workstation core, not a hosted tier.</p>
     </div>
     <div class="stat">
-      <p class="stat__n">43,741<span> B</span></p>
-      <p class="stat__l">the entire engine, PE64.<br>52,205 B as ELF64.</p>
+      <p class="stat__n">43,749<span> B</span></p>
+      <p class="stat__l">the entire engine, PE64.<br>52,221 B as ELF64.</p>
     </div>
     <div class="stat">
       <p class="stat__n">0</p>
@@ -268,7 +268,9 @@ ASMDB_DB=memory <span class="k">node</span> mcp/src/server.js</pre>
         the database directly — the instance API sends no CORS headers, so a
         browser refuses the call before it leaves. The container itself is never
         exposed; every request arrives through the gateway, which means the token
-        is the only thing standing between a caller and the data.
+        is the only thing standing between a caller and the data. The one
+        exception is this site's own console: it is an operator tool, so it does
+        hold the token in the browser for the session you opened.
       </p>
     </div>
 

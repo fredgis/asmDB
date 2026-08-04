@@ -6,7 +6,7 @@
 # is talking about. nasm -f bin emits the final image directly in both cases —
 # there is no linker involved, so cross-assembling the Windows PE64 on Linux is
 # not cross-compilation, it is just writing different bytes.
-FROM alpine:3.20 AS binaries
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS binaries
 RUN apk add --no-cache nasm
 WORKDIR /src
 COPY src/ src/
@@ -29,7 +29,7 @@ RUN set -eu; \
     printf '  ]\n}\n' >> /out/manifest.json; \
     cat /out/manifest.json
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.25-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS build
 WORKDIR /src
 
 # Dependencies first, as their own layer: the Azure SDK is by far the slowest
@@ -41,7 +41,7 @@ COPY saas/controlplane/*.go ./
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" -o /out/controlplane .
 
-FROM alpine:3.20
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 RUN addgroup -S asmdb && adduser -S -G asmdb asmdb
 WORKDIR /app
 COPY --from=build /out/controlplane /app/controlplane

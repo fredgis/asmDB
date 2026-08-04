@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -183,10 +186,11 @@ func (a *api) handleDatabases(w http.ResponseWriter, r *http.Request) {
 	case http.MethodOptions:
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodPost:
-		if !a.authorized(w, r) {
+		actor, ok := a.authorizedActor(w, r)
+		if !ok {
 			return
 		}
-		a.createDatabase(w, r)
+		a.createDatabase(w, r, actor)
 	case http.MethodGet:
 		if !a.authorized(w, r) {
 			return
@@ -239,21 +243,22 @@ func (a *api) handleDatabase(w http.ResponseWriter, r *http.Request) {
 		}
 		a.getDatabase(w, r, id)
 	case http.MethodDelete:
-		if !a.authorized(w, r) {
+		actor, ok := a.authorizedActor(w, r)
+		if !ok {
 			return
 		}
-		a.deleteDatabase(w, r, id)
+		a.deleteDatabase(w, r, id, actor)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
 	}
 }
 
-func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
+func (a *api) createDatabase(w http.ResponseWriter, r *http.Request, actor string) {
 	defer r.Body.Close()
 
 	var req createDatabaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body", err.Error())
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body", internalDetail(err))
 		return
 	}
 	if !validName(req.Name) {
@@ -268,7 +273,7 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 
 	instances, err := a.store.List(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "list metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "list metadata", internalDetail(err))
 		return
 	}
 	count := 0
@@ -284,12 +289,12 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 
 	id, err := generateInstanceID()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "generate instance id", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "generate instance id", internalDetail(err))
 		return
 	}
 	token, err := generateAccessToken()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "generate access token", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "generate access token", internalDetail(err))
 		return
 	}
 
@@ -307,15 +312,17 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 
 	endpoint, err := a.provisioner.Create(r.Context(), in, token)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "create container app", err.Error())
+		a.audit(actor, "create", in.ID, "failed")
+		writeError(w, http.StatusInternalServerError, "internal", "create container app", internalDetail(err))
 		return
 	}
 	if err := a.store.Save(r.Context(), in); err != nil {
 		_ = a.provisioner.Delete(context.Background(), in)
-		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "save metadata", internalDetail(err))
 		return
 	}
 
+	a.audit(actor, "create", in.ID, "ok")
 	writeJSON(w, http.StatusCreated, databaseResponse{
 		ID:        in.ID,
 		Name:      in.Name,
@@ -332,7 +339,7 @@ func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
 func (a *api) listDatabases(w http.ResponseWriter, r *http.Request) {
 	instances, err := a.store.List(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "list metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "list metadata", internalDetail(err))
 		return
 	}
 	responses := make([]databaseResponse, 0, len(instances))
@@ -356,30 +363,34 @@ func (a *api) getDatabase(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", internalDetail(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, a.responseFor(r.Context(), in))
 }
 
-func (a *api) deleteDatabase(w http.ResponseWriter, r *http.Request, id string) {
+func (a *api) deleteDatabase(w http.ResponseWriter, r *http.Request, id string, actor string) {
 	in, err := a.store.Get(r.Context(), id)
 	if err == nil {
 		if err := a.provisioner.Delete(r.Context(), in); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal", "delete container app", err.Error())
+			a.audit(actor, "delete", id, "failed")
+			writeError(w, http.StatusInternalServerError, "internal", "delete container app", internalDetail(err))
 			return
 		}
 		_ = a.store.Delete(r.Context(), id)
 	} else if !errors.Is(err, errNotFound) {
-		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		a.audit(actor, "delete", id, "failed")
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", internalDetail(err))
 		return
 	} else {
 		in = instance{ID: id, ContainerAppName: containerAppName(id)}
 		if err := a.provisioner.Delete(r.Context(), in); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal", "delete container app", err.Error())
+			a.audit(actor, "delete", id, "failed")
+			writeError(w, http.StatusInternalServerError, "internal", "delete container app", internalDetail(err))
 			return
 		}
 	}
+	a.audit(actor, "delete", id, "ok")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -396,7 +407,8 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
 		return
 	}
-	if !a.authorized(w, r) {
+	actor, ok := a.authorizedActor(w, r)
+	if !ok {
 		return
 	}
 
@@ -406,7 +418,7 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", internalDetail(err))
 		return
 	}
 	in = a.expireStaleOperation(context.Background(), in)
@@ -414,7 +426,7 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 		if in.Operation.Type == "rotate-token" && in.Operation.State == "pending_ack" && in.Operation.PendingTokenEncrypted != "" {
 			token, err := decryptRotationToken(a.cfg.PlatformSecret, in.ID, in.Operation.PendingTokenEncrypted)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "internal", "recover pending token", err.Error())
+				writeError(w, http.StatusInternalServerError, "internal", "recover pending token", internalDetail(err))
 				return
 			}
 			writeJSON(w, http.StatusAccepted, map[string]any{
@@ -430,12 +442,12 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 
 	token, err := generateAccessToken()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "generate access token", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "generate access token", internalDetail(err))
 		return
 	}
 	encrypted, err := encryptRotationToken(a.cfg.PlatformSecret, in.ID, token)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "encrypt pending token", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "encrypt pending token", internalDetail(err))
 		return
 	}
 
@@ -453,9 +465,10 @@ func (a *api) handleRotateToken(w http.ResponseWriter, r *http.Request, id strin
 	// lived copy so a client that times out can retry prepare and recover it.
 	// Only /rotate-token/commit applies the token hash or app secret.
 	if err := a.store.Save(context.Background(), in); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "save metadata", internalDetail(err))
 		return
 	}
+	a.audit(actor, "rotate-token-prepare", in.ID, "ok")
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"operation": operationForResponse(in.Operation),
 		"token":     token,
@@ -476,7 +489,8 @@ func (a *api) handleRotateTokenCommit(w http.ResponseWriter, r *http.Request, id
 		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
 		return
 	}
-	if !a.authorized(w, r) {
+	actor, ok := a.authorizedActor(w, r)
+	if !ok {
 		return
 	}
 
@@ -486,7 +500,7 @@ func (a *api) handleRotateTokenCommit(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", internalDetail(err))
 		return
 	}
 	in = a.expireStaleOperation(context.Background(), in)
@@ -496,15 +510,16 @@ func (a *api) handleRotateTokenCommit(w http.ResponseWriter, r *http.Request, id
 	}
 	token, err := decryptRotationToken(a.cfg.PlatformSecret, in.ID, in.Operation.PendingTokenEncrypted)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "recover pending token", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "recover pending token", internalDetail(err))
 		return
 	}
 	in.Operation.State = "stopping"
 	in.Operation.UpdatedAt = a.now()
 	if err := a.store.Save(context.Background(), in); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "save metadata", internalDetail(err))
 		return
 	}
+	a.audit(actor, "rotate-token-commit", in.ID, "ok")
 	go a.runRotateToken(in, token)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"operation": operationForResponse(in.Operation),
@@ -551,7 +566,7 @@ func (a *api) handleStats(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", internalDetail(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, a.fetchStats(r.Context(), in))
@@ -570,7 +585,8 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, http.StatusNotFound, "not_found", "route not found", "")
 		return
 	}
-	if !a.authorized(w, r) {
+	actor, ok := a.authorizedActor(w, r)
+	if !ok {
 		return
 	}
 
@@ -580,7 +596,7 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", internalDetail(err))
 		return
 	}
 	in = a.expireStaleOperation(context.Background(), in)
@@ -599,10 +615,11 @@ func (a *api) handleUpgrade(w http.ResponseWriter, r *http.Request, id string) {
 	now := a.now()
 	in.Operation = &operation{Type: "upgrade", State: "preparing_backup", StartedAt: now, UpdatedAt: now}
 	if err := a.store.Save(context.Background(), in); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "save metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "save metadata", internalDetail(err))
 		return
 	}
 	res := a.responseFor(r.Context(), in)
+	a.audit(actor, "upgrade", in.ID, "ok")
 	go a.runUpgrade(in)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"database":  res,
@@ -658,7 +675,7 @@ func (a *api) handleWake(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", internalDetail(err))
 		return
 	}
 	state, err := a.provisioner.GetState(r.Context(), in)
@@ -718,7 +735,7 @@ func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "read metadata", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "read metadata", internalDetail(err))
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(tokenHash(token)), []byte(in.TokenHash)) != 1 {
@@ -728,12 +745,12 @@ func (a *api) handleExec(w http.ResponseWriter, r *http.Request, id string) {
 
 	var req execRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body", err.Error())
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body", internalDetail(err))
 		return
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "marshal exec request", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal", "marshal exec request", internalDetail(err))
 		return
 	}
 
@@ -771,7 +788,7 @@ func (a *api) execOnce(ctx context.Context, in instance, token string, body []by
 		if isTimeoutError(err) {
 			return execResponse{}, false, http.StatusGatewayTimeout, "gateway_timeout", "instance timed out", ""
 		}
-		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance unreachable", summarizeError(err)
+		return execResponse{}, false, http.StatusBadGateway, "bad_gateway", "instance unreachable", internalDetail(err)
 	}
 	defer resp.Body.Close()
 	data, err := readAllLimited(resp.Body, maxUpstreamBodyBytes, "instance exec")
@@ -1151,21 +1168,40 @@ func engineSourceForInstance(in instance) string {
 }
 
 func (a *api) authorized(w http.ResponseWriter, r *http.Request) bool {
+	_, ok := a.authorizedActor(w, r)
+	return ok
+}
+
+// authorizedActor is authorized() plus the identity of the caller, for routes
+// that change or destroy something and therefore have to be attributable.
+func (a *api) authorizedActor(w http.ResponseWriter, r *http.Request) (string, bool) {
 	token, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok || a.verifier == nil || a.cfg.EntraGroupID == "" {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
-		return false
+		return "", false
 	}
 	claims, err := a.verifier.Verify(r.Context(), token)
 	if err != nil || !containsString(claims.Scopes, entraScopeName) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token", "")
-		return false
+		return "", false
 	}
 	if !containsString(claims.Groups, a.cfg.EntraGroupID) {
 		writeError(w, http.StatusForbidden, "forbidden", "required group membership missing", "")
-		return false
+		return "", false
 	}
-	return true
+	return claims.Subject, true
+}
+
+// audit records who did what to which database. It never receives a token: the
+// point is attribution, and a log line is a place secrets end up by accident.
+func (a *api) audit(actor, action, id, result string) {
+	if actor == "" {
+		actor = "unknown"
+	}
+	if id == "" {
+		id = "-"
+	}
+	log.Printf("audit actor=%s action=%s database=%s result=%s", actor, action, id, result)
 }
 
 func (a *api) withCORS(next http.HandlerFunc) http.HandlerFunc {
@@ -1223,11 +1259,23 @@ func summarizeContentType(contentType string) string {
 	return "Content-Type: " + contentType
 }
 
-func summarizeError(err error) string {
+// internalDetail keeps the operator's diagnostic and hands the caller only a
+// reference to it. ARM errors carry the subscription id, the resource group and
+// Azure correlation ids, and execOnce's error carries the instance's internal
+// Container Apps FQDN — which a caller holding only a database token could read,
+// so internal topology crossed the control-plane/data-plane boundary.
+func internalDetail(err error) string {
 	if err == nil {
 		return ""
 	}
-	return err.Error()
+	var raw [8]byte
+	if _, rerr := rand.Read(raw[:]); rerr != nil {
+		log.Printf("error ref=unavailable detail=%v", err)
+		return "see server logs"
+	}
+	ref := hex.EncodeToString(raw[:])
+	log.Printf("error ref=%s detail=%v", ref, err)
+	return "reference " + ref
 }
 
 func sameOrigin(origin, host string) bool {

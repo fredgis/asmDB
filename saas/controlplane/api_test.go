@@ -223,7 +223,7 @@ func TestCreateDatabaseAndTokenOnlyOnce(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases", bytes.NewBufferString(`{"name":"my-notes","tier":"free"}`))
-	api.createDatabase(rec, req)
+	api.createDatabase(rec, req, "test-actor")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
@@ -268,7 +268,7 @@ func TestQuotaEnforcement(t *testing.T) {
 	api := newTestAPI(store, &fakeProvisioner{states: map[string]liveState{}})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/databases", bytes.NewBufferString(`{"name":"another","tier":"free"}`))
-	api.createDatabase(rec, req)
+	api.createDatabase(rec, req, "test-actor")
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}

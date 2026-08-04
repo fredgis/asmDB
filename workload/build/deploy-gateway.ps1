@@ -138,6 +138,19 @@ try {
     Invoke-Az @('account','set') 'Select Azure subscription' -SkipWhenWhatIf
 
     $env = Get-AzJson @('containerapp','env','show','--resource-group',$ResourceGroup,'--name',$EnvironmentName) "Read Container Apps environment $EnvironmentName"
+
+    # The gateway reads every database's change log off the share, and its only
+    # credential is one static bearer shared by every consumer. `external = $true`
+    # below means "VNet-internal" ONLY because the environment carries
+    # vnetConfiguration.internal — on a public environment the same request
+    # publishes the gateway on a resolvable *.azurecontainerapps.io name. The
+    # invariant was documented (WORKLOAD.md §2) and never checked, so a restored
+    # environment or a mistyped -EnvironmentName was one re-run away from putting
+    # it on the internet. Fail closed instead.
+    if ($true -ne $env.properties.vnetConfiguration.internal) {
+        throw "Container Apps environment '$EnvironmentName' is not internal (vnetConfiguration.internal is not true). The CDC gateway must not be published from a public environment; refusing to deploy."
+    }
+
     $registry = Get-AzJson @('acr','show','--resource-group',$ResourceGroup,'--name',$RegistryName) "Read ACR $RegistryName"
     $identity = Get-AzJson @('identity','show','--resource-group',$ResourceGroup,'--name',$IdentityName) "Read managed identity $IdentityName"
     $writableStorage = Get-AzJson @('containerapp','env','storage','show','--resource-group',$ResourceGroup,'--name',$EnvironmentName,'--storage-name',$WritableStorageName) "Read existing storage $WritableStorageName"

@@ -34,3 +34,13 @@ docs/assets
 *.exe
 *.pdb
 *.log
+
+# Local credentials. Neither image copies these, so nothing has ever reached a
+# published layer — but the build context itself is uploaded to ACR and retained,
+# and .gitignore already anticipates a .env holding an Entra client secret at
+# exactly this path. Excluding them here means creating that file cannot quietly
+# ship it to the registry on the next deploy.
+.env
+.env.*
+!.env.example
+deploy.env

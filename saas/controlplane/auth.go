@@ -13,6 +13,11 @@ const entraScopeName = "console.access"
 type verifiedAccessToken struct {
 	Groups []string
 	Scopes []string
+	// Subject identifies the human behind the call: the Entra object id, or
+	// `sub` where no `oid` is present. Nothing used to read it, which meant a
+	// delete or a token rotation could not be attributed to anyone after the
+	// fact — the Azure Activity Log only ever sees the shared managed identity.
+	Subject string
 }
 
 type accessTokenVerifier interface {
@@ -45,13 +50,20 @@ func (v *oidcAccessTokenVerifier) Verify(ctx context.Context, raw string) (verif
 	var claims struct {
 		Groups []string `json:"groups"`
 		Scope  string   `json:"scp"`
+		OID    string   `json:"oid"`
+		Sub    string   `json:"sub"`
 	}
 	if err := token.Claims(&claims); err != nil {
 		return verifiedAccessToken{}, err
 	}
+	subject := claims.OID
+	if subject == "" {
+		subject = claims.Sub
+	}
 	return verifiedAccessToken{
-		Groups: claims.Groups,
-		Scopes: strings.Fields(claims.Scope),
+		Groups:  claims.Groups,
+		Scopes:  strings.Fields(claims.Scope),
+		Subject: subject,
 	}, nil
 }
 

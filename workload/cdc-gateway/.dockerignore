@@ -1,3 +1,10 @@
 cdc-gateway.exe
 *.test
 .git
+
+# Local credentials. This context is Go-only and nothing copies them, but the
+# context is uploaded and retained, so keep the exclusion consistent with the
+# repository-root .dockerignore.
+.env
+.env.*
+!.env.example

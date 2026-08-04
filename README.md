@@ -7,8 +7,8 @@
     <strong>A minimalist, transactional CRUD database engine, hand-written in<br>
     x86-64 assembly — with a Model Context Protocol server as its interface.</strong><br>
     No linker. No C runtime. No dependencies. Runs natively on Windows (PE64)
-    <strong>and</strong> Linux (ELF64). The 1.7.0 PE64 build is 43,741 bytes;
-    the 1.7.0 ELF64 build is 52,205 bytes. And it is genuinely fast.
+    <strong>and</strong> Linux (ELF64). The 1.7.0 PE64 build is 43,749 bytes;
+    the 1.7.0 ELF64 build is 52,221 bytes. And it is genuinely fast.
   </p>
 
   <img src="docs/assets/asmdb-banner.png" alt="asmdb — a transactional database engine in x86-64 assembly" width="100%">
@@ -348,8 +348,8 @@ flowchart TD
     SRC --> WIN["os_win.inc<br/>Win64 ABI · kernel32 thunks"]:::win
     SRC --> LIN["os_linux.inc<br/>raw syscalls · no libc"]:::lin
 
-    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 43,741 bytes</b>"]:::win
-    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · 52,205 bytes</b>"]:::lin
+    WIN --> PE["nasm -f bin ⇒ PE64<br/><b>asmdb.exe · 43,749 bytes</b>"]:::win
+    LIN --> ELF["nasm -f bin ⇒ ELF64<br/><b>asmdb · 52,221 bytes</b>"]:::lin
 
     PE --> WOS(["Windows x64"]):::winb
     ELF --> LOS(["Linux x86-64"]):::linb
@@ -567,7 +567,7 @@ flowchart LR
 
 ### The deep dive
 
-How a 43,741-byte PE64 and a 52,205-byte ELF64 become a durable database.
+How a 43,749-byte PE64 and a 52,221-byte ELF64 become a durable database.
 
 #### The executable — no linker, no CRT
 
@@ -580,8 +580,8 @@ On **Linux** there is no import table at all: a hand-assembled ELF64 header maps
 single RWX `PT_LOAD` segment and the code issues raw `syscall`s, so the binary
 depends on nothing but the kernel. Code, data and imports share a single section;
 the 1 GiB record store is **mapped copy-on-write from the `.dat`** at runtime,
-which is why the PE64 binary is 43,741 bytes at 1.7.0 and the 1.7.0
-ELF64 binary is 52,205 bytes — and why a million-row database needs only a few
+which is why the PE64 binary is 43,749 bytes at 1.7.0 and the 1.7.0
+ELF64 binary is 52,221 bytes — and why a million-row database needs only a few
 MB of RAM.
 
 #### The record store — four cache lines per row

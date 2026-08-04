@@ -398,7 +398,18 @@ print_detail:
     lea  rdx, [rel c_grey]
     call puts_col
     lea  rcx, [rbx+REC_CONTENT]
+    ; clen is a u32 read straight off the record, and nothing validates it when
+    ; records arrive from .dat, from WAL redo, or from RESTORE — only cmd_verify
+    ; ever checks it, and only on demand. putn writes exactly the length it is
+    ; given, so an oversized clen here reads past the 176-byte content field and
+    ; emits adjacent memory to whoever issued SELECT <id>. This is the only putn
+    ; call site in the engine whose length comes from record data. Clamp it: a
+    ; well-formed record is always <= CONTENT_MAX, so nothing valid changes.
     mov  edx, dword [rbx+REC_CLEN]
+    cmp  edx, CONTENT_MAX
+    jbe  .clen_ok
+    mov  edx, CONTENT_MAX
+.clen_ok:
     call putn
     call crlf
     call crlf

@@ -176,8 +176,23 @@ https://www.asmdb.cloud/db/<instance>/health
 ```
 
 The instance API deliberately has no CORS policy. A browser calling an instance
-directly would put the instance bearer token in front-end code. The browser
-terminal goes through the control plane instead.
+directly would put the instance bearer token in front-end code, so a customer's
+web application should call asmdb from its server and let the browser talk only
+to that backend.
+
+The browser terminal in the console is a first-party exception to that advice,
+and it is worth stating plainly rather than leaving implied. Routing it through
+the control plane changes which host receives the token; it does not keep the
+token out of the browser. The console reads the instance token when a database
+is opened, keeps it in `sessionStorage`, and sends it as a bearer to
+`/api/v1/databases/{id}/exec`. A "reveal for 10s" control renders it into the
+DOM on request. So anything with script execution on this origin can read it.
+
+That is a deliberate trade for an operator tool, not a property the design
+guarantees. The invariant that does hold is the narrower one: the instance API
+is unreachable from a browser on any other origin, because it sends no CORS
+headers. Making the broader claim true would mean authenticating `/exec` with
+the Entra token and resolving the instance token server-side.
 
 The published endpoints are HTTPS. APIM forwards to HTTPS backends, and
 Container Apps ingress defaults to redirecting HTTP to HTTPS because

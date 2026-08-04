@@ -117,9 +117,9 @@ backend (`os_linux.inc`); without it, `main.asm` emits the PE64 and includes
   This is what makes a hand-written import table tractable — every thunk
   references its target by RVA, which is just its offset.
 - **Image base** is `0x400000`; `RVA(x)` in the source is simply `x - IMAGEBASE`.
-- The result is a single self-contained **43,741-byte PE64** at 1.7.0 whose only
+- The result is a single self-contained **43,749-byte PE64** at 1.7.0 whose only
   dependency is `kernel32.dll` (`nasm -f bin -i src\ src\main.asm`; the Linux
-  ELF64 from the same source is 52,205 bytes). The configured record region is
+  ELF64 from the same source is 52,221 bytes). The configured record region is
   **not** in the exe — it is a copy-on-write mapping of the `.dat` established at
   startup (§6.1), not a `VirtualAlloc` block.
 

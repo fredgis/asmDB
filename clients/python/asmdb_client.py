@@ -40,13 +40,55 @@ def default_exe() -> str:
     return str(Path(__file__).resolve().parents[2] / "build" / name)
 
 
+# The engine reads one command per line, so a newline inside an argument is not
+# data — it is a second command. Every other component that builds this protocol
+# already refuses control characters (saas/sidecar/http.go, saas/sidecar/mcp.go,
+# mcp/src/server.js); this client did not, which made
+# `db.find(request.args["q"])` a way to smuggle TRUNCATE or BACKUP.
+_FORBIDDEN = {"\r": "carriage return", "\n": "newline", "\x00": "NUL"}
+
+CONTENT_MAX = 175
+TAG_MAX = 39
+
+
+def _check_line(value: str, what: str) -> str:
+    """Reject anything that would end the current command line."""
+    if not isinstance(value, str):
+        raise TypeError(f"{what} must be a string, got {type(value).__name__}")
+    for ch, name in _FORBIDDEN.items():
+        if ch in value:
+            raise ValueError(
+                f"{what} may not contain a {name}: the engine reads one command "
+                f"per line, so this would inject a second command"
+            )
+    return value
+
+
+def _check_field(value: str, what: str, limit: int) -> str:
+    """Reject control characters and anything the engine would refuse to store."""
+    _check_line(value, what)
+    encoded = value.encode("utf-8")
+    if len(encoded) > limit:
+        raise ValueError(
+            f"{what} is {len(encoded)} bytes; the engine stores at most {limit}"
+        )
+    return value
+
+
 class Asmdb:
     def __init__(self, database: str, table: str | None = None,
                  exe: str | None = None) -> None:
         self.argv = [exe or default_exe(), database] + ([table] if table else [])
 
     def run(self, *commands: str) -> str:
-        """Send one or more commands, then QUIT. Returns raw stdout."""
+        """Send one or more commands, then QUIT. Returns raw stdout.
+
+        Each argument is one command. Commands are joined with newlines, so a
+        newline inside one of them would silently become an extra command; that
+        is refused here rather than sent.
+        """
+        for command in commands:
+            _check_line(command, "command")
         script = "\n".join(commands) + "\nQUIT\n"
         proc = subprocess.run(
             self.argv, input=script, capture_output=True, text=True, check=True
@@ -58,6 +100,8 @@ class Asmdb:
         return parse_tsv_rows(self.run("FORMAT TSV", f"PAGE {limit} {offset}", "SELECT *"))
 
     def find(self, substring: str, limit: int = 0, offset: int = 0) -> List[Row]:
+        """Search stored rows. `substring` is untrusted input by assumption."""
+        _check_field(substring, "search term", CONTENT_MAX)
         return parse_tsv_rows(
             self.run("FORMAT TSV", f"PAGE {limit} {offset}", f"FIND {substring}")
         )

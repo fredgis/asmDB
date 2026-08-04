@@ -105,9 +105,26 @@ function Test-LiveCertificate([string]$Domain, [datetime]$ExpectedNotAfter) {
     $client = [Net.Sockets.TcpClient]::new()
     try {
         $client.Connect($Domain, 443)
-        $ssl = [Net.Security.SslStream]::new($client.GetStream(), $false, { $true })
+        # This is the gate that proves the renewed certificate actually went
+        # live. It used to pass a callback returning $true unconditionally, so
+        # any self-signed certificate with a distant expiry satisfied it — the
+        # one check that verifies the renewal succeeded could be satisfied
+        # without the renewal having succeeded. Capture the policy errors and
+        # fail on them instead.
+        $policyErrors = [Net.Security.SslPolicyErrors]::None
+        $validate = {
+            param($senderObject, $certificate, $chain, $sslPolicyErrors)
+            $script:lastSslPolicyErrors = $sslPolicyErrors
+            return $true
+        }
+        $ssl = [Net.Security.SslStream]::new($client.GetStream(), $false, $validate)
         try {
+            $script:lastSslPolicyErrors = [Net.Security.SslPolicyErrors]::None
             $ssl.AuthenticateAsClient($Domain)
+            $policyErrors = $script:lastSslPolicyErrors
+            if ($policyErrors -ne [Net.Security.SslPolicyErrors]::None) {
+                throw "The live certificate for $Domain did not validate: $policyErrors. Renewal is not confirmed."
+            }
             $live = [Security.Cryptography.X509Certificates.X509Certificate2]::new($ssl.RemoteCertificate)
             if ($live.NotAfter -lt $ExpectedNotAfter.AddMinutes(-5)) {
                 throw "The live certificate expires $($live.NotAfter), but the renewed certificate expires $ExpectedNotAfter."
