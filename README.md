@@ -166,7 +166,7 @@ signed package and enabled per tenant and per capacity:
 </p>
 
 <p align="center">
-  <img src="docs/assets/asmdb-workload.png" alt="asmDB Analytical Capabilities running inside Fabric: connected status, counts of premium databases, workspace lakehouses and sync links, a sync-link builder, and a lineage graph from one asmdb database to two Fabric lakehouses whose edges are coloured Active and Planned from real notebook run history" width="90%">
+  <img src="docs/assets/asmdb-workload.png" alt="asmDB Analytical Capabilities in the redesigned Fabric light theme: connected status, two premium databases, five workspace lakehouses, three sync links, a sync-link builder with CDC preview, and lineage from smilesdb and pixelslimes to three Fabric lakehouses" width="90%">
 </p>
 
 The design decision that shapes it: **Fabric Spark writes the Delta tables, we do
@@ -182,10 +182,14 @@ that mount is writable. Everything downstream of it is the customer's own.
 
 A link is **Active**, **Planned** or **Warning** according to what its notebook
 actually did, read back from Fabric's own job history, and each state carries the
-sentence that justifies it rather than leaving the reader to guess:
+sentence that justifies it rather than leaving the reader to guess.
+
+Each link creates a readable PySpark notebook in the customer's workspace. The
+Notebooks tab lists every generated notebook, opens it in Fabric, runs it on
+demand and manages its first-party Fabric schedule:
 
 <p align="center">
-  <img src="docs/assets/asmdb-workload-monitoring.png" alt="The Monitoring tab in light theme: three runs read from Fabric with three successful and none failed, recent sync activity listing completed runs with their timestamps, and coverage showing one Active link explained as scheduled with its last run not failing, and one Planned link explained as having a notebook that nothing runs yet" width="90%">
+  <img src="docs/assets/asmdb-workload-monitoring.png" alt="The Notebooks tab in the redesigned Fabric light theme: three generated notebooks, the selected smilesdb to SlimeAnalytics notebook, its daily schedule, Run now action and readable PySpark preview" width="90%">
 </p>
 
 Four components are built and tested, and the engine and the hosted service are
@@ -196,7 +200,7 @@ untouched:
 | [`workload/cdc-gateway/`](workload/cdc-gateway/) | Serves change frames over HTTP from a **read-only** mount of the share instances write to. Refuses to start if the mount is writable, so the guarantee is structural rather than intentional. |
 | [`workload/notebooks/`](workload/notebooks/) | The generated PySpark sync. Applies changes with `MERGE`, then writes the watermark — in that order, so a crash replays a batch instead of skipping one. |
 | [`workload/backend/`](workload/backend/) | Exchanges the Fabric token for an asmdb Cloud token on behalf of the user, and never falls back to a service identity. Only premium databases are listed. |
-| [`workload/frontend/`](workload/frontend/) | Fluent v9 surface on the asmdb brand ramp, following the host's light and dark themes. |
+| [`workload/frontend/`](workload/frontend/) | React and Fluent UI surface using the official Fabric UX theme tokens, with Light as the default and System and Dark options. |
 
 `.\workload\build\pack.ps1` builds, validates and emits a single uploadable `.nupkg`,
 printing its path and where to upload it. It refuses to produce a release package while
@@ -2042,4 +2046,3 @@ disaster — that is what makes a rule memorable enough to obey.
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
-

@@ -11,7 +11,7 @@ interface ThemePreferenceContextType {
 }
 
 const ThemePreferenceContext = createContext<ThemePreferenceContextType>({
-  preference: "auto",
+  preference: "light",
   hostTheme: "light",
   effectiveTheme: "light",
   setPreference: () => undefined,

@@ -1,7 +1,25 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { KeyboardEvent } from "react";
-import { Button, Dropdown, Input, Option, Textarea } from "@fluentui/react-components";
+import {
+  Button,
+  Dropdown,
+  Input,
+  MessageBar,
+  MessageBarBody,
+  Option,
+  Tab,
+  TabList,
+  Textarea,
+} from "@fluentui/react-components";
 import type { OptionOnSelectData, SelectionEvents } from "@fluentui/react-components";
+import {
+  BookDatabase20Regular,
+  BranchForkLink20Regular,
+  DataLine20Regular,
+  DatabaseSwitch20Regular,
+  Notebook20Regular,
+  Table20Regular,
+} from "@fluentui/react-icons";
 import { useWorkloadClient } from "./context/WorkloadContext";
 import { useThemePreference, type ThemePreference } from "./context/ThemePreferenceContext";
 import { createNotebook as createNotebookArtifact, DependencyError, fetchDatabases, fetchHealth, previewCdc } from "./lib/api";
@@ -915,8 +933,10 @@ function App() {
           </div>
           <div className="statusCluster">
             <ThemeModeControl preference={preference} effectiveTheme={effectiveTheme} onChange={setPreference} />
-            <span className={`dependencyChip ${headerStatusClass}`}>{headerConnected ? `✓ Connected at ${formatTime(connection.updatedAt)}` : headerChecking ? "○ Checking dependencies" : `! ${issueText(headerIssue)}`}</span>
-            <Button onClick={() => void refresh()}>Retry</Button>
+            <span className={`connectionBadge ${headerStatusClass}`}>
+              {headerConnected ? `Connected at ${formatTime(connection.updatedAt)}` : headerChecking ? "Checking connections" : issueText(headerIssue)}
+            </span>
+            <Button appearance="subtle" onClick={() => void refresh()}>Refresh</Button>
           </div>
         </header>
 
@@ -924,24 +944,24 @@ function App() {
           <section className="hero panel" aria-labelledby="overview-heading">
             <div className="introCard">
               <div className="heroVisual"><img src="/assets/asmdb-logo.png" alt="" width="150" height="150" /></div>
-              <div><h2 id="overview-heading">Sync asmDB databases to Fabric lakehouses</h2><p>Create a link, generate the notebook, and track lineage from this workload item.</p></div>
+              <div><h2 id="overview-heading">Sync overview</h2><p>Connect premium asmDB databases to Fabric lakehouses, then manage notebooks and schedules.</p></div>
             </div>
-            <Kpi title="Premium asmDB databases" state={databases.state} value={databases.state === "ready" ? String(databases.data.length) : "—"} caption={databases.state === "no-data" ? "No premium databases visible for this user." : databases.state === "failed" ? issueText(databases.issue) : "From GET /api/databases."} />
-            <Kpi title="Workspace lakehouses" state={lakehouses.state} value={lakehouses.state === "ready" ? String(lakehouses.data.length) : "—"} caption={lakehouses.state === "failed" ? issueText(lakehouses.issue) : "From Fabric workspace items."} />
-            <Kpi title="Sync links" state={links.state} value={links.state === "ready" ? String(links.data.length) : "—"} caption={links.state === "no-data" ? "No links in links.json yet." : "From this item definition."} />
-            <Kpi title="Sync health" state={jobHistory.length ? "ready" : links.state} value={jobHistory.length ? `${successfulRuns}/${jobHistory.length}` : "—"} caption={jobHistory.length ? `${failedRuns} failed notebook runs in history.` : "Unknown until a real run record exists."} />
+            <Kpi title="Premium databases" state={databases.state} value={databases.state === "ready" ? String(databases.data.length) : "—"} caption={databases.state === "no-data" ? "None available to this identity." : databases.state === "failed" ? issueText(databases.issue) : "Available to this identity."} />
+            <Kpi title="Lakehouses" state={lakehouses.state} value={lakehouses.state === "ready" ? String(lakehouses.data.length) : "—"} caption={lakehouses.state === "failed" ? issueText(lakehouses.issue) : "Available in this workspace."} />
+            <Kpi title="Sync links" state={links.state} value={links.state === "ready" ? String(links.data.length) : "—"} caption={links.state === "no-data" ? "No links saved yet." : "Saved in this Sync Hub."} />
+            <Kpi title="Recent run health" state={jobHistory.length ? "ready" : links.state} value={jobHistory.length ? `${successfulRuns}/${jobHistory.length}` : "—"} caption={jobHistory.length ? `${failedRuns} failed runs in recent history.` : "No run history yet."} />
           </section>
 
-          <div className="tabBar" role="tablist" aria-label="Workload views">
-            <button type="button" role="tab" aria-selected={activeTab === "links"} className={activeTab === "links" ? "selected" : ""} onClick={() => setActiveTab("links")}>Sync links</button>
-            <button type="button" role="tab" aria-selected={activeTab === "notebooks"} className={activeTab === "notebooks" ? "selected" : ""} onClick={() => setActiveTab("notebooks")}>Notebooks {notebooks.length ? `(${notebooks.length})` : ""}</button>
-            <button type="button" role="tab" aria-selected={activeTab === "monitoring"} className={activeTab === "monitoring" ? "selected" : ""} onClick={() => setActiveTab("monitoring")}>Monitoring</button>
-          </div>
+          <TabList className="tabBar" selectedValue={activeTab} onTabSelect={(_, data) => setActiveTab(data.value as "links" | "notebooks" | "monitoring")}>
+            <Tab value="links">Sync links</Tab>
+            <Tab value="notebooks">Notebooks {notebooks.length ? `(${notebooks.length})` : ""}</Tab>
+            <Tab value="monitoring">Monitoring</Tab>
+          </TabList>
 
           {activeTab === "links" ? <>
           <section className="middleGrid">
             <article className="panel" aria-labelledby="create-heading">
-              <div className="panelHead"><h2 id="create-heading"><span aria-hidden="true">ↄ</span>Create Sync Link</h2></div>
+              <div className="panelHead"><h2 id="create-heading"><DatabaseSwitch20Regular aria-hidden="true" />Create sync link</h2></div>
               <form className="formGrid" onSubmit={(event) => event.preventDefault()}>
                 <label htmlFor="source">Source Database</label>
                 <Dropdown id="source" value={selectedSource?.name ?? stateLabel(databases.state)} selectedOptions={sourceId ? [sourceId] : []} onOptionSelect={onSelect(setSourceId)} disabled={!databases.data.length}>
@@ -974,26 +994,26 @@ function App() {
                     <pre aria-live="polite">{decoded.preview}</pre>
                   </div>
                 </section>
-                <div className="actions"><Button type="button" onClick={onPreviewCdc} disabled={!selectedSource || previewState === "checking"}>{previewState === "checking" ? "Fetching…" : "Preview CDC"}</Button>{/* Fabric sandboxes workload iframes without allow-forms, so this must not be a submit button: native form submission is blocked before React receives onSubmit. */}<Button appearance="primary" type="button" onClick={() => void createLink()} disabled={!canCreate || saveState === "checking"}>{saveState === "checking" ? "Saving…" : "✦ Create Link"}</Button></div>
+                <div className="actions"><Button type="button" onClick={onPreviewCdc} disabled={!selectedSource || previewState === "checking"}>{previewState === "checking" ? "Fetching…" : "Preview CDC"}</Button>{/* Fabric sandboxes workload iframes without allow-forms, so this must not be a submit button: native form submission is blocked before React receives onSubmit. */}<Button appearance="primary" type="button" onClick={() => void createLink()} disabled={!canCreate || saveState === "checking"}>{saveState === "checking" ? "Saving…" : "Create link"}</Button></div>
                 <div className="saveStatus"><StateMessage state={saveState} text={saveMessage} /></div>
               </form>
             </article>
 
             <article className="panel" aria-labelledby="lineage-heading">
-              <div className="panelHead"><h2 id="lineage-heading"><span aria-hidden="true">⌘</span>Current Lineage</h2></div>
+              <div className="panelHead"><h2 id="lineage-heading"><BranchForkLink20Regular aria-hidden="true" />Current lineage</h2></div>
               <div className="lineageList">
-                {lineage.edges.length ? <LineageDiagram graph={lineage} selectedId={selectedId} onSelect={selectLink} /> : <LineageEmpty state={links.state} text={links.state === "failed" ? issueText(links.issue) : "Create a sync link to draw asmDB databases on the left, Fabric lakehouses on the right, and status-labelled edges between them. The graph is stored in lineage/graph.json."} />}
+                {lineage.edges.length ? <LineageDiagram graph={lineage} selectedId={selectedId} onSelect={selectLink} /> : <LineageEmpty state={links.state} text={links.state === "failed" ? issueText(links.issue) : "Create a sync link to connect an asmDB database to a Fabric lakehouse."} />}
                 <LineageLegend />
               </div>
             </article>
           </section>
-          <section className="panel cdcPanel" aria-labelledby="cdc-heading"><div className="panelHead"><h2 id="cdc-heading"><span aria-hidden="true">▤</span>CDC Preview</h2></div><div className="panelBody"><StateMessage state={previewState} text={previewText} />{previewRows.length ? <CdcPreview entries={previewRows} /> : null}</div></section>
+          <section className="panel cdcPanel" aria-labelledby="cdc-heading"><div className="panelHead"><h2 id="cdc-heading"><Table20Regular aria-hidden="true" />CDC preview</h2></div><div className="panelBody"><StateMessage state={previewState} text={previewText} />{previewRows.length ? <CdcPreview entries={previewRows} /> : null}</div></section>
           </> : activeTab === "notebooks" ? <NotebooksView notebooks={notebooks} selectedNotebookId={selectedNotebook?.key ?? ""} onSelect={setSelectedNotebookId} state={notebookState} message={notebookMessage} schedule={schedule} draft={scheduleDraft} onDraft={setScheduleDraft} onSaveSchedule={saveSchedule} onRunNow={runNotebookNow} onOpen={openNotebook} history={jobHistory} /> : <MonitoringView links={links.data} activityRows={activityRows} activeLinks={activeLinks} plannedLinks={plannedLinks} warningLinks={warningLinks} successfulRuns={successfulRuns} failedRuns={failedRuns} onSelect={selectLink} linkStatus={linkStatus} runsState={runsState} runsMessage={runsMessage} onRefresh={() => { void loadRuns(); }} />}
 
-          <footer className="footer"><span>{connection.updatedAt ? `✓ Data checked: ${formatTime(connection.updatedAt)}` : "○ Data not checked yet"}</span></footer>
+          <footer className="footer"><span>{connection.updatedAt ? `Data refreshed at ${formatTime(connection.updatedAt)}` : "Data has not been refreshed yet."}</span></footer>
         </section>
       </main>
-      {detailsOpen && selectedLink ? <div className="detailOverlay" role="dialog" aria-modal="true" aria-labelledby="detail-heading"><article className="panel detailPopup"><div className="panelHead"><h2 id="detail-heading"><span aria-hidden="true">ↄ</span>Selected Link Details</h2><Button type="button" onClick={() => setDetailsOpen(false)}>Close</Button></div><LinkSummary link={selectedLink} status={statusOf(selectedLink)} reason={linkStatus[selectedLink.id]?.reason ?? ""} confirmDelete={deleteConfirmId === selectedLink.id} onAskDelete={() => setDeleteConfirmId(selectedLink.id)} onCancelDelete={() => setDeleteConfirmId("")} onDelete={() => void deleteLink(selectedLink.id)} /></article></div> : null}
+      {detailsOpen && selectedLink ? <div className="detailOverlay" role="dialog" aria-modal="true" aria-labelledby="detail-heading"><article className="panel detailPopup"><div className="panelHead"><h2 id="detail-heading"><DatabaseSwitch20Regular aria-hidden="true" />Sync link details</h2><Button type="button" onClick={() => setDetailsOpen(false)}>Close</Button></div><LinkSummary link={selectedLink} status={statusOf(selectedLink)} reason={linkStatus[selectedLink.id]?.reason ?? ""} confirmDelete={deleteConfirmId === selectedLink.id} onAskDelete={() => setDeleteConfirmId(selectedLink.id)} onCancelDelete={() => setDeleteConfirmId("")} onDelete={() => void deleteLink(selectedLink.id)} /></article></div> : null}
       <div className={`toast ${toast ? "show" : ""}`} role="status" aria-live="polite">{toast}</div>
     </div>
   );
@@ -1011,17 +1031,20 @@ function FieldState<T>({ loadable, empty }: { loadable: Loadable<T[]>; empty: st
 
 function ThemeModeControl({ preference, effectiveTheme, onChange }: { preference: ThemePreference; effectiveTheme: "light" | "dark"; onChange: (preference: ThemePreference) => void }) {
   const options: { value: ThemePreference; label: string }[] = [
-    { value: "auto", label: `Auto (${effectiveTheme})` },
     { value: "light", label: "Light" },
+    { value: "auto", label: `System (${effectiveTheme})` },
     { value: "dark", label: "Dark" },
   ];
   return <div className="themeModeControl" role="group" aria-label="Theme mode">
-    {options.map((option) => <button key={option.value} type="button" className={preference === option.value ? "selected" : ""} aria-pressed={preference === option.value} onClick={() => onChange(option.value)}>{option.label}</button>)}
+    {options.map((option) => <Button key={option.value} size="small" appearance={preference === option.value ? "primary" : "subtle"} aria-pressed={preference === option.value} onClick={() => onChange(option.value)}>{option.label}</Button>)}
   </div>;
 }
 
 function StateMessage({ state, text }: { state: RequestState; text: string }) {
-  return <div className={`stateMessage ${state}`}><strong>{stateLabel(state)}</strong><pre>{text}</pre></div>;
+  const intent = state === "failed" ? "error" : state === "ready" ? "success" : state === "stale" ? "warning" : "info";
+  return <MessageBar className={`stateMessage ${state}`} intent={intent} layout="multiline">
+    <MessageBarBody><strong>{stateLabel(state)}</strong><span>{text}</span></MessageBarBody>
+  </MessageBar>;
 }
 
 function LineageLegend() {
@@ -1035,7 +1058,7 @@ function LineageLegend() {
 function MonitoringView({ links, activityRows, activeLinks, plannedLinks, warningLinks, successfulRuns, failedRuns, onSelect, linkStatus, runsState, runsMessage, onRefresh }: { links: SyncLink[]; activityRows: RunRecord[]; activeLinks: number; plannedLinks: number; warningLinks: number; successfulRuns: number; failedRuns: number; onSelect: (id: string) => void; linkStatus: Record<string, { status: LinkState; reason: string }>; runsState: RequestState; runsMessage: string; onRefresh: () => void }) {
   return <section className="monitoringGrid">
     <article className="panel monitoringHero">
-      <div className="panelHead"><h2><span aria-hidden="true">◴</span>Run monitoring</h2><Button size="small" type="button" onClick={onRefresh}>Refresh</Button></div>
+      <div className="panelHead"><h2><DataLine20Regular aria-hidden="true" />Run monitoring</h2><Button size="small" type="button" onClick={onRefresh}>Refresh</Button></div>
       <div className="monitorStats">
         <div><strong>{activityRows.length || "—"}</strong><span>runs read from Fabric</span></div>
         <div><strong>{successfulRuns || "—"}</strong><span>successful runs</span></div>
@@ -1045,11 +1068,11 @@ function MonitoringView({ links, activityRows, activeLinks, plannedLinks, warnin
       <StateMessage state={runsState} text={runsMessage} />
     </article>
     <article className="panel">
-      <div className="panelHead"><h2><span aria-hidden="true">▤</span>Recent Sync Activity</h2></div>
-      {activityRows.length ? <div className="activityList">{activityRows.map((row) => <button type="button" className="activityItem" key={row.id} onClick={() => { const link = links.find((candidate) => candidate.source === row.source && candidate.target === row.target); if (link) onSelect(link.id); }}><span>{row.source} → {row.target}</span><span className={`compactStatus ${statusClass(row.status)}`}>{statusIcon(row.status)} {row.status}</span><small>{row.lastRun ?? "Unknown"} · {row.lag ?? "Unknown"}</small></button>)}</div> : <div className="quietPanel"><span className="surfaceBadge">No runs yet</span><p>Fabric returned no run instances for the generated notebooks. Runs appear here once a notebook has run on demand or on schedule.</p></div>}
+      <div className="panelHead"><h2><Table20Regular aria-hidden="true" />Recent sync activity</h2></div>
+      {activityRows.length ? <div className="activityList">{activityRows.map((row) => <button type="button" className="activityItem" key={row.id} onClick={() => { const link = links.find((candidate) => candidate.source === row.source && candidate.target === row.target); if (link) onSelect(link.id); }}><span>{row.source} → {row.target}</span><span className={`compactStatus ${statusClass(row.status)}`}>{statusIcon(row.status)} {row.status}</span><small>{row.lastRun ?? "Unknown"} · {row.lag ?? "Unknown"}</small></button>)}</div> : <div className="quietPanel"><strong>No runs yet</strong><p>Run a generated notebook or enable a schedule to see activity here.</p></div>}
     </article>
     <article className="panel">
-      <div className="panelHead"><h2><span aria-hidden="true">◇</span>Coverage &amp; Readiness</h2></div>
+      <div className="panelHead"><h2><BranchForkLink20Regular aria-hidden="true" />Coverage and readiness</h2></div>
       <div className="readinessSummary"><p>{links.length ? `${links.length} saved ${links.length === 1 ? "link" : "links"}: ${activeLinks} active, ${plannedLinks} planned, ${warningLinks} warning.` : "No coverage to report until a link is saved."}</p><div className="readinessBar" aria-hidden="true"><span className="barActive" style={{ flexGrow: activeLinks }} /><span className="barPlanned" style={{ flexGrow: plannedLinks }} /><span className="barWarning" style={{ flexGrow: warningLinks }} /></div><div className="linkHealthList">{links.map((link) => { const computed = linkStatus[link.id]; const status = computed?.status ?? link.status; return <button type="button" key={link.id} onClick={() => onSelect(link.id)}><span>{link.source} → {link.target}</span><span className={`compactStatus ${statusClass(status)}`}>{statusIcon(status)} {status}</span><small>{computed?.reason ?? ""}</small></button>; })}</div></div>
     </article>
   </section>;
@@ -1058,9 +1081,9 @@ function MonitoringView({ links, activityRows, activeLinks, plannedLinks, warnin
 function LinkSummary({ link, status, reason, confirmDelete, onAskDelete, onCancelDelete, onDelete }: { link: SyncLink; status: LinkState; reason: string; confirmDelete: boolean; onAskDelete: () => void; onCancelDelete: () => void; onDelete: () => void }) {
   return <div className="linkSummary">
     <div className="linkPair">
-      <span className="linkEndpoint sourceEndpoint">▤ {link.source}</span>
+      <span className="linkEndpoint sourceEndpoint"><BookDatabase20Regular aria-hidden="true" />{link.source}</span>
       <span className="linkArrow">→</span>
-      <span className="linkEndpoint targetEndpoint">⌂ {link.target}</span>
+      <span className="linkEndpoint targetEndpoint"><BranchForkLink20Regular aria-hidden="true" />{link.target}</span>
     </div>
     <span className={`compactStatus ${statusClass(status)}`}>{statusIcon(status)} {status}</span>
     <p>{reason}</p>
@@ -1127,7 +1150,7 @@ function NotebooksView({
   };
   return <section className="notebooksGrid">
     <article className="panel notebookListPanel">
-      <div className="panelHead"><h2><span aria-hidden="true">▤</span>Generated notebooks</h2></div>
+      <div className="panelHead"><h2><Notebook20Regular aria-hidden="true" />Generated notebooks</h2></div>
       <div className="notebookList">
         {notebooks.length ? notebooks.map((notebook) => <button type="button" key={notebook.key} className={selected?.key === notebook.key ? "notebookItem selected" : "notebookItem"} onClick={() => onSelect(notebook.key)}>
           <strong>{notebook.displayName}</strong>
@@ -1137,7 +1160,7 @@ function NotebooksView({
       </div>
     </article>
     <article className="panel notebookDetailPanel">
-      <div className="panelHead"><h2><span aria-hidden="true">⌘</span>Notebook details</h2></div>
+      <div className="panelHead"><h2><Notebook20Regular aria-hidden="true" />Notebook details</h2></div>
       {selected ? <div className="notebookDetail">
         <div className="notebookHero">
           <div><h3>{selected.displayName}</h3><p>{selected.link.source} → {selected.link.target}</p></div>
@@ -1146,7 +1169,7 @@ function NotebooksView({
         <StateMessage state={selected.status === "failed" ? "failed" : selected.status === "creating" ? "checking" : selectedNotebook ? state : "not-configured"} text={selected.link.notebookError ?? (selectedNotebook ? message : "The link exists, but no notebook is attached to it. Create Link now creates notebooks automatically for new links; older links may need to be recreated.")} />
         {selectedNotebook ? <section className="scheduleBox" aria-labelledby="schedule-heading">
           <h3 id="schedule-heading">Schedule</h3>
-          <p className="scheduleNote">Schedules use Fabric REST for first-party Notebook items. The token is requested for Fabric API Item.Execute.All and Item.ReadWrite.All scopes.</p>
+          <p className="scheduleNote">Run this notebook automatically on a Fabric schedule.</p>
           <div className="scheduleGrid">
             <label htmlFor="cadence">Cadence</label>
             <Dropdown id="cadence" value={draft.cadence} selectedOptions={[draft.cadence]} onOptionSelect={(_, data) => { if (data.optionValue) updateDraft({ cadence: data.optionValue as ScheduleCadence }); }}>

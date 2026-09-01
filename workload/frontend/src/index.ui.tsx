@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createBrowserHistory } from "history";
 import { FluentProvider, RendererProvider, createDOMRenderer } from "@fluentui/react-components";
+import { setTheme } from "@fabric-msft/theme";
 import { createWorkloadClient, InitParams } from "@ms-fabric/workload-client";
 import App from "./App";
 import { WorkloadProvider } from "./context/WorkloadContext";
@@ -10,14 +11,14 @@ import { readHostTheme, subscribeHostTheme } from "./theme/hostTheme";
 import { HostThemeName, themeForHost } from "./theme/asmdbTheme";
 
 const renderer = createDOMRenderer();
-const THEME_PREFERENCE_KEY = "asmdb.themePreference";
+const THEME_PREFERENCE_KEY = "asmdb.themePreference.v2";
 
 function readStoredThemePreference(): ThemePreference {
   try {
     const value = window.localStorage.getItem(THEME_PREFERENCE_KEY);
-    return value === "light" || value === "dark" || value === "auto" ? value : "dark";
+    return value === "light" || value === "dark" || value === "auto" ? value : "light";
   } catch {
-    return "dark";
+    return "light";
   }
 }
 
@@ -50,6 +51,10 @@ export function ThemedRoot({ workloadClient }: { workloadClient: ReturnType<type
       unsubscribe();
     };
   }, [workloadClient]);
+
+  useEffect(() => {
+    void setTheme(themeForHost(effectiveTheme), "root");
+  }, [effectiveTheme]);
 
   return (
     <RendererProvider renderer={renderer}>
@@ -103,5 +108,6 @@ export async function initialize(params: InitParams) {
     return;
   }
 
+  await setTheme(themeForHost("light"), "root");
   createRoot(rootElement).render(<ThemedRoot workloadClient={workloadClient} />);
 }
